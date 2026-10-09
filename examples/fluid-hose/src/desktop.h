@@ -10,12 +10,16 @@ struct DesktopInput {
     bool paused;
     bool clear;
     bool quit;
+    bool tilt;
+    bool reverse_tilt;
 };
+enum class TiltStatus { off, waiting, active, unavailable };
 
-HoseRenderer* create_hose_renderer(SDL_Window* window, const char* shader_file, bool continuous);
+HoseRenderer* create_hose_renderer(SDL_Window* window, const char* shader_file, bool continuous, bool tilt = false);
 void destroy_hose_renderer(HoseRenderer* renderer);
 const char* hose_device_name(const HoseRenderer* renderer);
 DesktopInput poll_desktop_input(HoseRenderer* renderer, const SDL_Rect& canvas);
+void set_hose_tilt_status(HoseRenderer* renderer, TiltStatus status);
 bool read_window_obstacles(const SDL_Rect& canvas, std::vector<WindowRect>& output);
 bool draw_hose_frame(HoseRenderer* renderer, const std::vector<FluidVertex>& particles,
                      const SceneUniforms& scene, bool& presented);

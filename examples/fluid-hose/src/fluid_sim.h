@@ -8,7 +8,8 @@ public:
     static constexpr std::size_t capacity = 8000;
     static constexpr float radius = 2.8f;
     FluidSimulation(float width, float height);
-    void step(float dt, const std::vector<WindowRect>& windows, bool pouring, FluidPoint nozzle);
+    void step(float dt, const std::vector<WindowRect>& windows, bool pouring, FluidPoint nozzle,
+              FluidPoint gravity = {0, 950});
     void clear();
     FluidPoint place_hose(FluidPoint pointer, const std::vector<WindowRect>& windows) const;
     const std::vector<FluidVertex>& vertices() const { return render_vertices_; }

@@ -4,6 +4,7 @@
 #include <SDL3/SDL_events.h>
 #include "desktop.h"
 #include "fluid_sim.h"
+#include "motion.h"
 #include <mach-o/dyld.h>
 #include <algorithm>
 #include <charconv>
@@ -28,12 +29,15 @@ template<typename T> static T* require(T* value, const char* operation) {
     return value;
 }
 
-static std::filesystem::path shader_path() {
+static std::filesystem::path executable_directory() {
     uint32_t size = 0;
     _NSGetExecutablePath(nullptr, &size);
     std::vector<char> path(size);
     if (_NSGetExecutablePath(path.data(), &size) != 0) throw std::runtime_error("Cannot locate executable");
-    auto directory = std::filesystem::canonical(path.data()).parent_path();
+    return std::filesystem::canonical(path.data()).parent_path();
+}
+static std::filesystem::path shader_path() {
+    auto directory = executable_directory();
     if (directory.filename() == "MacOS") directory = directory.parent_path() / "Resources";
     return directory / "fluid.metallib";
 }
@@ -41,7 +45,9 @@ static std::filesystem::path shader_path() {
 struct App {
     SDL_Window* window = nullptr;
     HoseRenderer* renderer = nullptr;
+    MotionProcess motion;
     ~App() {
+        motion.stop();
         if (renderer) destroy_hose_renderer(renderer);
         if (window) SDL_DestroyWindow(window);
         SDL_Quit();
@@ -54,6 +60,8 @@ int main(int argc, char** argv) {
         bool smoke = false;
         bool probe = false;
         bool continuous = false;
+        bool tilt_enabled = false;
+        bool motion_check = false;
         unsigned duration = 0;
         for (int i = 1; i < argc; ++i) {
             const std::string argument = argv[i];
@@ -61,22 +69,28 @@ int main(int argc, char** argv) {
             else if (argument == "--smoke-test") smoke = true;
             else if (argument == "--probe") probe = true;
             else if (argument == "--pour") continuous = true;
+            else if (argument == "--tilt") tilt_enabled = true;
+            else if (argument == "--motion-check") motion_check = true;
             else if (argument == "--duration" && i + 1 < argc) {
                 const char* value = argv[++i];
                 const auto result = std::from_chars(value, value + std::strlen(value), duration);
                 if (result.ec != std::errc{} || *result.ptr != '\0' || duration == 0)
                     throw std::runtime_error("--duration requires a positive integer number of seconds");
             } else if (argument == "--help") {
-                std::puts("Fluid Hose\nUsage: fluid-hose [--pour] [--duration SECONDS] "
-                          "[--probe | --physics-check | --smoke-test]\n"
+                std::puts("Fluid Hose\nUsage: fluid-hose [--pour] [--tilt] [--duration SECONDS] "
+                          "[--probe | --physics-check | --motion-check | --smoke-test]\n"
                           "Hold Option to pour at the mouse pointer. Release Option to stop.\n"
                           "The overlay lets clicks pass through: arrange windows normally.\n"
                           "Use the droplet menu in the menu bar to pour continuously, pause, clear, or quit.\n"
+                          "--tilt lets Mac motion change gravity; toggle Use Mac tilt in the droplet menu.\n"
+                          "The sensor helper stops and restores its settings when tilt is off or the app exits.\n"
                           "This prototype uses the primary display and ordinary window rectangles.");
                 return 0;
             } else throw std::runtime_error("Unknown or incomplete option: " + argument);
         }
         if (physics_check) return run_physics_checks() ? 0 : 1;
+        const auto motion_helper = (executable_directory() / "probe-motion").string();
+        if (motion_check) return run_motion_checks(motion_helper) ? 0 : 1;
         SDL_SetMainReady();
         App app;
         require(SDL_Init(smoke ? 0 : SDL_INIT_VIDEO), "Initialize SDL3");
@@ -107,12 +121,14 @@ int main(int argc, char** argv) {
         require(SDL_SetWindowPosition(app.window, canvas.x, canvas.y), "Position fluid overlay");
         // SDL GPU rejects transparent windows. This example uses SDL's supported
         // Metal-view API and native Metal rendering, as in the working triangle.
-        app.renderer = require(create_hose_renderer(app.window, shaders.c_str(), continuous), "Create fluid renderer");
+        app.renderer = require(create_hose_renderer(app.window, shaders.c_str(), continuous, tilt_enabled), "Create fluid renderer");
         std::printf("Device: %s\nHold Option to pour; use the droplet menu to clear or quit.\n", hose_device_name(app.renderer));
         std::signal(SIGINT, stop);
         std::signal(SIGTERM, stop);
 
         FluidSimulation simulation(static_cast<float>(canvas.w), static_cast<float>(canvas.h));
+        TiltGravity tilt;
+        bool requested_tilt = false;
         using Clock = std::chrono::steady_clock;
         const auto start = Clock::now();
         auto previous = start;
@@ -138,6 +154,19 @@ int main(int argc, char** argv) {
             }
             const auto input = poll_desktop_input(app.renderer, canvas);
             if (input.quit) break;
+            if (input.tilt != requested_tilt) {
+                requested_tilt = input.tilt;
+                tilt.reset();
+                if (requested_tilt) app.motion.start(motion_helper);
+                else app.motion.stop();
+            }
+            MotionPacket packet;
+            if (requested_tilt && app.motion.poll(packet)) tilt.update(packet);
+            const auto motion_time = motion_now();
+            const bool fresh_tilt = requested_tilt && tilt.fresh(motion_time);
+            set_hose_tilt_status(app.renderer, !requested_tilt ? TiltStatus::off :
+                fresh_tilt ? TiltStatus::active : app.motion.running() ? TiltStatus::waiting : TiltStatus::unavailable);
+            const FluidPoint gravity = requested_tilt ? tilt.gravity(motion_time, input.reverse_tilt) : FluidPoint{0, 950};
             if (input.clear) simulation.clear();
             const auto nozzle = simulation.place_hose(input.pointer, obstacles);
             const bool in_canvas = nozzle.x > 0 && nozzle.y > 0 && nozzle.x < canvas.w && nozzle.y < canvas.h;
@@ -145,7 +174,7 @@ int main(int argc, char** argv) {
             if (!input.paused) {
                 accumulator += delta;
                 while (accumulator >= step) {
-                    simulation.step(step, obstacles, pouring, nozzle);
+                    simulation.step(step, obstacles, pouring, nozzle, gravity);
                     accumulator -= step;
                 }
             } else accumulator = 0;

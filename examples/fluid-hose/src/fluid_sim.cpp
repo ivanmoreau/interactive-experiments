@@ -216,7 +216,8 @@ void FluidSimulation::relax_density(float dt) {
     }
 }
 
-void FluidSimulation::step(float dt, const std::vector<WindowRect>& windows, bool pouring, FluidPoint nozzle) {
+void FluidSimulation::step(float dt, const std::vector<WindowRect>& windows, bool pouring, FluidPoint nozzle,
+                           FluidPoint gravity) {
     if (pouring && nozzle.x > radius && nozzle.x < width_ - radius && nozzle.y > radius && nozzle.y < height_ - radius) {
         emission_ += dt * 200.0f;
         while (emission_ >= 1.0f && particles_.size() < capacity) {
@@ -229,7 +230,8 @@ void FluidSimulation::step(float dt, const std::vector<WindowRect>& windows, boo
 
     for (auto& particle : particles_) {
         particle.previous = particle.position;
-        particle.velocity.y += 950.0f * dt;
+        if (gravity.x != 0) particle.velocity.x += gravity.x * dt;
+        particle.velocity.y += gravity.y * dt;
         particle.position.x += particle.velocity.x * dt;
         particle.position.y += particle.velocity.y * dt;
         collide(particle, windows);

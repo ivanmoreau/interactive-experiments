@@ -17,6 +17,7 @@ Or open `build/Fluid Hose.app` from this example folder in Finder.
 - Move the mouse above a window and **hold Option** to pour. Release it to stop.
 - When the pointer is over a solid window body, the nozzle snaps to the nearest available edge.
 - Use the **💧 menu-bar icon** to pour continuously, pause, clear the water, or quit.
+- **Use Mac tilt** changes gravity using laptop motion; **Reverse tilt left/right** flips the horizontal direction if needed.
 - **Ctrl+C** also quits when launched from Terminal.
 
 For continuous pouring from launch:
@@ -26,6 +27,14 @@ For continuous pouring from launch:
 ```
 
 The app has no Dock icon or visible window frame. Its menu-bar icon provides the controls.
+
+For gravity controlled by Mac tilt from launch:
+
+```sh
+./examples/fluid-hose/run.sh --tilt
+```
+
+Tilt is off by default. Its menu status shows whether fresh motion is available. Without fresh data the water uses downward gravity. This mode is intended for the MacBook's own display: the sensor tracks the laptop body, rather than an external monitor.
 
 ## How it works
 
@@ -55,6 +64,7 @@ This is a 2D prototype on the **primary display**. Windows are solid, axis-align
 ```
 
 - `--physics-check` requires no graphics access and checks gravity, pooling, collision, hose placement, displacement by moving and overlapping windows, and clearing.
+- `--motion-check` checks gravity projection, stale/invalid data, fluid moving toward side walls and the ceiling, and helper transport/shutdown using synthetic data without opening sensors.
 - `--probe` prints desktop bounds and the window collision rectangles without launching the overlay.
 - `--smoke-test` checks Metal density accumulation, a translucent merged fluid surface, and transparent background pixels without creating a window.
 - `--duration 10` runs the overlay for ten seconds and exits.
@@ -71,11 +81,34 @@ The M1 Pro MacBook exposes SPU accelerometer and gyroscope devices. To check liv
 ./examples/fluid-hose/tools/probe-motion.sh --duration 10
 ```
 
-This rebuilds `build/probe-motion`, so the previously used binary path also works. The probe opens the IMU non-exclusively and enables its driver reporting, power, and report interval, following the [SPU sensor reader's activation sequence](https://github.com/olvvier/apple-silicon-accelerometer/blob/main/macimu/_spu.py). It touches only the accelerometer and gyroscope, restores prior published settings when it exits, and defaults unpublished power/reporting commands back to off.
+This rebuilds `build/probe-motion`, so the previously used binary path also works. The probe opens the IMU non-exclusively and enables its driver reporting, power, and report interval, following the [SPU sensor reader's activation sequence](https://github.com/olvvier/apple-silicon-accelerometer/blob/main/macimu/_spu.py). It borrows an existing reporting session when samples are already arriving. When it enables reporting itself, it touches only the accelerometer and gyroscope, restores prior published settings when it exits, and defaults unpublished power/reporting commands back to off.
 
 The probe prints live axes, report counts, and sample age. `NO DATA` means no sample was decoded; it does not mean measured acceleration is zero. Zero gyroscope values can be normal while stationary. The acceleration magnitude is nominally around one g at rest, with its components changing as you tilt. Wake-up errors are printed individually; opening a device does not establish that reporting is enabled. The protocol is undocumented and its Q16 scale is nominal.
 
-`--self-test` checks signed sample decoding, short reports, and callback errors without opening hardware. Device opening is blocked in the development sandbox; the initial probe opened in the user's Terminal but received no reports because it did not enable the drivers. Tilt is not yet connected to the fluid simulation.
+`--self-test` checks signed sample decoding, short reports, and callback errors without opening hardware. Device opening is blocked in the development sandbox; the user confirmed fresh live readings near one g after driver activation was added.
+
+To observe existing reporting without enabling any driver settings:
+
+```sh
+./examples/fluid-hose/tools/probe-motion.sh --observe-only --duration 3
+```
+
+## Tilt gravity and sensor lifetime
+
+The app uses a short-lived reader process only while **Use Mac tilt** is enabled. The reader sends motion packets over local pipes. Closing the app or disabling tilt closes its control pipe; the reader detects that closure and restores its sensor settings. It uses a separate process group so it can also clean up after the main app is force-killed. No startup service is installed.
+
+These are runtime driver settings, not settings automatically limited to one process. The standalone probe restores them on timeout, Ctrl+C, or SIGTERM. Killing the reader itself with SIGKILL, or a driver refusing restoration, can leave changes active. Restoring a prior active state can also legitimately leave sensors reporting for another consumer. After the user's completed probe, both IMU report intervals were observed back at their original value of zero.
+
+Gravity estimation combines gyro rotation with smoothed acceleration, rejecting large bumps. It projects the resulting 3D direction into the display plane. The reader optionally obtains lid angle without changing that sensor's reporting or power settings; when the lid angle is unavailable, projection assumes a 110° opening. The projection keeps its physical magnitude, so a nearly horizontal display has less gravity along its surface.
+
+Checks from the workspace root:
+
+```sh
+./examples/fluid-hose/run.sh --motion-check
+python3 examples/fluid-hose/tools/check-motion-lifetime.py
+```
+
+The lifecycle check force-kills a test owner and verifies the mock reader stops when its control pipe closes. It does not access sensors. Physics, projection, transport, packaged executable, lifecycle, and signing checks passed; live tilt rendering still needs the normal desktop session.
 
 ## Performance assessment — October 8, 2026
 
@@ -119,5 +152,6 @@ Raw results: [original solver](benchmarks/2026-10-08-physics-baseline.csv), [nei
 - [src/fluid.metal](src/fluid.metal): density splats, water surface shading, and the nozzle.
 - [src/fluid_types.h](src/fluid_types.h): shared CPU/GPU data layouts.
 - [tools/probe_motion.cpp](tools/probe_motion.cpp): SPU motion sensor activation and live sample diagnostics.
+- [src/motion.cpp](src/motion.cpp): gravity estimation, display projection, and ownership of the reader process.
 
 SDL's license is in [SDL3-LICENSE.txt](SDL3-LICENSE.txt) and the app bundle.

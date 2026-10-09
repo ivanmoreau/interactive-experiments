@@ -17,10 +17,14 @@
 @property(nonatomic) BOOL paused;
 @property(nonatomic) BOOL clearRequested;
 @property(nonatomic) BOOL quitRequested;
+@property(nonatomic) BOOL tiltEnabled;
+@property(nonatomic) BOOL reverseTilt;
 - (void)togglePour:(NSMenuItem*)sender;
 - (void)togglePause:(NSMenuItem*)sender;
 - (void)clearWater:(NSMenuItem*)sender;
 - (void)quit:(NSMenuItem*)sender;
+- (void)toggleTilt:(NSMenuItem*)sender;
+- (void)toggleReverseTilt:(NSMenuItem*)sender;
 @end
 
 @implementation FluidMenuController
@@ -34,6 +38,14 @@
 }
 - (void)clearWater:(NSMenuItem*)sender { (void)sender; self.clearRequested = YES; }
 - (void)quit:(NSMenuItem*)sender { (void)sender; self.quitRequested = YES; }
+- (void)toggleTilt:(NSMenuItem*)sender {
+    self.tiltEnabled = !self.tiltEnabled;
+    sender.state = self.tiltEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+}
+- (void)toggleReverseTilt:(NSMenuItem*)sender {
+    self.reverseTilt = !self.reverseTilt;
+    sender.state = self.reverseTilt ? NSControlStateValueOn : NSControlStateValueOff;
+}
 @end
 
 struct HoseRenderer {
@@ -50,6 +62,8 @@ struct HoseRenderer {
     unsigned slot = 0;
     NSStatusItem* status_item = nil;
     FluidMenuController* controls = nil;
+    NSMenuItem* tilt_status = nil;
+    TiltStatus previous_tilt_status = TiltStatus::off;
     std::string device_name;
 
     ~HoseRenderer() {
@@ -147,7 +161,7 @@ struct HoseRenderer {
     }
 };
 
-HoseRenderer* create_hose_renderer(SDL_Window* window, const char* shader_file, bool continuous) {
+HoseRenderer* create_hose_renderer(SDL_Window* window, const char* shader_file, bool continuous, bool tilt) {
     @autoreleasepool {
         auto renderer = std::make_unique<HoseRenderer>();
         if (!renderer->initialize(shader_file)) return nullptr;
@@ -179,6 +193,7 @@ HoseRenderer* create_hose_renderer(SDL_Window* window, const char* shader_file, 
 
         renderer->controls = [[FluidMenuController alloc] init];
         renderer->controls.pouring = continuous;
+        renderer->controls.tiltEnabled = tilt;
         renderer->status_item = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
         renderer->status_item.button.title = @"💧";
         renderer->status_item.button.toolTip = @"Fluid Hose — hold Option to pour";
@@ -197,6 +212,17 @@ HoseRenderer* create_hose_renderer(SDL_Window* window, const char* shader_file, 
         NSMenuItem* clear = [[NSMenuItem alloc] initWithTitle:@"Clear water" action:@selector(clearWater:) keyEquivalent:@""];
         clear.target = renderer->controls;
         [menu addItem:clear];
+        [menu addItem:NSMenuItem.separatorItem];
+        NSMenuItem* tilt_item = [[NSMenuItem alloc] initWithTitle:@"Use Mac tilt" action:@selector(toggleTilt:) keyEquivalent:@""];
+        tilt_item.target = renderer->controls;
+        tilt_item.state = tilt ? NSControlStateValueOn : NSControlStateValueOff;
+        [menu addItem:tilt_item];
+        NSMenuItem* reverse = [[NSMenuItem alloc] initWithTitle:@"Reverse tilt left/right" action:@selector(toggleReverseTilt:) keyEquivalent:@""];
+        reverse.target = renderer->controls;
+        [menu addItem:reverse];
+        renderer->tilt_status = [[NSMenuItem alloc] initWithTitle:@"Tilt: off" action:nil keyEquivalent:@""];
+        renderer->tilt_status.enabled = NO;
+        [menu addItem:renderer->tilt_status];
         [menu addItem:NSMenuItem.separatorItem];
         NSMenuItem* quit = [[NSMenuItem alloc] initWithTitle:@"Quit Fluid Hose" action:@selector(quit:) keyEquivalent:@""];
         quit.target = renderer->controls;
@@ -221,9 +247,23 @@ DesktopInput poll_desktop_input(HoseRenderer* renderer, const SDL_Rect& canvas) 
         const bool option = (CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState) & kCGEventFlagMaskAlternate) != 0;
         DesktopInput input{pointer, option || static_cast<bool>(renderer->controls.pouring),
                            static_cast<bool>(renderer->controls.paused), static_cast<bool>(renderer->controls.clearRequested),
-                           static_cast<bool>(renderer->controls.quitRequested)};
+                           static_cast<bool>(renderer->controls.quitRequested),
+                           static_cast<bool>(renderer->controls.tiltEnabled), static_cast<bool>(renderer->controls.reverseTilt)};
         renderer->controls.clearRequested = NO;
         return input;
+    }
+}
+
+void set_hose_tilt_status(HoseRenderer* renderer, TiltStatus status) {
+    if (status == renderer->previous_tilt_status) return;
+    renderer->previous_tilt_status = status;
+    @autoreleasepool {
+        switch (status) {
+            case TiltStatus::off: renderer->tilt_status.title = @"Tilt: off"; break;
+            case TiltStatus::waiting: renderer->tilt_status.title = @"Tilt: waiting for motion"; break;
+            case TiltStatus::active: renderer->tilt_status.title = @"Tilt: active"; break;
+            case TiltStatus::unavailable: renderer->tilt_status.title = @"Tilt: unavailable — gravity down"; break;
+        }
     }
 }
 
