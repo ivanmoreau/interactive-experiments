@@ -61,7 +61,41 @@ This is a 2D prototype on the **primary display**. Windows are solid, axis-align
 
 Requires macOS 14 or newer and Xcode's C++ and Metal tools to rebuild. The SDL3 SDK and library are cached under `.deps/SDL3`; `tools/setup-sdl.sh` installs the official SDK locally if needed.
 
-Compilation, physics checks, CLI checks, app signing, and property-list validation passed. A separate flow check confirmed water spilling below a window. Live window enumeration and Metal pixel readback could not be tested in the sandbox because it cannot access the display or a Metal device; run those checks from your normal desktop session.
+Compilation, physics checks, CLI checks, app signing, and property-list validation passed. A separate flow check confirmed water spilling below a window. The fluid overlay and mouse pass-through have also been confirmed in a normal desktop session. GPU pixel readback and timing require that session because the development sandbox cannot access a Metal device or the display.
+
+## Performance assessment — October 8, 2026
+
+CPU physics is already expensive enough to miss the 120 Hz simulation budget at full capacity. A neighbor-cache experiment substantially reduced that cost. The experiment builds a separate executable; the app still uses the committed, working solver.
+
+The benchmark uses a 1440 × 900 logical canvas, deterministic pouring to seed particles, and 120 settling steps before timing. Each case measures three runs of 180 steps from the same snapshot, with pouring stopped. Setup, snapshot copying, SDL, window enumeration, and Metal rendering are excluded. Apple clang 17 compiles with the app's `-O2` setting on the project's M1 Pro Mac. Times below are milliseconds per step with one window obstacle.
+
+| Particles | Current median | Current p95 | Cached-neighbor median | Cached-neighbor p95 | Median time reduction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2,000 | 2.90 | 4.37 | 1.61 | 1.72 | 44% |
+| 4,000 | 7.32 | 11.76 | 4.10 | 4.32 | 44% |
+| 8,000 | 16.40 | 17.95 | 9.91 | 10.90 | 40% |
+
+A 120 Hz simulation has **8.33 ms per step**, with additional CPU work needed for input and rendering submission. At 8,000 particles, the current loop's catch-up steps can consume substantial time before presenting a frame. The prototype also needs further improvement to meet that budget at full capacity. Increasing obstacles from one to twelve changed the current 8,000-particle median by approximately 3% in this scene.
+
+The solver currently traverses the same neighbors twice in each density-relaxation iteration, recomputing distances both times. Particle positions are fixed until all corrections have been accumulated, so those results can be reused safely. The prototype passed the existing physics checks and produced bit-identical particle vertices throughout a 1,800-step, 2,000-particle comparison, including displacement by moving, overlapping windows. These results point to neighbor processing as a major CPU optimization opportunity.
+
+The next changes to consider, in priority order:
+
+1. **Reuse neighbor calculations in the app.** Promote the tested cache and keep its scratch storage across steps to avoid repeated allocation. The measured reduction comes from the standalone prototype, which allocates its scratch vector once per relaxation pass.
+2. **Reduce idle rendering.** The current loop renders both passes even with no water or when paused. Retain the last frame when the visible state is unchanged, while continuing to poll the global pointer, Option key, menu controls, and window bounds.
+3. **Measure and reduce GPU work.** Both passes currently use the drawable's full pixel dimensions. On a 2× Retina display, a density field at logical resolution would contain 75% fewer pixels while the final output could remain native resolution. The surface shader can also skip its four gradient samples and lighting on empty pixels, provided it preserves the nozzle. These are unmeasured candidates; density resolution can affect edge detail and lighting. Record [GPU start](https://developer.apple.com/documentation/metal/mtlcommandbuffer/gpustarttime) and [end](https://developer.apple.com/documentation/metal/mtlcommandbuffer/gpuendtime) timestamps in command-buffer completion handlers before choosing a rendering change.
+4. **For a larger solver improvement, process unordered neighbor pairs once or redesign for parallel updates.** Current corrections write into other particles, so simply threading the loop would introduce data races. A 60 Hz physics preset would reduce tick count, but the pressure terms depend on `dt²` and require behavior and stability checks.
+
+Reproduce the CPU measurements from the workspace root:
+
+```sh
+./examples/fluid-hose/tools/benchmark-physics.sh
+./examples/fluid-hose/tools/benchmark-neighbor-cache.py
+```
+
+Both commands accept `--quick` for a 2,000-particle check. `--profile` adds a 15-second steady workload for sampling in a normal desktop session. The experiment generates its source and binaries under `build/performance` and checks equivalence before benchmarking.
+
+Raw results: [current solver](benchmarks/2026-10-08-physics-baseline.csv) and [neighbor-cache prototype](benchmarks/2026-10-08-physics-cached-neighbors.csv). These are standalone wall-clock timings from the development sandbox, with scheduling outliers and no CPU affinity or thermal isolation; they are not live app frame rates. The CSV budget percentage is mean step time divided by 8.33 ms, rather than measured OS CPU utilization. GPU timings and the cost of Quartz window enumeration remain unmeasured. External process sampling was denied by the sandbox.
 
 ## Code
 
