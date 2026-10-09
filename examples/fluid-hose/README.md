@@ -63,6 +63,20 @@ Requires macOS 14 or newer and Xcode's C++ and Metal tools to rebuild. The SDL3 
 
 Compilation, physics checks, CLI checks, app signing, and property-list validation passed. A separate flow check confirmed water spilling below a window. The fluid overlay and mouse pass-through have also been confirmed in a normal desktop session. GPU pixel readback and timing require that session because the development sandbox cannot access a Metal device or the display.
 
+## Motion sensor probe
+
+The M1 Pro MacBook exposes SPU accelerometer and gyroscope devices. To check live readings from a normal Terminal:
+
+```sh
+./examples/fluid-hose/tools/probe-motion.sh --duration 10
+```
+
+This rebuilds `build/probe-motion`, so the previously used binary path also works. The probe opens the IMU non-exclusively and enables its driver reporting, power, and report interval, following the [SPU sensor reader's activation sequence](https://github.com/olvvier/apple-silicon-accelerometer/blob/main/macimu/_spu.py). It touches only the accelerometer and gyroscope, restores prior published settings when it exits, and defaults unpublished power/reporting commands back to off.
+
+The probe prints live axes, report counts, and sample age. `NO DATA` means no sample was decoded; it does not mean measured acceleration is zero. Zero gyroscope values can be normal while stationary. The acceleration magnitude is nominally around one g at rest, with its components changing as you tilt. Wake-up errors are printed individually; opening a device does not establish that reporting is enabled. The protocol is undocumented and its Q16 scale is nominal.
+
+`--self-test` checks signed sample decoding, short reports, and callback errors without opening hardware. Device opening is blocked in the development sandbox; the initial probe opened in the user's Terminal but received no reports because it did not enable the drivers. Tilt is not yet connected to the fluid simulation.
+
 ## Performance assessment — October 8, 2026
 
 Neighbor caching is integrated into the app and the rebuilt app bundle. It reduced CPU physics step time by approximately 38–43% in these benchmarks, with the same particle trajectories as the original solver. Scratch memory is retained across particles, relaxation iterations, and simulation steps.
@@ -104,5 +118,6 @@ Raw results: [original solver](benchmarks/2026-10-08-physics-baseline.csv), [nei
 - [src/desktop.mm](src/desktop.mm): window metadata, Option-key state, click-through window, menu-bar controls, and native Metal rendering.
 - [src/fluid.metal](src/fluid.metal): density splats, water surface shading, and the nozzle.
 - [src/fluid_types.h](src/fluid_types.h): shared CPU/GPU data layouts.
+- [tools/probe_motion.cpp](tools/probe_motion.cpp): SPU motion sensor activation and live sample diagnostics.
 
 SDL's license is in [SDL3-LICENSE.txt](SDL3-LICENSE.txt) and the app bundle.
