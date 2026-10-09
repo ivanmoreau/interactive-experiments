@@ -22,6 +22,7 @@ FluidSimulation::FluidSimulation(float width, float height)
     render_vertices_.reserve(capacity);
     grid_next_.reserve(capacity);
     correction_.reserve(capacity);
+    neighbor_cache_.reserve(128);
     grid_heads_.resize(grid_width_ * grid_height_, -1);
 }
 
@@ -35,6 +36,7 @@ float FluidSimulation::random() {
 void FluidSimulation::clear() {
     particles_.clear();
     render_vertices_.clear();
+    neighbor_cache_.clear();
     emission_ = 0;
 }
 
@@ -156,6 +158,7 @@ void FluidSimulation::relax_density(float dt) {
     rebuild_grid();
     correction_.assign(particles_.size(), {0, 0});
     for (std::size_t i = 0; i < particles_.size(); ++i) {
+        neighbor_cache_.clear();
         const FluidPoint p = particles_[i].position;
         const int cell_x = static_cast<int>(p.x / support);
         const int cell_y = static_cast<int>(p.y / support);
@@ -184,20 +187,28 @@ void FluidSimulation::relax_density(float dt) {
                 }
             }
         };
-        neighbors([&](int, FluidPoint, float, float q) {
+        // Positions stay fixed until all corrections have been accumulated.
+        // Cache this particle's neighbors for the pressure pass, retaining the
+        // scratch allocation across particles, solver iterations, and steps.
+        neighbors([&](int j, FluidPoint delta, float distance, float q) {
             density += q * q;
             near_density += q * q * q;
+            neighbor_cache_.push_back({j, delta, distance, q});
         });
         const float pressure = std::clamp(stiffness * (density - rest_density), -350.0f, 7000.0f);
         const float near_pressure = std::min(near_stiffness * near_density, 9000.0f);
-        neighbors([&](int j, FluidPoint delta, float distance, float q) {
+        for (const auto& neighbor : neighbor_cache_) {
+            const int j = neighbor.index;
+            const auto delta = neighbor.delta;
+            const float distance = neighbor.distance;
+            const float q = neighbor.q;
             const float amount = std::clamp(dt * dt * (pressure * q + near_pressure * q * q), -0.12f, 0.55f);
             const FluidPoint shift{delta.x / distance * amount * 0.5f, delta.y / distance * amount * 0.5f};
             correction_[j].x += shift.x;
             correction_[j].y += shift.y;
             correction_[i].x -= shift.x;
             correction_[i].y -= shift.y;
-        });
+        }
     }
     for (std::size_t i = 0; i < particles_.size(); ++i) {
         particles_[i].position.x += std::clamp(correction_[i].x, -2.0f, 2.0f);

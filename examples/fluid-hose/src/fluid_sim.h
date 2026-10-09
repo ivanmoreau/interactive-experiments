@@ -16,6 +16,7 @@ public:
 
 private:
     struct Particle { FluidPoint position; FluidPoint previous; FluidPoint velocity; };
+    struct Neighbor { int index; FluidPoint delta; float distance; float q; };
     float width_;
     float height_;
     float emission_ = 0;
@@ -25,6 +26,7 @@ private:
     std::vector<int> grid_heads_;
     std::vector<int> grid_next_;
     std::vector<FluidPoint> correction_;
+    std::vector<Neighbor> neighbor_cache_;
     int grid_width_;
     int grid_height_;
     float random();
