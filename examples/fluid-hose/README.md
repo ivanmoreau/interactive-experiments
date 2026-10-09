@@ -33,7 +33,7 @@ SDL handles the overlay window and event loop. The native macOS bridge reads nor
 
 The C++ simulation applies gravity and particle density constraints, using a spatial grid for neighboring particles. Each relaxation iteration caches a particle's neighbors and distances for its pressure pass, with scratch memory reused across steps. Water is retained until you clear it, so it accumulates instead of disappearing. The current capacity is 8,000 particles.
 
-Native Metal renders in two passes: particle splats add into a density texture, then a surface shader merges and shades that field into water. The final output uses premultiplied alpha so the desktop remains visible through empty areas. Three particle buffers allow GPU work to overlap safely with CPU updates.
+Native Metal renders in two passes: particle splats add into a density texture, then a surface shader merges and shades that field into water. Water opacity is capped at 78% after merging, with a softer edge transition, so the desktop shows through drops and settled pools. The final output uses premultiplied alpha. Three particle buffers allow GPU work to overlap safely with CPU updates.
 
 SDL GPU rejects transparent windows, so this example uses SDL's supported native Metal-view API, following the working floating triangle's approach.
 
@@ -56,7 +56,7 @@ This is a 2D prototype on the **primary display**. Windows are solid, axis-align
 
 - `--physics-check` requires no graphics access and checks gravity, pooling, collision, hose placement, displacement by moving and overlapping windows, and clearing.
 - `--probe` prints desktop bounds and the window collision rectangles without launching the overlay.
-- `--smoke-test` checks Metal density accumulation, a merged fluid surface, and transparent background pixels without creating a window.
+- `--smoke-test` checks Metal density accumulation, a translucent merged fluid surface, and transparent background pixels without creating a window.
 - `--duration 10` runs the overlay for ten seconds and exits.
 
 Requires macOS 14 or newer and Xcode's C++ and Metal tools to rebuild. The SDL3 SDK and library are cached under `.deps/SDL3`; `tools/setup-sdl.sh` installs the official SDK locally if needed.

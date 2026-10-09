@@ -299,10 +299,10 @@ bool smoke_test_hose_renderer(const char* shader_file) {
         std::vector<unsigned char> pixels(64 * 64 * 4);
         [texture getBytes:pixels.data() bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
         const auto* center = pixels.data() + (32 * 64 + 32) * 4;
-        if (center[3] < 180 || center[0] + center[1] + center[2] < 80 ||
+        if (center[3] < 170 || center[3] > 205 || center[0] + center[1] + center[2] < 80 ||
             pixels[0] != 0 || pixels[1] != 0 || pixels[2] != 0 || pixels[3] != 0)
-            return SDL_SetError("Fluid density did not merge into an opaque surface on a transparent background");
-        std::puts("PASS: Metal density accumulation, merged water surface, and transparent background.");
+            return SDL_SetError("Fluid density did not merge into a translucent surface on a transparent background");
+        std::puts("PASS: Metal density accumulation, translucent merged water surface, and transparent background.");
         return true;
     }
 }

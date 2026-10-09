@@ -39,7 +39,9 @@ fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
                                  texture2d<float> field [[texture(0)]]) {
     constexpr sampler sample_field(coord::normalized, address::clamp_to_edge, filter::linear);
     float density = field.sample(sample_field, in.uv).r;
-    float alpha = smoothstep(0.38, 0.68, density);
+    // Feather the edges and cap opacity after merging, so settled pools also
+    // let the desktop show through instead of becoming completely opaque.
+    float alpha = smoothstep(0.32, 0.78, density) * 0.78;
     float2 texel = 1.0 / float2(field.get_width(), field.get_height());
     float2 gradient = float2(
         field.sample(sample_field, in.uv + float2(texel.x, 0)).r - field.sample(sample_field, in.uv - float2(texel.x, 0)).r,
@@ -50,7 +52,8 @@ fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
     float depth = clamp(density * 0.09, 0.0, 1.0);
     float3 water = mix(float3(0.035, 0.50, 0.86), float3(0.015, 0.28, 0.63), depth);
     water += float3(0.55, 0.78, 0.9) * light;
-    float3 color = water * alpha;
+    // Keep LDR highlights within the opacity when premultiplying for the desktop.
+    float3 color = saturate(water) * alpha;
 
     if (scene.show_nozzle > 0.5) {
         float2 point = in.uv * float2(scene.width, scene.height);
