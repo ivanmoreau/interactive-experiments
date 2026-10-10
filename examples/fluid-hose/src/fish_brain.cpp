@@ -12,7 +12,9 @@ constexpr float inhibition_time = 0.010f;
 constexpr float rate_time = 0.050f;       // smoothing of the population rates
 constexpr int refractory_ticks = 2;
 constexpr float pi = 3.14159265f;
-constexpr float prey_seen = 0.25f;  // tectal vector strength that counts as seeing prey
+constexpr float prey_seen = 0.25f;
+constexpr float habituation_per_spike = 0.004f;
+constexpr float habituation_recovery = 60.0f;  // seconds  // tectal vector strength that counts as seeing prey
 
 float wrap(float angle) { return std::remainder(angle, 2 * pi); }
 
@@ -57,6 +59,10 @@ struct Population {
     float noise;      // standard deviation of the membrane potential noise
     float adaptation; // current added per spike, subtracted from the input
     float adaptation_time;
+    // Short-term synaptic depression: the fraction of the neuron's synaptic
+    // strength each spike uses up, and how long it takes to come back.
+    float depression = 0;
+    float recovery_time = 1;
 };
 
 const Population populations[population_count] = {
@@ -64,8 +70,11 @@ const Population populations[population_count] = {
     {"tectum", 3 * FishSenses::prey_bins, 0.2f, 0.25f, 0, 1},
     {"tectal inhibition", 8, 0.3f, 0.2f, 0, 1},
     {"strike zone", 6, 0.4f, 0.2f, 0, 1},
-    {"looming", 2 * FishSenses::loom_bins, 0.3f, 0.2f, 0, 1},
-    {"lateral line", 4, 0.3f, 0.2f, 0, 1},
+    // Looming and lateral-line synapses onto the Mauthner cells tire with
+    // use, so a fish stops fleeing a harmless stimulus that keeps repeating
+    // from the same direction (short-term habituation).
+    {"looming", 2 * FishSenses::loom_bins, 0.3f, 0.2f, 0, 1, habituation_per_spike, habituation_recovery},
+    {"lateral line", 4, 0.3f, 0.2f, 0, 1, habituation_per_spike, habituation_recovery},
     {"Mauthner (dorsal)", 1, 0, 0.05f, 0, 1},
     {"Mauthner (ventral)", 1, 0, 0.05f, 0, 1},
     {"escape inhibition", 4, 0, 0.05f, 0, 1},
@@ -98,6 +107,7 @@ struct FishBrain::Impl {
     int first[population_count + 1] = {};
     std::vector<int> owner;  // population of each neuron
     std::vector<float> voltage, excitation, inhibition, adaptation, input;
+    std::vector<float> strength;  // remaining synaptic strength under depression, 0 to 1
     std::vector<int> refractory;
     std::vector<std::uint32_t> synapse_start;
     std::vector<Synapse> synapses;
@@ -151,6 +161,7 @@ struct FishBrain::Impl {
         excitation.assign(count, 0);
         inhibition.assign(count, 0);
         adaptation.assign(count, 0);
+        strength.assign(count, 1);
         input.assign(count, 0);
         refractory.assign(count, 0);
 
@@ -298,11 +309,18 @@ struct FishBrain::Impl {
         int counts[population_count] = {};
         for (const auto i : spiked) {
             ++counts[owner[i]];
+            const Population& p = populations[owner[i]];
+            const float scale = strength[i] * membrane_time / 4;
+            strength[i] -= p.depression * strength[i];
             for (std::uint32_t k = synapse_start[i]; k < synapse_start[i + 1]; ++k) {
                 const auto& synapse = synapses[k];
-                if (synapse.weight > 0) excitation[synapse.target] += synapse.weight * membrane_time / excitation_time / 4;
-                else inhibition[synapse.target] += synapse.weight * membrane_time / inhibition_time / 4;
+                if (synapse.weight > 0) excitation[synapse.target] += synapse.weight * scale / excitation_time;
+                else inhibition[synapse.target] += synapse.weight * scale / inhibition_time;
             }
+        }
+        for (int i = 0; i < count; ++i) {
+            const Population& p = populations[owner[i]];
+            if (p.depression > 0) strength[i] += (1 - strength[i]) * tick / p.recovery_time;
         }
         const float keep = std::exp(-tick / rate_time);
         for (int p = 0; p < population_count; ++p)
@@ -557,6 +575,33 @@ bool run_brain_checks(std::uint32_t seed) {
         print_rates(startled);
         return false;
     }
+
+    // Habituation: the same harmless threat, again and again from the same
+    // direction, soon stops causing escapes. One from a new direction still
+    // does, and after a couple of minutes' rest the old one works again.
+    FishBrain habituating(seed + 16);
+    simulate(habituating, calm, 2);
+    auto pulses = [&](int count, int first_bin) {
+        std::vector<int> escaped;
+        FishSenses pulse = calm;
+        pulse.looming[first_bin] = pulse.looming[first_bin + 1] = 1.0f;
+        for (int i = 0; i < count; ++i) {
+            escaped.push_back(simulate(habituating, pulse, 0.3f).escapes > 0);
+            simulate(habituating, calm, 2.7f);
+        }
+        return escaped;
+    };
+    const auto repeated = pulses(10, 1);
+    const int early = repeated[0] + repeated[1] + repeated[2];
+    const int late = repeated[7] + repeated[8] + repeated[9];
+    const int novel = pulses(1, 5)[0];
+    simulate(habituating, calm, 150);
+    const int rested = pulses(1, 1)[0];
+    std::printf("  habituation: escapes on pulses");
+    for (const int e : repeated) std::printf(" %d", e);
+    std::printf(", new direction %d, after rest %d\n", novel, rested);
+    if (!check(early >= 2 && late <= 1, "a repeated harmless threat stops causing escapes")) return false;
+    if (!check(novel && rested, "a threat from a new direction, or after a rest, still causes an escape")) return false;
 
     // Out of water, the fish thrashes.
     FishBrain gasping(seed + 12);
