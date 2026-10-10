@@ -1,3 +1,7 @@
 .deps/
 build/
 .DS_Store
+.devenv*
+.direnv/
+devenv.local.nix
+devenv.local.yaml

@@ -4,13 +4,14 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
 SDL_DIR="${SDL3_ROOT:-$PROJECT_DIR/.deps/SDL3}"
-SDL_LIBRARY="$SDL_DIR/lib/libSDL3.0.dylib"
+SDL_LIBRARY="${SDL3_LIBRARY:-$SDL_DIR/lib/libSDL3.0.dylib}"
 APP_DIR="$BUILD_DIR/Hello SDL GPU.app"
 
 if [[ ! -f "$SDL_DIR/include/SDL3/SDL_gpu.h" || ! -f "$SDL_LIBRARY" ]]; then
-    printf 'SDL3 headers/library are missing. Run ./tools/setup-sdl.sh or set SDL3_ROOT.\n' >&2
+    printf 'SDL3 headers/library are missing. Enter the repository devenv shell, or set SDL3_ROOT and SDL3_LIBRARY.\n' >&2
     exit 1
 fi
+"$PROJECT_DIR/../../tools/check-native-tools.sh"
 
 mkdir -p "$BUILD_DIR" "$BUILD_DIR/lib" "$APP_DIR/Contents/MacOS" \
     "$APP_DIR/Contents/Resources" "$APP_DIR/Contents/Frameworks"

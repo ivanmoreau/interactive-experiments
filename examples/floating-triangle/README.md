@@ -4,7 +4,7 @@ A small native C++17 macOS application using **SDL3 + SDL GPU's Metal backend** 
 
 ## Run
 
-The executable and app bundle have already been built in this workspace. From this directory:
+Enter the shared development environment from the repository root with `devenv shell`, then build this example with `./build.sh` from its directory (or use `build-examples` at the root). See the [repository setup](../../README.md). From this directory:
 
 ```sh
 ./run.sh
@@ -50,7 +50,7 @@ The hardware inspection found:
 
 Apple Silicon satisfies [SDL GPU's Metal hardware requirements](https://wiki.libsdl.org/SDL3/CategoryGPU). The local SDL library requires macOS 14, which this device meets.
 
-The sandboxed execution environment could not obtain a Metal device or connect to a display. Compilation succeeded, but a visible frame and the GPU pixel-readback check could not be verified here. The machine's reported Metal support and process-level GPU access are recorded separately in [the device report](build/device-capabilities.json).
+On October 9, 2026, the locked devenv SDK built the app successfully on this machine. Pixel-readback checks passed for both the SDL GPU renderer and the native Metal floating renderer; the packaged app's floating readback check also passed. The floating window's compositing and dragging have been confirmed interactively. The machine's reported capabilities are recorded separately in [the device report](build/device-capabilities.json).
 
 To repeat the inspection from your normal Terminal session:
 
@@ -76,20 +76,19 @@ Requires macOS 14 or newer and Xcode with its C++ compiler and Metal tools. Thos
 ./build.sh
 ```
 
-The script compiles the Metal shaders into `build/hello.metallib`, builds the C++ executable with optimization and warnings treated as errors, and assembles an app bundle with local ad hoc code signatures. It uses project-local dependencies under `.deps/SDL3`. Set `SDL3_ROOT` to use another SDL SDK with `include/SDL3` and `lib/libSDL3.0.dylib`.
+Run the build inside the repository's devenv shell. The script compiles the Metal shaders into `build/hello.metallib`, builds the C++ executable with optimization and warnings treated as errors, and assembles an app bundle with local ad hoc code signatures. It uses the SDL header and library paths exported by devenv. `SDL3_ROOT` and `SDL3_LIBRARY` can select a custom SDK; a standalone SDK containing `include/SDL3` and `lib/libSDL3.0.dylib` needs only `SDL3_ROOT`.
 
-### Dependency bootstrap
+### Dependencies
 
-This workspace's initial SDK uses a cached SDL 3.4.10 library and official SDL public headers. Supporting headers came from upstream; two unavailable headers contain explicitly marked compatibility declarations for this demo. Their provenance is recorded in `.deps/SDL3/PROVENANCE.json`.
+The root `devenv.lock` pins Nixpkgs, which provides complete, matching SDL3 headers and its library for both examples. The current pin contains SDL 3.4.10. Bash, Git, and Python are provided by the same environment. Xcode supplies the native compiler and Metal tools.
 
-For a complete SDK with matching headers, run the included downloader from a Terminal session with network access:
+From the repository root:
 
 ```sh
-./tools/setup-sdl.sh
-./build.sh
+devenv shell -- build-examples
 ```
 
-It downloads the official SDL 3.4.10 macOS SDK into `.deps/SDL3` and replaces the bootstrap headers. This download could not be exercised in the network-restricted execution environment. Dependencies and build output are excluded by `.gitignore`.
+Each bundle includes its own SDL library, so running the built app does not require Nix. Existing `.deps/SDL3` bootstrap folders are ignored and remain a fallback outside devenv; they are not required in a fresh checkout. Dependencies and generated build output stay outside Git.
 
 ## Code
 

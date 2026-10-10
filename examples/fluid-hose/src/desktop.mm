@@ -19,12 +19,14 @@
 @property(nonatomic) BOOL quitRequested;
 @property(nonatomic) BOOL tiltEnabled;
 @property(nonatomic) BOOL reverseTilt;
+@property(nonatomic) SDL_DisplayID requestedDisplay;
 - (void)togglePour:(NSMenuItem*)sender;
 - (void)togglePause:(NSMenuItem*)sender;
 - (void)clearWater:(NSMenuItem*)sender;
 - (void)quit:(NSMenuItem*)sender;
 - (void)toggleTilt:(NSMenuItem*)sender;
 - (void)toggleReverseTilt:(NSMenuItem*)sender;
+- (void)selectDisplay:(NSMenuItem*)sender;
 @end
 
 @implementation FluidMenuController
@@ -46,6 +48,9 @@
     self.reverseTilt = !self.reverseTilt;
     sender.state = self.reverseTilt ? NSControlStateValueOn : NSControlStateValueOff;
 }
+- (void)selectDisplay:(NSMenuItem*)sender {
+    self.requestedDisplay = [sender.representedObject unsignedIntValue];
+}
 @end
 
 struct HoseRenderer {
@@ -63,6 +68,9 @@ struct HoseRenderer {
     NSStatusItem* status_item = nil;
     FluidMenuController* controls = nil;
     NSMenuItem* tilt_status = nil;
+    NSMenu* display_menu = nil;
+    std::vector<DesktopDisplay> display_options;
+    SDL_DisplayID selected_display = 0;
     TiltStatus previous_tilt_status = TiltStatus::off;
     std::string device_name;
 
@@ -202,6 +210,11 @@ HoseRenderer* create_hose_renderer(SDL_Window* window, const char* shader_file, 
         hint.enabled = NO;
         [menu addItem:hint];
         [menu addItem:NSMenuItem.separatorItem];
+        NSMenuItem* display = [[NSMenuItem alloc] initWithTitle:@"Display" action:nil keyEquivalent:@""];
+        renderer->display_menu = [[NSMenu alloc] initWithTitle:@"Display"];
+        display.submenu = renderer->display_menu;
+        [menu addItem:display];
+        [menu addItem:NSMenuItem.separatorItem];
         NSMenuItem* pour = [[NSMenuItem alloc] initWithTitle:@"Pour continuously" action:@selector(togglePour:) keyEquivalent:@""];
         pour.target = renderer->controls;
         pour.state = continuous ? NSControlStateValueOn : NSControlStateValueOff;
@@ -248,8 +261,10 @@ DesktopInput poll_desktop_input(HoseRenderer* renderer, const SDL_Rect& canvas) 
         DesktopInput input{pointer, option || static_cast<bool>(renderer->controls.pouring),
                            static_cast<bool>(renderer->controls.paused), static_cast<bool>(renderer->controls.clearRequested),
                            static_cast<bool>(renderer->controls.quitRequested),
-                           static_cast<bool>(renderer->controls.tiltEnabled), static_cast<bool>(renderer->controls.reverseTilt)};
+                           static_cast<bool>(renderer->controls.tiltEnabled), static_cast<bool>(renderer->controls.reverseTilt),
+                           renderer->controls.requestedDisplay};
         renderer->controls.clearRequested = NO;
+        renderer->controls.requestedDisplay = 0;
         return input;
     }
 }
@@ -264,6 +279,82 @@ void set_hose_tilt_status(HoseRenderer* renderer, TiltStatus status) {
             case TiltStatus::active: renderer->tilt_status.title = @"Tilt: active"; break;
             case TiltStatus::unavailable: renderer->tilt_status.title = @"Tilt: unavailable — gravity down"; break;
         }
+    }
+}
+
+bool read_desktop_displays(std::vector<DesktopDisplay>& output) {
+    @autoreleasepool {
+        int count = 0;
+        std::unique_ptr<SDL_DisplayID, decltype(&SDL_free)> ids(SDL_GetDisplays(&count), SDL_free);
+        if (!ids) return false;
+        output.clear();
+        const auto primary = SDL_GetPrimaryDisplay();
+        for (int i = 0; i < count; ++i) {
+            SDL_Rect bounds{}, canvas{};
+            if (!SDL_GetDisplayBounds(ids.get()[i], &bounds) ||
+                !SDL_GetDisplayUsableBounds(ids.get()[i], &canvas)) return false;
+            if (canvas.w < 64 || canvas.h < 64) continue;
+            const char* name = SDL_GetDisplayName(ids.get()[i]);
+            std::string uuid;
+            // SDL's Cocoa display bounds use Quartz coordinates. Match the full
+            // bounds, not visibleFrame, which excludes the menu bar and Dock.
+            for (NSScreen* screen in NSScreen.screens) {
+                const CGDirectDisplayID native_id = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+                const CGRect native_bounds = CGDisplayBounds(native_id);
+                const SDL_Rect native_rect{static_cast<int>(native_bounds.origin.x), static_cast<int>(native_bounds.origin.y),
+                                           static_cast<int>(native_bounds.size.width), static_cast<int>(native_bounds.size.height)};
+                if (!same_rect(native_rect, bounds)) continue;
+                CFUUIDRef identifier = CGDisplayCreateUUIDFromDisplayID(native_id);
+                if (identifier) {
+                    NSString* value = CFBridgingRelease(CFUUIDCreateString(kCFAllocatorDefault, identifier));
+                    if (value.UTF8String) uuid = value.UTF8String;
+                    CFRelease(identifier);
+                }
+                break;
+            }
+            output.push_back({ids.get()[i], name ? name : "Display", uuid, bounds, canvas, ids.get()[i] == primary});
+        }
+        if (output.empty()) return SDL_SetError("No usable desktop display is available");
+        return true;
+    }
+}
+
+std::string saved_hose_display() {
+    @autoreleasepool {
+        NSUserDefaults* preferences = [[NSUserDefaults alloc] initWithSuiteName:@"local.interactive-experiences.fluid-hose"];
+        NSString* uuid = [preferences stringForKey:@"SelectedDisplayUUID"];
+        return uuid.UTF8String ? uuid.UTF8String : "";
+    }
+}
+
+void save_hose_display(const DesktopDisplay& display) {
+    if (display.uuid.empty()) return;
+    @autoreleasepool {
+        NSUserDefaults* preferences = [[NSUserDefaults alloc] initWithSuiteName:@"local.interactive-experiences.fluid-hose"];
+        [preferences setObject:[NSString stringWithUTF8String:display.uuid.c_str()] forKey:@"SelectedDisplayUUID"];
+    }
+}
+
+void set_hose_displays(HoseRenderer* renderer, const std::vector<DesktopDisplay>& displays, SDL_DisplayID selected) {
+    if (renderer->display_options == displays && renderer->selected_display == selected) return;
+    renderer->display_options = displays;
+    renderer->selected_display = selected;
+    @autoreleasepool {
+        [renderer->display_menu removeAllItems];
+        unsigned index = 0;
+        for (const auto& display : displays) {
+            NSString* title = [NSString stringWithFormat:@"%u. %s — %d × %d%@", ++index, display.name.c_str(),
+                              display.bounds.w, display.bounds.h, display.primary ? @" (main)" : @""];
+            NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:title action:@selector(selectDisplay:) keyEquivalent:@""];
+            item.target = renderer->controls;
+            item.representedObject = @(display.id);
+            item.state = display.id == selected ? NSControlStateValueOn : NSControlStateValueOff;
+            [renderer->display_menu addItem:item];
+        }
+        [renderer->display_menu addItem:NSMenuItem.separatorItem];
+        NSMenuItem* hint = [[NSMenuItem alloc] initWithTitle:@"Switching displays clears the water" action:nil keyEquivalent:@""];
+        hint.enabled = NO;
+        [renderer->display_menu addItem:hint];
     }
 }
 

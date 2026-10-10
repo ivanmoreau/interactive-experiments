@@ -4,13 +4,14 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
 SDL_DIR="${SDL3_ROOT:-$PROJECT_DIR/.deps/SDL3}"
-SDL_LIBRARY="$SDL_DIR/lib/libSDL3.0.dylib"
+SDL_LIBRARY="${SDL3_LIBRARY:-$SDL_DIR/lib/libSDL3.0.dylib}"
 APP_DIR="$BUILD_DIR/Fluid Hose.app"
 
 if [[ ! -f "$SDL_DIR/include/SDL3/SDL_gpu.h" || ! -f "$SDL_LIBRARY" ]]; then
-    printf 'SDL3 is missing. Run ./tools/setup-sdl.sh or set SDL3_ROOT.\n' >&2
+    printf 'SDL3 is missing. Enter the repository devenv shell, or set SDL3_ROOT and SDL3_LIBRARY.\n' >&2
     exit 1
 fi
+"$PROJECT_DIR/../../tools/check-native-tools.sh"
 
 mkdir -p "$BUILD_DIR/lib" "$APP_DIR/Contents/MacOS" \
     "$APP_DIR/Contents/Resources" "$APP_DIR/Contents/Frameworks"
@@ -34,7 +35,7 @@ xcrun clang++ -std=c++17 -O2 -g -fobjc-arc -Wall -Wextra -Wpedantic -Werror \
     -c "$PROJECT_DIR/src/desktop.mm" -o "$BUILD_DIR/desktop.o"
 xcrun clang++ -std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror \
     -mmacosx-version-min=14.0 -I "$SDL_DIR/include" \
-    "$PROJECT_DIR/src/main.cpp" "$PROJECT_DIR/src/fluid_sim.cpp" "$PROJECT_DIR/src/motion.cpp" \
+    "$PROJECT_DIR/src/main.cpp" "$PROJECT_DIR/src/fluid_sim.cpp" "$PROJECT_DIR/src/motion.cpp" "$PROJECT_DIR/src/displays.cpp" \
     "$BUILD_DIR/desktop.o" "$BUILD_DIR/lib/libSDL3.0.dylib" \
     -framework AppKit -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics \
     -Wl,-rpath,@executable_path/lib -Wl,-rpath,@executable_path/../Frameworks \

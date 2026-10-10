@@ -1,0 +1,6 @@
+# yaml-language-server: $schema=https://devenv.sh/devenv.schema.json
+inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixpkgs-unstable
+  devenv:
+    url: github:cachix/devenv/df5c75a82c3ac3d70a13c90fb869b7e44470a118?dir=src/modules
