@@ -41,6 +41,14 @@ struct HindbrainConnectome {
     static std::shared_ptr<const HindbrainConnectome> load(const std::string& path);
 };
 
+// Inherited differences in how a brain behaves, each 1 for an average fish.
+// They tune strengths in the brain, not its wiring.
+struct FishTraits {
+    float boldness = 1;   // weakens the looming input to the escape cells
+    float appetite = 1;   // strengthens hunger's drive
+    float curiosity = 1;  // more bouts, and more turning around to explore
+};
+
 // A swim bout: larval fish move in discrete flicks rather than continuously.
 enum class BoutKind { swim, hunt, strike, escape, reverse };
 struct FishBout {
@@ -59,7 +67,7 @@ public:
     // measured wiring; shuffle_hindbrain rewires it at random, keeping each
     // cell type's synapse counts (a control for checks).
     explicit FishBrain(std::uint32_t seed, std::shared_ptr<const HindbrainConnectome> hindbrain = nullptr,
-                       bool shuffle_hindbrain = false);
+                       bool shuffle_hindbrain = false, FishTraits traits = {});
     ~FishBrain();
     FishBrain(FishBrain&&) noexcept;
     FishBrain& operator=(FishBrain&&) noexcept;

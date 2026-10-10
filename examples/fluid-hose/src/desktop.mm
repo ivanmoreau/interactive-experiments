@@ -802,7 +802,10 @@ void set_hose_fish_status(HoseRenderer* renderer, const FishStatus& status) {
     else if (!status.alive) text = status.dead == 1 ? "Your fish died 💀" : "All your fish died 💀";
     else {
         const unsigned alive = status.alive;
-        text = alive == 1 ? "Fish: " : std::to_string(alive) + " fish: ";
+        text = alive == 1 ? "Fish: " : std::to_string(alive) + " fish";
+        if (alive > 1 && status.young) text += " (" + std::to_string(status.young) + " young)";
+        if (status.generations > 1) text += ", " + std::to_string(status.generations) + " generations";
+        if (alive > 1) text += ": ";
         std::vector<std::string> notes;
         if (status.gasping) notes.push_back(alive == 1 ? "out of water!" : std::to_string(status.gasping) + " out of water!");
         if (status.starving) notes.push_back(alive == 1 ? "starving" : std::to_string(status.starving) + " starving");
@@ -1203,8 +1206,19 @@ bool render_hose_snapshot(const char* shader_file, const char* output_file, floa
             // once it has formed, and food is sprinkled over it near the end.
             if (pond.duck_count() < duck_count && t >= 1.0f + pond.duck_count() * 0.7f)
                 pond.add_duck({150.0f + std::fmod(pond.duck_count() * 263.0f, width - 300), 40});
-            if (pond.fish_count() < fish_count && t >= 3.0f + pond.fish_count() * 0.5f)
-                pond.add_fish({120.0f + std::fmod(pond.fish_count() * 157.0f, 400.0f), height - 40});
+            if (pond.fish_count() < fish_count && t >= 3.0f + pond.fish_count() * 0.5f) {
+                // A family portrait: a female, a male, then young of every age,
+                // one of them spotted.
+                const std::size_t k = pond.fish_count();
+                FishGenome::Random genes{static_cast<std::uint32_t>(97 + k * 31)};
+                FishBirth birth;
+                birth.genome = FishGenome::founder(genes);
+                birth.female = k % 2 == 0;
+                birth.growth = k < 2 ? 1.0f : k == 2 ? 0.55f : k == 3 ? 0.15f : 0.75f;
+                if (k == 4) birth.genome.stripes = 0.05f;
+                if (k == 1) birth.genome.hue = 0.8f;
+                pond.add_fish({120.0f + std::fmod(k * 157.0f, 400.0f), height - 40}, birth);
+            }
             if (fish_count && t >= seconds - 4 && t < seconds - 3 && i % 12 == 0)
                 pond.add_food({100.0f + std::fmod(i * 37.0f, 400.0f), height - 160});
             pond.set_windows(obstacles);

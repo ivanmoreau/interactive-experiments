@@ -429,8 +429,15 @@ int main(int argc, char** argv) {
                                       fish.hunting > 0.3f ? "hunting" : "exploring",
                                       fish.energy * 100, fish.oxygen * 100, fish.meals,
                                       fish.escapes ? (" · " + std::to_string(fish.escapes) + " escapes").c_str() : "");
-                        brain_window.update(*pond.fish_brain(watched_fish),
-                                            "Fish " + std::to_string(watched_fish + 1) + " of " + std::to_string(vitals.size()), status);
+                        const char* stages[] = {"larva", "juvenile", "adult"};
+                        std::string title = fish.name + (fish.birth.female ? " ♀" : " ♂") + " · " +
+                                            stages[static_cast<int>(fish.stage)] + " · generation " +
+                                            std::to_string(fish.birth.generation);
+                        // Names come from fish numbers, so parents keep theirs after they are gone.
+                        if (fish.birth.mother)
+                            title += " · child of " + fish_name(fish.birth.mother) + " and " + fish_name(fish.birth.father);
+                        title += "   (" + std::to_string(watched_fish + 1) + " of " + std::to_string(vitals.size()) + ")";
+                        brain_window.update(*pond.fish_brain(watched_fish), title, status);
                     }
                 }
             }

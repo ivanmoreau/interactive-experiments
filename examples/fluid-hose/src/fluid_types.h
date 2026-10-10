@@ -58,14 +58,16 @@ struct SolverUniforms {
 // the same convention. facing is +scale for a duck facing right and -scale
 // for one facing left; other kinds use +scale. look holds drawing details:
 // a duck's colour variant in look[0]; for a fish, tail bend, eye vergence,
-// health, and its belly side times how foreshortened it looks mid-turn.
-// tag identifies the body in its water sample.
+// health, and its belly side times how foreshortened it looks mid-turn;
+// style holds a fish's inherited looks: stripe hue, stripe pattern, and its
+// sex times its growth (negative for a female). tag identifies the body in
+// its water sample.
 struct PondBody {
     float x, y, angle, facing;
     float vx, vy, spin, kind;
     float look[4];
     fluid_uint tag;
-    float padding0, padding1, padding2;
+    float style[3];
 };
 
 #define BODY_DUCK 0.0f

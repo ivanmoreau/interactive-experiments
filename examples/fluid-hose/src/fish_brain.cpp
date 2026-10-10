@@ -246,6 +246,7 @@ struct FishBrain::Impl {
     int first[population_count + 1] = {};
     std::shared_ptr<const HindbrainConnectome> hindbrain;
     bool shuffle_hindbrain = false;
+    FishTraits traits;
     std::vector<int> owner;  // population of each neuron
     std::vector<float> voltage, excitation, inhibition, adaptation, input;
     std::vector<float> strength;  // remaining synaptic strength under depression, 0 to 1
@@ -367,10 +368,10 @@ struct FishBrain::Impl {
         // escape recruits inhibition that silences both cells for a while.
         // Their fields overlap straight ahead and behind, so a threat there
         // drives both and the faster one wins.
-        wire(looming, mauthner_dorsal, 1.0f, 0.6f, [&](int l, int) { return std::sin(FishSenses::loom_angle(l / 2)) > -0.4f ? 1.0f : 0.0f; });
-        wire(looming, mauthner_ventral, 1.0f, 0.6f, [&](int l, int) { return std::sin(FishSenses::loom_angle(l / 2)) < 0.4f ? 1.0f : 0.0f; });
-        wire(lateral_line, mauthner_dorsal, 1.0f, 0.25f);
-        wire(lateral_line, mauthner_ventral, 1.0f, 0.25f);
+        wire(looming, mauthner_dorsal, 1.0f, 0.6f / traits.boldness, [&](int l, int) { return std::sin(FishSenses::loom_angle(l / 2)) > -0.4f ? 1.0f : 0.0f; });
+        wire(looming, mauthner_ventral, 1.0f, 0.6f / traits.boldness, [&](int l, int) { return std::sin(FishSenses::loom_angle(l / 2)) < 0.4f ? 1.0f : 0.0f; });
+        wire(lateral_line, mauthner_dorsal, 1.0f, 0.25f / traits.boldness);
+        wire(lateral_line, mauthner_ventral, 1.0f, 0.25f / traits.boldness);
         wire(mauthner_dorsal, escape_inhibition, 1.0f, 3.0f);
         wire(mauthner_ventral, escape_inhibition, 1.0f, 3.0f);
         wire(escape_inhibition, mauthner_dorsal, 1.0f, -6.0f);
@@ -492,7 +493,8 @@ struct FishBrain::Impl {
         set(blocked_dorsal, populations[blocked_dorsal].tonic + 2.5f * s.blocked_dorsal);
         set(blocked_ventral, populations[blocked_ventral].tonic + 2.5f * s.blocked_ventral);
         set(blocked_ahead, populations[blocked_ahead].tonic + 2.5f * s.blocked_ahead);
-        set(hunger, populations[hunger].tonic + 1.3f * s.hunger);
+        set(hunger, populations[hunger].tonic + 1.3f * s.hunger * traits.appetite);
+        set(bout_generator, populations[bout_generator].tonic + 0.08f * (traits.curiosity - 1));
         set(satiety, populations[satiety].tonic + 1.6f * s.fullness);
         set(hypoxia, populations[hypoxia].tonic + 2.0f * s.hypoxia);
     }
@@ -577,10 +579,12 @@ struct FishBrain::Impl {
     }
 };
 
-FishBrain::FishBrain(std::uint32_t seed, std::shared_ptr<const HindbrainConnectome> hindbrain, bool shuffle_hindbrain)
+FishBrain::FishBrain(std::uint32_t seed, std::shared_ptr<const HindbrainConnectome> hindbrain, bool shuffle_hindbrain,
+                     FishTraits traits)
     : impl_(std::make_unique<Impl>(seed)) {
     impl_->hindbrain = std::move(hindbrain);
     impl_->shuffle_hindbrain = shuffle_hindbrain;
+    impl_->traits = traits;
     impl_->build();
     impl_->trace.assign(impl_->voltage.size(), 0);
 }
@@ -707,7 +711,7 @@ bool FishBrain::advance(const FishSenses& senses, float dt, FishBout& bout) {
         // Exploration turns left or right, out of the screen plane. When they
         // add up to more than a right angle, the fish has turned around.
         const float left = s.rate[turning_left], right = s.rate[turning_right];
-        s.yaw += 0.6f * (left - right) / (left + right + 10.0f) + 0.05f * s.gaussian();
+        s.yaw += 0.6f * s.traits.curiosity * (left - right) / (left + right + 10.0f) + 0.05f * s.gaussian();
         const float dorsal = s.rate[steer_dorsal], ventral = s.rate[steer_ventral];
         const float steer = 0.7f * (dorsal - ventral) / (dorsal + ventral + 30.0f) + noise;
         if (s.rate[reverse] > 45.0f || std::abs(s.yaw) > 1.0f) {
@@ -920,6 +924,24 @@ bool run_brain_checks(std::uint32_t seed) {
     std::printf(", new direction %d, after rest %d\n", novel, rested);
     if (!check(early >= 2 && late <= 1, "a repeated harmless threat stops causing escapes")) return false;
     if (!check(novel && rested, "a threat from a new direction, or after a rest, still causes an escape")) return false;
+
+    // Inherited boldness: a bold fish ignores a moderate threat that a timid
+    // one flees.
+    auto flee_count = [&](float boldness) {
+        FishBrain fish(seed + 28, nullptr, false, {boldness, 1, 1});
+        simulate(fish, calm, 2);
+        FishSenses moderate = calm;
+        moderate.looming[5] = moderate.looming[6] = 0.55f;
+        int fled = 0;
+        for (int i = 0; i < 6; ++i) {
+            fled += simulate(fish, moderate, 0.3f).escapes > 0;
+            simulate(fish, calm, 3);
+        }
+        return fled;
+    };
+    const int timid = flee_count(0.6f), bold = flee_count(1.5f);
+    std::printf("  boldness: a timid fish fled %d of 6 moderate threats, a bold one %d\n", timid, bold);
+    if (!check(timid > bold, "a bolder fish flees less")) return false;
 
     // Out of water, the fish thrashes.
     FishBrain gasping(seed + 12);
