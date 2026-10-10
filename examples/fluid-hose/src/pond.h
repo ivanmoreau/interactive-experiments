@@ -14,6 +14,7 @@ struct FishStatus {
     unsigned gasping = 0;   // out of the water
     unsigned dead = 0;
     unsigned young = 0;     // larvae and juveniles
+    unsigned eggs = 0;
     unsigned generations = 1;  // the highest generation alive
 };
 
@@ -39,11 +40,15 @@ struct PondState {
         unsigned meals;
     };
     struct Duck { FluidPoint position; float facing, variant; };
+    struct Egg { FluidPoint position; float age; FishBirth birth; };
     float width = 0, height = 0;
     std::uint32_t next_fish_number = 1;
     std::vector<Fish> fish;
     std::vector<Duck> ducks;
+    std::vector<Egg> eggs;
 };
+
+struct PondStats { unsigned eggs_laid, eggs_eaten, hatched; };
 
 enum class FishStage { larva, juvenile, adult };
 
@@ -63,7 +68,8 @@ struct FishVitals {
     bool in_water;
     unsigned meals;
     unsigned escapes;
-    float hunting;  // 0 to 1
+    float hunting;   // 0 to 1
+    float courting;  // 0 to 1
 };
 
 // Rubber ducks, fish, and fish food simulated with Jolt Physics, locked to
@@ -93,7 +99,8 @@ public:
     bool add_fish(FluidPoint position);
     // Adds a fish with a given start in life. Returns false when full.
     bool add_fish(FluidPoint position, const FishBirth& birth);
-    void clear_fish();
+    void clear_fish();  // and their eggs
+    void remove_fish(std::uint32_t number);
     std::size_t fish_count() const;
     // Drops one food flake; the oldest flake goes when there are too many.
     void add_food(FluidPoint position);
@@ -101,6 +108,13 @@ public:
     std::size_t food_count() const;
     // Fish watch the mouse pointer and flee when it rushes at them.
     void set_pointer(FluidPoint position);
+    // The urge to spawn, 0 to 1: high in the morning or with the lights just on.
+    // Fed adults feel it; courting pairs spawn; eggs hatch in a few minutes.
+    void set_spawning(float urge);
+    std::size_t egg_count() const;
+    PondStats stats() const;
+    // Lays a fertilized egg directly (for checks and snapshots).
+    void lay_egg(FluidPoint position, const FishBirth& birth, float age = 0);
     PondState state() const;
     // Brings back a saved pond, scaled to this pond's size, adding to what is here.
     void restore(const PondState& state);

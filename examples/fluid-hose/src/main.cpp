@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <cstdlib>
+#include <ctime>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -162,14 +163,15 @@ int main(int argc, char** argv) {
                           "Hold Option to pour at the mouse pointer. Release Option to stop.\n"
                           "The overlay lets clicks pass through: arrange windows normally.\n"
                           "Use the droplet menu in the menu bar to pour continuously, pause, clear, or quit.\n"
-                          "Choose a monitor in the Display submenu; switching clears the water.\n"
+                          "Choose a monitor in the Display submenu; the pond moves with it.\n"
                           "The app remembers your selected display and handles display disconnection.\n"
                           "--tilt lets Mac motion change gravity; toggle Use Mac tilt in the droplet menu.\n"
                           "The sensor helper stops and restores its settings when tilt is off or the app exits.\n"
                           "Windows are tracked live as rounded rectangles; moving one pushes the water.\n"
                           "--size and --liquid choose particle size and how runny the liquid is; the droplet menu changes them too.\n"
                           "--ducks drops rubber ducks at launch; the droplet menu adds and removes them too.\n"
-                          "--fish drops fish at launch. They need water to breathe and food to live:\n"
+                          "--fish drops fish at launch. They need water to breathe and food to live, grow up when fed,\n"
+                          "and spawn in the morning (7:00 to 7:45, or Lights on in the droplet menu); eggs hatch in minutes.\n"
                           "hold Control to sprinkle food at the pointer, or use Feed the fish in the droplet menu.\n"
                           "Show fish brain in the droplet menu (or --brain) opens a window of a fish's neurons firing.\n"
                           "--brain-snapshot draws that window for a hungry fish that sees food and is startled.\n"
@@ -348,6 +350,7 @@ int main(int argc, char** argv) {
         auto next_save = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         for (unsigned i = 0; i < initial_fish; ++i) pond.add_fish(drop_point());
         float sprinkle_wait = 0;
+        auto lights_until = std::chrono::steady_clock::time_point{};
         BrainWindow brain_window;
         bool brain_shown = false;
         std::size_t watched_fish = 0;
@@ -456,6 +459,16 @@ int main(int argc, char** argv) {
                 sprinkle_wait = 0.12f;
             }
             pond.set_pointer(input.pointer);
+            // Zebrafish spawn at first light: from 7:00 to 7:45 local time, or
+            // for five minutes after Lights on.
+            if (input.lights_on) lights_until = now + std::chrono::minutes(5);
+            {
+                const std::time_t clock = std::time(nullptr);
+                std::tm local{};
+                localtime_r(&clock, &local);
+                const bool morning = local.tm_hour == 7 && local.tm_min < 45;
+                pond.set_spawning(morning || now < lights_until ? 1.0f : 0.0f);
+            }
             set_hose_fish_status(app.renderer, pond.fish_status());
             // The brain window follows the menu, and unticks it when closed.
             if (input.show_brain != brain_shown) {
@@ -479,6 +492,7 @@ int main(int argc, char** argv) {
                         char status[160];
                         std::snprintf(status, sizeof(status), "%s · energy %.0f%% · air %.0f%% · %u flakes eaten%s",
                                       !fish.alive ? "dead" : !fish.in_water ? "out of water!" :
+                                      fish.courting > 0.3f ? (fish.birth.female ? "courted" : "courting") :
                                       fish.hunting > 0.3f ? "hunting" : "exploring",
                                       fish.energy * 100, fish.oxygen * 100, fish.meals,
                                       fish.escapes ? (" · " + std::to_string(fish.escapes) + " escapes").c_str() : "");

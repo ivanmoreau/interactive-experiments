@@ -56,8 +56,9 @@ vertex BodyOutput body_vertex(uint vertex_id [[vertex_id]], uint body_id [[insta
     const float4 look = float4(body.look[0], body.look[1], body.look[2], body.look[3]);
     // Probes are invisible: their quad collapses to nothing.
     const float3 style = float3(body.style[0], body.style[1], body.style[2]);
-    if (body.kind > 2.5) return {float4(2, 2, 0, 1), float2(0), body.kind, look, style};
-    const float reach = body.kind < 0.5 ? DUCK_REACH + 2.0 : body.kind < 1.5 ? FISH_REACH + 2.0 : FOOD_RADIUS * 1.6 + 2.0;
+    if (body.kind > 2.5 && body.kind < 3.5) return {float4(2, 2, 0, 1), float2(0), body.kind, look, style};
+    const float reach = body.kind < 0.5 ? DUCK_REACH + 2.0 : body.kind < 1.5 ? FISH_REACH + 2.0 :
+                        body.kind < 2.5 ? FOOD_RADIUS * 1.6 + 2.0 : EGG_RADIUS + 2.0;
     const float2 local = corners[vertex_id] * reach;
     const float2 scaled = local * float2(body.facing, abs(body.facing));
     const float c = cos(body.angle), s = sin(body.angle);
@@ -243,9 +244,34 @@ float4 draw_food(float2 p, float4 look) {
 }
 }
 
+// An egg: a clear shell around a yolk; the embryo curls and its eyes darken
+// as it develops. look: development 0 to 1, and 1 when dead (gone white).
+float4 draw_egg(float2 p, float4 look) {
+    constexpr float drawn = 2.6;  // drawn at this radius, then scaled
+    p *= drawn / EGG_RADIUS;
+    const float pixel = max(fwidth(p.x) + fwidth(p.y), 1e-3) * 0.7;
+    const float shell = length(p) - drawn;
+    if (shell > pixel * 2) return 0;
+    if (look.y > 0.5) return float4(0.9, 0.9, 0.86, 1.0) * saturate(0.5 - shell / pixel);
+    float4 egg = float4(float3(0.85, 0.92, 0.95) * 0.35, 0.35) * saturate(0.5 - shell / pixel);
+    egg = over(egg, float3(1.0), abs(shell + 0.35) - 0.12, pixel);  // the shell's rim
+    const float develop = look.x;
+    // The yolk shrinks as the embryo grows around it.
+    egg = over(egg, float3(0.98, 0.82, 0.45), length(p - float2(0.2, 0.3)) - mix(1.2, 0.6, develop), pixel);
+    if (develop > 0.3) {
+        const float angle = atan2(p.y, p.x);
+        const float body = abs(length(p) - 1.5) - 0.35;
+        const float curl = angle - mix(3.0, 0.5, develop);  // the tail grows around the yolk
+        egg = over(egg, float3(0.92, 0.88, 0.8), max(body, curl), pixel);
+        egg = over(egg, float3(0.1, 0.1, 0.12), length(p - float2(-1.1, -0.9)) - 0.42 * smoothstep(0.4, 0.8, develop), pixel);
+    }
+    return egg;
+}
+
 fragment float4 body_fragment(BodyOutput in [[stage_in]]) {
     const float4 color = in.kind < 0.5 ? draw_duck(in.local, in.look.x) :
-                         in.kind < 1.5 ? draw_fish(in.local, in.look, in.style) : draw_food(in.local, in.look);
+                         in.kind < 1.5 ? draw_fish(in.local, in.look, in.style) :
+                         in.kind < 2.5 ? draw_food(in.local, in.look) : draw_egg(in.local, in.look);
     if (color.a <= 0.0) discard_fragment();
     return color;
 }

@@ -51,6 +51,13 @@ bool save_pond(const std::filesystem::path& dir, const PondState& state, const s
     text << "next-fish " << state.next_fish_number << '\n';
     for (const auto& duck : state.ducks)
         text << "duck " << duck.position.x << ' ' << duck.position.y << ' ' << duck.facing << ' ' << duck.variant << '\n';
+    for (const auto& egg : state.eggs) {
+        const auto& b = egg.birth;
+        text << "egg " << egg.position.x << ' ' << egg.position.y << ' ' << egg.age << ' ' << (b.female ? 'f' : 'm') << ' '
+             << b.generation << ' ' << b.mother << ' ' << b.father << ' ';
+        write_genome(text, b.genome);
+        text << '\n';
+    }
     for (const auto& fish : state.fish) {
         const auto& b = fish.birth;
         text << "fish " << fish.number << ' ' << (b.female ? 'f' : 'm') << ' ' << b.growth << ' ' << b.generation << ' ' << b.mother
@@ -87,6 +94,15 @@ bool load_pond(const std::filesystem::path& dir, PondState& state, std::vector<F
         else if (word == "duck") {
             PondState::Duck duck{};
             if (entry >> duck.position.x >> duck.position.y >> duck.facing >> duck.variant) loaded.ducks.push_back(duck);
+        } else if (word == "egg") {
+            PondState::Egg egg{};
+            char sex = 'm';
+            auto& b = egg.birth;
+            entry >> egg.position.x >> egg.position.y >> egg.age >> sex >> b.generation >> b.mother >> b.father;
+            if (!entry || !read_genome(entry, b.genome)) continue;
+            b.female = sex == 'f';
+            b.growth = 0.02f;
+            loaded.eggs.push_back(egg);
         } else if (word == "fish") {
             PondState::Fish fish{};
             char sex = 'm';
@@ -99,7 +115,7 @@ bool load_pond(const std::filesystem::path& dir, PondState& state, std::vector<F
             fish.alive = alive != 0;
             loaded.fish.push_back(fish);
         }
-        if (!entry && word != "fish") return false;
+        if (!entry && word != "fish" && word != "egg") return false;
     }
     if (!(loaded.width > 0 && loaded.height > 0)) return false;
 

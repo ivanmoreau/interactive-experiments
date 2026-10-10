@@ -56,6 +56,13 @@ constexpr float meal_energy = 0.05f;   // per flake
 constexpr float meal_fullness = 0.12f;
 constexpr float sight_distance = 420;
 constexpr float flip_turn = 1.75f;
+constexpr float hatch_seconds = 3 * 60;     // real zebrafish take two to three days
+constexpr float spawn_rest_seconds = 10 * 60;
+constexpr float egg_density = 1.08f;       // relative to water
+constexpr float egg_dry_seconds = 30;
+constexpr float egg_energy = 0.03f;        // to a fish that eats one
+constexpr float egg_cost = 0.025f;         // to the mother, per egg
+constexpr std::size_t max_eggs = 60;
 constexpr float growth_seconds = 20 * 60;  // well fed, a hatchling is full grown in about 20 minutes
 constexpr float meal_growth = 0.003f;
 constexpr float hatchling_scale = 0.4f;    // a hatchling's length relative to its adult length
@@ -219,6 +226,9 @@ struct Pond::Impl {
         std::uint32_t mother = 0, father = 0;
         std::uint32_t brain_seed = 0;
         float shape_scale = 1;  // the scale of its current collision shape
+        float spawn_rest = 0;   // seconds before a female can spawn again
+        int clutch_left = 0;    // eggs left to lay in this spawning
+        float lay_wait = 0;
         FluidPoint probes[3] = {};
         float energy = fish_start_energy, fullness = 0, oxygen = 1;
         bool alive = true, in_water = false;
@@ -234,6 +244,15 @@ struct Pond::Impl {
         float tail_phase = 0, tail_amplitude = 0, bend = 0;
     };
     struct Food { BodyID id; float mass; float age; float hue; std::uint32_t tag; };
+    struct Egg {
+        BodyID id;
+        float mass;
+        std::uint32_t tag;
+        FishBirth birth;  // the fertilized child
+        float age = 0;
+        float dry = 0;    // seconds spent out of water
+        bool dead = false;
+    };
 
     BroadPhaseLayers broad_phase_layers;
     ObjectBroadPhaseFilter object_broad_phase_filter;
@@ -245,6 +264,8 @@ struct Pond::Impl {
     std::vector<Duck> ducks;
     std::vector<Fish> fish;
     std::vector<Food> food;
+    std::vector<Egg> eggs;
+    float spawning = 0;  // the morning urge to spawn, for adults ready to
     std::unordered_map<std::uint32_t, Window> windows;
     std::vector<PondBody> bodies;
     std::unordered_map<std::uint32_t, BodySample> samples;
@@ -311,29 +332,45 @@ struct Pond::Impl {
         // flake is right at the mouth.
         const FluidPoint eye = p + frame.ahead * (14 * s), mouth = p + frame.ahead * (FISH_RX * s);
         const float bin_width = 2 * FishSenses::prey_field / FishSenses::prey_bins;
-        for (const auto& flake : food) {
-            const FluidPoint q = position(flake.id);
+        // Something in view: where it falls in the visual field, if anywhere.
+        auto seen = [&](FluidPoint q, float& angle, float& distance) {
             const FluidPoint r = q - eye;
-            const float distance = length(r);
-            if (distance > sight_distance) continue;
-            bool hidden = false;
+            distance = length(r);
+            if (distance > sight_distance) return false;
             for (const auto& entry : windows) {
                 const auto& w = entry.second;
-                if (segment_hits_rect(eye, q, w.now.x - w.width * 0.5f, w.now.y - w.height * 0.5f, w.width, w.height)) {
-                    hidden = true;
-                    break;
-                }
+                if (segment_hits_rect(eye, q, w.now.x - w.width * 0.5f, w.now.y - w.height * 0.5f, w.width, w.height)) return false;
             }
-            if (hidden) continue;
-            const float angle = bearing(frame, r);
-            if (std::abs(angle) > FishSenses::prey_field + bin_width) continue;
-            const float salience = std::min(1.0f, 100.0f / (distance + 60.0f));
+            angle = bearing(frame, r);
+            return std::abs(angle) <= FishSenses::prey_field + bin_width;
+        };
+        auto mark = [&](std::array<float, FishSenses::prey_bins>& field, float angle, float salience) {
             for (int b = 0; b < FishSenses::prey_bins; ++b) {
                 const float offset = (angle - FishSenses::prey_angle(b)) / bin_width;
-                senses.prey[b] = std::max(senses.prey[b], salience * std::exp(-offset * offset / 0.72f));
+                field[b] = std::max(field[b], salience * std::exp(-offset * offset / 0.72f));
             }
+        };
+        auto prey = [&](FluidPoint q, float salience_scale) {
+            float angle = 0, distance = 0;
+            if (!seen(q, angle, distance)) return;
+            mark(senses.prey, angle, salience_scale * std::min(1.0f, 100.0f / (distance + 60.0f)));
             if (std::abs(angle) < 0.45f)
                 senses.strike_zone = std::max(senses.strike_zone, std::clamp(1.3f - length(q - mouth) / std::max(18 * s, 12.0f), 0.0f, 1.0f));
+        };
+        for (const auto& flake : food) prey(position(flake.id), 1);
+        // Older fish eat eggs, as real zebrafish do.
+        if (f.growth >= juvenile_growth)
+            for (const auto& egg : eggs)
+                if (!egg.dead) prey(position(egg.id), 0.7f);
+
+        // Mates: adults of the other sex, and the morning urge to spawn.
+        if (f.growth >= adult_growth) {
+            for (const auto& other : fish) {
+                if (&other == &f || !other.alive || other.female == f.female || other.growth < adult_growth) continue;
+                float angle = 0, distance = 0;
+                if (seen(position(other.id), angle, distance)) mark(senses.mate, angle, std::min(1.0f, 150.0f / (distance + 90.0f)));
+            }
+            if (f.energy > 0.5f && f.spawn_rest <= 0) senses.spawning = spawning;
         }
 
         // Looming: the pointer, windows, and ducks rushing toward the fish.
@@ -536,7 +573,88 @@ struct Pond::Impl {
                 ++f.meals;
             } else ++i;
         }
+        if (f.growth < juvenile_growth) return;  // too small to swallow an egg
+        for (std::size_t i = 0; i < eggs.size();) {
+            if (!eggs[i].dead && length(position(eggs[i].id) - mouth) < std::max(11 * f.scale, 7.0f)) {
+                remove(eggs[i].id);
+                eggs.erase(eggs.begin() + i);
+                f.energy = std::min(1.0f, f.energy + egg_energy);
+                ++f.meals;
+                ++eggs_eaten;
+            } else ++i;
+        }
     }
+
+    // Spawning: a ready female courted by a male close by lays her clutch
+    // one egg at a time; each is fertilized by that male.
+    void spawn(Fish& f, float dt) {
+        f.spawn_rest = std::max(0.0f, f.spawn_rest - dt);
+        if (!f.alive || !f.female || f.growth < adult_growth || !f.in_water || f.spawn_rest > 0) return;
+        if (f.brain.courtship() < 0.3f) return;
+        const FluidPoint p = position(f.id);
+        Fish* partner = nullptr;
+        for (auto& other : fish) {
+            if (other.alive && !other.female && other.growth >= adult_growth && other.brain.courtship() > 0.3f &&
+                length(position(other.id) - p) < 60 * f.scale)
+                partner = &other;
+        }
+        if (!partner) return;
+        if (f.clutch_left <= 0) f.clutch_left = 5 + static_cast<int>(f.energy * 8);
+        f.lay_wait -= dt;
+        if (f.lay_wait > 0) return;
+        f.lay_wait = 0.5f;
+        FishBirth child;
+        child.genome = FishGenome::child(f.genome, partner->genome, genes);
+        child.female = random() < 0.5f;
+        child.growth = 0.02f;
+        child.generation = std::max(f.generation, partner->generation) + 1;
+        child.mother = f.number;
+        child.father = partner->number;
+        // Laid from the vent, under the middle of the body.
+        const Frame now = frame(heading(f.id), f.upright);
+        lay_egg(p - now.back * (6 * f.scale), child, 0);
+        f.energy -= egg_cost;
+        ++eggs_laid;
+        if (--f.clutch_left <= 0) f.spawn_rest = spawn_rest_seconds;
+    }
+
+    void lay_egg(FluidPoint position, const FishBirth& birth, float age) {
+        if (eggs.size() >= max_eggs) return;
+        Ref<SphereShapeSettings> sphere = new SphereShapeSettings(EGG_RADIUS * metres_per_point);
+        sphere->mDensity = 1000;
+        BodyCreationSettings settings(sphere->Create().Get(), to_world(position), Quat::sIdentity(), EMotionType::Dynamic, Layers::food);
+        settings.mAllowedDOFs = EAllowedDOFs::Plane2D;
+        settings.mAllowSleeping = false;
+        settings.mMotionQuality = EMotionQuality::LinearCast;
+        settings.mFriction = 0.9f;
+        settings.mRestitution = 0.05f;
+        settings.mLinearVelocity = to_world_vector({(random() - 0.5f) * 30, (random() - 0.5f) * 30});
+        const BodyID id = bodies_interface().CreateAndAddBody(settings, EActivation::Activate);
+        if (id.IsInvalid()) return;
+        Egg egg{id, bodies_interface().GetShape(id)->GetMassProperties().mMass, next_tag++, birth};
+        egg.age = age;
+        eggs.push_back(egg);
+    }
+
+    // Eggs are a little heavier than water and sink slowly; out of water they
+    // dry out and die.
+    void step_egg(Egg& egg, float dt, Vec3 gravity) {
+        auto& interface = bodies_interface();
+        egg.age += growing * dt;  // sped up with growth, for checks
+        const FluidPoint v = velocity(egg.id);
+        Vec3 force = to_world_vector(v * (-0.8f * egg.mass));
+        float wet = 0;
+        if (const BodySample* water = sample(egg.tag)) {
+            wet = std::min(1.0f, water->count * particle_area / food_wet_area);
+            const FluidPoint flow{water->vx / water->count, water->vy / water->count};
+            force += -egg.mass * wet / egg_density * gravity + to_world_vector((flow - v) * (food_water_drag * wet * egg.mass));
+        }
+        interface.AddForce(egg.id, force);
+        egg.dry = wet > 0.3f ? std::max(0.0f, egg.dry - dt) : egg.dry + dt;
+        if (egg.dry > egg_dry_seconds) egg.dead = true;
+    }
+
+    unsigned eggs_laid = 0, eggs_eaten = 0, hatched = 0;
 
     void step_food(Food& flake, float dt, Vec3 gravity) {
         auto& interface = bodies_interface();
@@ -589,6 +707,12 @@ struct Pond::Impl {
             bodies.push_back({p.x, p.y, heading(flake.id), 1, v.x, v.y, -interface.GetAngularVelocity(flake.id).GetZ(), BODY_FOOD,
                               {flake.hue, std::min(1.0f, flake.age / food_soak_seconds), fade, 0}, flake.tag, {0, 0, 0}});
         }
+        for (const auto& egg : eggs) {
+            const FluidPoint p = position(egg.id), v = velocity(egg.id);
+            bodies.push_back({p.x, p.y, 0, 1, v.x, v.y, 0, BODY_EGG,
+                              {std::min(1.0f, egg.age / hatch_seconds), egg.dead ? 1.0f : 0.0f, 0, 0}, egg.tag,
+                              {egg.birth.genome.hue, egg.birth.genome.stripes, 0}});
+        }
         for (const auto& f : fish)
             for (int i = 0; i < 3; ++i)
                 bodies.push_back({f.probes[i].x, f.probes[i].y, 0, 1, 0, 0, 0, BODY_PROBE, {0, 0, 0, 0}, f.probe_tags[i], {0, 0, 0}});
@@ -616,7 +740,7 @@ Pond::~Pond() {
 void Pond::reset(float width, float height) {
     auto& s = *impl_;
     clear_ducks();
-    clear_fish();
+    clear_fish();  // and eggs
     clear_food();
     for (const auto& window : s.windows) s.remove(window.second.id);
     s.windows.clear();
@@ -681,6 +805,8 @@ PondState Pond::state() const {
         state.fish.push_back({f.number, {f.genome, f.female, f.growth, f.generation, f.mother, f.father, f.brain_seed},
                               impl_->position(f.id), f.energy, f.fullness, f.oxygen, f.alive, f.meals});
     for (const auto& duck : s.ducks) state.ducks.push_back({impl_->position(duck.id), duck.facing, duck.variant});
+    for (const auto& egg : s.eggs)
+        if (!egg.dead) state.eggs.push_back({impl_->position(egg.id), egg.age, egg.birth});
     return state;
 }
 
@@ -699,6 +825,7 @@ void Pond::restore(const PondState& state) {
         f.meals = saved.meals;
         if (!f.alive) f.foreshorten = 1;
     }
+    for (const auto& egg : state.eggs) s.lay_egg({egg.position.x * sx, egg.position.y * sy}, egg.birth, egg.age);
     s.next_fish_number = std::max(s.next_fish_number, state.next_fish_number);
     s.refresh_bodies();
 }
@@ -740,7 +867,7 @@ bool Pond::add_fish(FluidPoint position, const FishBirth& birth) {
     settings.mAngularDamping = 0.5f;
     const BodyID id = s.bodies_interface().CreateAndAddBody(settings, EActivation::Activate);
     if (id.IsInvalid()) return false;
-    const FishTraits traits{birth.genome.boldness, birth.genome.appetite, birth.genome.curiosity};
+    const FishTraits traits{birth.genome.boldness, birth.genome.appetite, birth.genome.curiosity, birth.female};
     const std::uint32_t brain_seed = birth.brain_seed ? birth.brain_seed : static_cast<std::uint32_t>(s.random() * 4e9f) | 1u;
     Impl::Fish fish{id, scale, s.bodies_interface().GetShape(id)->GetMassProperties().mMass,
                     FishBrain(brain_seed, s.hindbrain, false, traits), s.next_tag,
@@ -765,7 +892,28 @@ void Pond::clear_fish() {
     auto& s = *impl_;
     for (const auto& fish : s.fish) s.remove(fish.id);
     s.fish.clear();
+    for (const auto& egg : s.eggs) s.remove(egg.id);  // they would hatch into more fish
+    s.eggs.clear();
     s.refresh_bodies();
+}
+
+void Pond::remove_fish(std::uint32_t number) {
+    auto& s = *impl_;
+    for (std::size_t i = 0; i < s.fish.size(); ++i)
+        if (s.fish[i].number == number) {
+            s.remove(s.fish[i].id);
+            s.fish.erase(s.fish.begin() + i);
+            break;
+        }
+    s.refresh_bodies();
+}
+
+void Pond::set_spawning(float urge) { impl_->spawning = std::clamp(urge, 0.0f, 1.0f); }
+std::size_t Pond::egg_count() const { return impl_->eggs.size(); }
+PondStats Pond::stats() const { return {impl_->eggs_laid, impl_->eggs_eaten, impl_->hatched}; }
+void Pond::lay_egg(FluidPoint position, const FishBirth& birth, float age) {
+    impl_->lay_egg(position, birth, age);
+    impl_->refresh_bodies();
 }
 
 void Pond::add_food(FluidPoint position) {
@@ -815,6 +963,7 @@ void Pond::set_metabolism(float hunger, float breath, float growth) {
 
 FishStatus Pond::fish_status() const {
     FishStatus status;
+    status.eggs = static_cast<unsigned>(impl_->eggs.size());
     for (const auto& f : impl_->fish) {
         if (!f.alive) {
             ++status.dead;
@@ -840,7 +989,7 @@ std::vector<FishVitals> Pond::fish_vitals() const {
         result.push_back({f.number, fish_name(f.number), {f.genome, f.female, f.growth, f.generation, f.mother, f.father, f.brain_seed},
                           f.growth, fish_stage(f.growth), impl_->position(f.id), impl_->velocity(f.id), f.energy, f.oxygen, f.alive,
                           std::asin(std::clamp(-std::sin(impl_->heading(f.id)), -1.0f, 1.0f)), f.in_water, f.meals, f.escapes,
-                          f.alive ? f.brain.hunting() : 0.0f});
+                          f.alive ? f.brain.hunting() : 0.0f, f.alive ? f.brain.courtship() : 0.0f});
     return result;
 }
 
@@ -920,10 +1069,30 @@ void Pond::step(float dt, float progress, FluidPoint gravity, const std::vector<
         const float submerged = std::min(1.0f, area / (duck_area * scale * scale));
         interface.SetAngularVelocity(duck.id, interface.GetAngularVelocity(duck.id) * std::exp(-spin_damping * submerged * dt));
     }
-    for (auto& fish : s.fish) s.step_fish(fish, dt, g);
+    for (auto& fish : s.fish) {
+        s.step_fish(fish, dt, g);
+        s.spawn(fish, dt);
+    }
     for (auto& flake : s.food) s.step_food(flake, dt, g);
+    for (auto& egg : s.eggs) s.step_egg(egg, dt, g);
     s.system->Update(dt, 1, s.temp.get(), s.jobs.get());
     for (auto& fish : s.fish) s.eat(fish);
+    // Eggs hatch into larvae when there is room; dead ones break up after a
+    // minute.
+    for (std::size_t i = 0; i < s.eggs.size();) {
+        auto& egg = s.eggs[i];
+        const bool hatch = !egg.dead && egg.age >= hatch_seconds && egg.dry <= 0 && s.fish.size() < max_fish;
+        const bool gone = egg.dead && egg.dry > egg_dry_seconds + 60;
+        if (!hatch && !gone) {
+            ++i;
+            continue;
+        }
+        const FluidPoint where = s.position(egg.id);
+        const FishBirth birth = egg.birth;
+        s.remove(egg.id);
+        s.eggs.erase(s.eggs.begin() + i);
+        if (hatch && add_fish(where, birth)) ++s.hatched;
+    }
     for (std::size_t i = 0; i < s.food.size();) {
         if (s.food[i].age > food_lifetime) {
             s.remove(s.food[i].id);
@@ -1150,6 +1319,54 @@ bool run_fish_checks(const char* shader_file, std::shared_ptr<const HindbrainCon
                 grown.meals);
     if (!check(grown.alive && grown.stage == FishStage::adult, "a well-fed hatchling grows into an adult")) return false;
     pond.clear_food();
+
+    // Breeding: a fed female and male, with the morning urge, court and spawn;
+    // the eggs hatch into larvae of the next generation, with both parents.
+    {
+        pond.clear_fish();
+        pond.clear_food();
+        FishBirth mother, father;
+        mother.female = true;
+        mother.genome.hue = -0.8f;
+        father.genome.hue = 0.8f;
+        pond.add_fish({width * 0.4f, (surface + height) * 0.5f}, mother);
+        pond.add_fish({width * 0.6f, (surface + height) * 0.5f}, father);
+        const auto parents = pond.fish_vitals();
+        pond.set_spawning(1);
+        int seconds = 0;
+        for (; seconds < 90 && pond.stats().eggs_laid < 3; ++seconds) run(fluid, pond, 120, {});
+        pond.set_spawning(0);
+        std::printf("  breeding: %u eggs laid after %d s\n", pond.stats().eggs_laid, seconds);
+        if (!check(pond.stats().eggs_laid >= 3, "a courting pair spawns in the morning")) return false;
+        // Like a breeder, move the parents out so they do not eat the eggs.
+        for (const auto& parent : parents) pond.remove_fish(parent.number);
+        pond.set_metabolism(1, 1, 60);  // three minutes of development in three seconds
+        for (int i = 0; i < 8 && pond.stats().hatched == 0; ++i) run(fluid, pond, 120, {});
+        pond.set_metabolism(1);
+        const auto all = pond.fish_vitals();
+        bool family = false;
+        for (const auto& f : all)
+            if (f.birth.generation == 2 && f.birth.mother == parents[0].number && f.birth.father == parents[1].number &&
+                f.stage == FishStage::larva && f.birth.genome.hue > -0.95f && f.birth.genome.hue < 0.95f)
+                family = true;
+        std::printf("  hatching: %u hatched, %zu fish now, %zu eggs left\n", pond.stats().hatched, all.size(), pond.egg_count());
+        if (!check(family, "the eggs hatch into larvae of the next generation, with both parents")) return false;
+    }
+
+    // A hungry fish eats an egg it finds.
+    {
+        pond.clear_fish();
+        FishBirth hungry;
+        pond.add_fish({width * 0.5f, height - 60}, hungry);
+        const unsigned eaten = pond.stats().eggs_eaten;
+        for (int k = 0; k < 4; ++k) pond.lay_egg({width * (0.35f + 0.1f * k), height - 40}, hungry);
+        int seconds = 0;
+        for (; seconds < 60 && pond.stats().eggs_eaten == eaten; ++seconds) run(fluid, pond, 120, {});
+        std::printf("  egg eating: %u eaten after %d s\n", pond.stats().eggs_eaten - eaten, seconds);
+        if (!check(pond.stats().eggs_eaten > eaten, "a hungry fish eats eggs it finds")) return false;
+        pond.clear_fish();
+        pond.add_fish({width * 0.5f, (surface + height) * 0.5f}, standard);
+    }
 
     // A pond's state brings back the same fish in a new pond: their
     // genomes, growth, numbers, and brain wiring.

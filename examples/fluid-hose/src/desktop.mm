@@ -108,6 +108,7 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 @property(nonatomic) NSInteger feedRequests;
 @property(nonatomic) BOOL removeFishRequested;
 @property(nonatomic) BOOL showBrain;
+@property(nonatomic) BOOL lightsOnRequested;
 @property(nonatomic, strong) NSMenuItem* brainItem;
 @property(nonatomic, strong) NSMenuItem* flowItem;
 @property(nonatomic, strong) NSMenu* flowMenu;
@@ -131,6 +132,7 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 - (void)feedFish:(NSMenuItem*)sender;
 - (void)removeFish:(NSMenuItem*)sender;
 - (void)toggleBrain:(NSMenuItem*)sender;
+- (void)lightsOn:(NSMenuItem*)sender;
 - (void)adjustFlowByScroll:(double)points;
 - (void)updateFlowMenu;
 @end
@@ -175,6 +177,7 @@ static const double flow_presets[] = {0.25, 0.5, 1.0, 1.5, 2.0, 3.0};
 - (void)addFish:(NSMenuItem*)sender { (void)sender; self.fishRequests += 1; }
 - (void)feedFish:(NSMenuItem*)sender { (void)sender; self.feedRequests += 1; }
 - (void)removeFish:(NSMenuItem*)sender { (void)sender; self.removeFishRequested = YES; }
+- (void)lightsOn:(NSMenuItem*)sender { (void)sender; self.lightsOnRequested = YES; }
 - (void)toggleBrain:(NSMenuItem*)sender {
     self.showBrain = !self.showBrain;
     sender.state = self.showBrain ? NSControlStateValueOn : NSControlStateValueOff;
@@ -558,6 +561,10 @@ HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader
         NSMenuItem* no_fish = [[NSMenuItem alloc] initWithTitle:@"Remove fish" action:@selector(removeFish:) keyEquivalent:@""];
         no_fish.target = renderer->controls;
         [menu addItem:no_fish];
+        NSMenuItem* lights = [[NSMenuItem alloc] initWithTitle:@"Lights on 🌅 (morning: fish spawn)" action:@selector(lightsOn:)
+                                                 keyEquivalent:@""];
+        lights.target = renderer->controls;
+        [menu addItem:lights];
         NSMenuItem* brain = [[NSMenuItem alloc] initWithTitle:@"Show fish brain" action:@selector(toggleBrain:) keyEquivalent:@""];
         brain.target = renderer->controls;
         renderer->controls.brainItem = brain;
@@ -779,7 +786,9 @@ DesktopInput poll_desktop_input(HoseRenderer* renderer, const DesktopRect& canva
                            static_cast<unsigned>(renderer->controls.fishRequests),
                            static_cast<bool>(renderer->controls.removeFishRequested),
                            static_cast<unsigned>(renderer->controls.feedRequests), control,
-                           static_cast<bool>(renderer->controls.showBrain)};
+                           static_cast<bool>(renderer->controls.showBrain),
+                           static_cast<bool>(renderer->controls.lightsOnRequested)};
+        renderer->controls.lightsOnRequested = NO;
         renderer->controls.duckRequests = 0;
         renderer->controls.fishRequests = 0;
         renderer->controls.feedRequests = 0;
@@ -813,6 +822,7 @@ void set_hose_fish_status(HoseRenderer* renderer, const FishStatus& status) {
         if (notes.empty()) notes.push_back(alive == 1 ? "happy" : "all happy");
         for (std::size_t i = 0; i < notes.size(); ++i) text += (i ? ", " : "") + notes[i];
         if (status.dead) text += ", " + std::to_string(status.dead) + " dead";
+        if (status.eggs) text += ", " + std::to_string(status.eggs) + (status.eggs == 1 ? " egg" : " eggs");
     }
     if (text == renderer->previous_fish_status) return;
     renderer->previous_fish_status = text;
@@ -1219,6 +1229,10 @@ bool render_hose_snapshot(const char* shader_file, const char* output_file, floa
                 if (k == 1) birth.genome.hue = 0.8f;
                 pond.add_fish({120.0f + std::fmod(k * 157.0f, 400.0f), height - 40}, birth);
             }
+            // Eggs at every stage, from just laid to about to hatch.
+            if (fish_count >= 2 && i == static_cast<int>(4.0f / FluidSimulation::step_time))
+                for (int k = 0; k < 5; ++k)
+                    pond.lay_egg({300.0f + k * 40.0f, height - 150}, FishBirth{}, k * 40.0f);
             if (fish_count && t >= seconds - 4 && t < seconds - 3 && i % 12 == 0)
                 pond.add_food({100.0f + std::fmod(i * 37.0f, 400.0f), height - 160});
             pond.set_windows(obstacles);

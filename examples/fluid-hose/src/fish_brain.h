@@ -25,6 +25,8 @@ struct FishSenses {
     float hunger = 0;    // energy missing, 0 to 1
     float fullness = 0;  // food still in the gut, 0 to 1
     float hypoxia = 0;   // oxygen missing, 0 to 1
+    std::array<float, prey_bins> mate{};  // adults of the other sex in view, by direction like prey, 0 to 1
+    float spawning = 0;  // the morning urge to spawn, 0 to 1
 
     static float prey_angle(int bin) { return -prey_field + (bin + 0.5f) * 2 * prey_field / prey_bins; }
     static float loom_angle(int bin) { return -3.14159265f + (bin + 0.5f) * 2 * 3.14159265f / loom_bins; }
@@ -47,10 +49,11 @@ struct FishTraits {
     float boldness = 1;   // weakens the looming input to the escape cells
     float appetite = 1;   // strengthens hunger's drive
     float curiosity = 1;  // more bouts, and more turning around to explore
+    bool female = false;  // in courtship, males chase and females lead
 };
 
 // A swim bout: larval fish move in discrete flicks rather than continuously.
-enum class BoutKind { swim, hunt, strike, escape, reverse };
+enum class BoutKind { swim, hunt, strike, escape, reverse, court };
 struct FishBout {
     BoutKind kind = BoutKind::swim;
     float turn = 0;   // radians toward the back's side; beyond ±100° the fish flips around
@@ -76,6 +79,7 @@ public:
     bool advance(const FishSenses& senses, float dt, FishBout& bout);
     float vergence() const;  // eyes turned in to hunt, 0 to 1
     float hunting() const;   // hunting state, 0 to 1
+    float courtship() const;  // courting a mate, 0 to 1
     // Where the visible eye looks: -1 back toward the tail to 1 forward, from
     // the abducens neurons. Zero without a hindbrain connectome.
     float eye_position() const;
