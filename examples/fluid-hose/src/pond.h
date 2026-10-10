@@ -24,6 +24,25 @@ struct FishBirth {
     float growth = 1;         // 0 hatchling to 1 full grown
     unsigned generation = 1;  // founders are generation 1
     std::uint32_t mother = 0, father = 0;  // parents' numbers; 0 for a founder
+    std::uint32_t brain_seed = 0;          // how its brain is wired; 0 draws a new wiring
+};
+
+// Everything needed to bring a pond back: its creatures, where they were,
+// and how they were doing (water is saved separately).
+struct PondState {
+    struct Fish {
+        std::uint32_t number;
+        FishBirth birth;  // with the brain seed and current growth
+        FluidPoint position;
+        float energy, fullness, oxygen;
+        bool alive;
+        unsigned meals;
+    };
+    struct Duck { FluidPoint position; float facing, variant; };
+    float width = 0, height = 0;
+    std::uint32_t next_fish_number = 1;
+    std::vector<Fish> fish;
+    std::vector<Duck> ducks;
 };
 
 enum class FishStage { larva, juvenile, adult };
@@ -82,6 +101,9 @@ public:
     std::size_t food_count() const;
     // Fish watch the mouse pointer and flee when it rushes at them.
     void set_pointer(FluidPoint position);
+    PondState state() const;
+    // Brings back a saved pond, scaled to this pond's size, adding to what is here.
+    void restore(const PondState& state);
     // Reseeds the pond's randomness, which wires new fishes' brains (for checks).
     void set_seed(std::uint32_t seed);
     // Fish added from now on build their eye-position circuit from this

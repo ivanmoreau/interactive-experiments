@@ -5,6 +5,7 @@
 #include "pond.h"
 #include "brain_view.h"
 #include "fish_brain.h"
+#include "pond_store.h"
 #include <random>
 #include <mach-o/dyld.h>
 #include <algorithm>
@@ -82,6 +83,8 @@ int main(int argc, char** argv) {
         bool fish_check = false;
         std::string brain_snapshot;
         bool show_brain = false;
+        bool new_pond = false;
+        std::filesystem::path pond_directory = default_pond_directory();
         bool capture_check = false;
         unsigned display_number = 0;
         unsigned duration = 0;
@@ -104,6 +107,8 @@ int main(int argc, char** argv) {
             else if (argument == "--fish-check") fish_check = true;
             else if (argument == "--brain-snapshot" && i + 1 < argc) brain_snapshot = argv[++i];
             else if (argument == "--brain") show_brain = true;
+            else if (argument == "--new-pond") new_pond = true;
+            else if (argument == "--pond" && i + 1 < argc) pond_directory = argv[++i];
             else if (argument == "--fish" && i + 1 < argc) {
                 const char* value = argv[++i];
                 const auto result = std::from_chars(value, value + std::strlen(value), initial_fish);
@@ -150,7 +155,7 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("--duration requires a positive integer number of seconds");
             } else if (argument == "--help") {
                 std::puts("Fluid Hose\nUsage: fluid-hose [--pour] [--tilt] [--display NUMBER] [--duration SECONDS]\n"
-                          "                  [--size fine|medium|coarse] [--liquid water|thick|goo] [--refraction] [--flow RATE] [--ducks N] [--fish N] [--brain]\n"
+                          "                  [--size fine|medium|coarse] [--liquid water|thick|goo] [--refraction] [--flow RATE] [--ducks N] [--fish N] [--brain] [--new-pond] [--pond DIR]\n"
                           "                  "
                           "[--list-displays | --probe | --physics-check | --motion-check | --display-check | --smoke-test | --window-check |\n"
                           " --snapshot FILE.png | --brain-snapshot FILE.png | --capture-check | --duck-check | --fish-check]\n"
@@ -168,6 +173,8 @@ int main(int argc, char** argv) {
                           "hold Control to sprinkle food at the pointer, or use Feed the fish in the droplet menu.\n"
                           "Show fish brain in the droplet menu (or --brain) opens a window of a fish's neurons firing.\n"
                           "--brain-snapshot draws that window for a hungry fish that sees food and is startled.\n"
+                          "The pond (fish, ducks, and water) is saved in ~/Library/Application Support/Fluid Hose and comes\n"
+                          "back next launch; --new-pond starts an empty one, and --pond keeps it in another folder.\n"
                           "--flow sets how fast the nozzle pours, from 0.25 to 3; Option+scroll changes it while running.\n"
                           "--refraction bends the desktop seen through the water; it needs the Screen Recording permission.\n"
                           "--snapshot renders a scripted scene offscreen to a PNG (--duration sets its length).");
@@ -288,7 +295,19 @@ int main(int argc, char** argv) {
         std::printf("Fish hindbrain: %s\n", hindbrain ? "measured wiring (Vishwanathan et al. 2024)" : "hand-wired only");
         std::mt19937 random(std::random_device{}());
         std::uniform_real_distribution<float> unit(0.0f, 1.0f);
-        auto drop_point = [&]() { return FluidPoint{(0.15f + 0.7f * unit(random)) * canvas.w, 40}; };
+        // A drop point clear of windows, so a new creature is not squeezed out
+        // of one against the top of the screen.
+        auto drop_point = [&]() {
+            FluidPoint point{(0.15f + 0.7f * unit(random)) * canvas.w, 40};
+            for (int attempt = 0; attempt < 40; ++attempt) {
+                const bool covered = std::any_of(obstacles.begin(), obstacles.end(), [&](const WindowObstacle& w) {
+                    return point.x > w.x - 30 && point.x < w.x + w.width + 30 && point.y > w.y - 30 && point.y < w.y + w.height + 30;
+                });
+                if (!covered) break;
+                point = {(0.05f + 0.9f * unit(random)) * canvas.w, 40 + unit(random) * (canvas.h * 0.5f)};
+            }
+            return point;
+        };
         // A pinch of food lands above a fish, or mid-screen when there is none.
         auto feed = [&]() {
             FluidPoint above{canvas.w * 0.5f, 60};
@@ -302,6 +321,31 @@ int main(int argc, char** argv) {
             for (int i = 0; i < 6; ++i) pond.add_food({above.x + (unit(random) - 0.5f) * 90, above.y + (unit(random) - 0.5f) * 20});
         };
         for (unsigned i = 0; i < initial_ducks; ++i) pond.add_duck(drop_point());
+        // Bring back the saved pond, scaled to this display.
+        auto bring_back = [&](const PondState& state, std::vector<FluidParticle> water) {
+            const float sx = state.width > 0 ? canvas.w / state.width : 1, sy = state.height > 0 ? canvas.h / state.height : 1;
+            for (auto& p : water) {
+                p.x *= sx;
+                p.y *= sy;
+            }
+            simulation.restore_particles(water);
+            pond.restore(state);
+        };
+        if (!new_pond) {
+            PondState saved;
+            std::vector<FluidParticle> water;
+            if (load_pond(pond_directory, saved, water)) {
+                bring_back(saved, water);
+                std::printf("Pond: %zu fish, %zu ducks, %zu water particles from %s\n", saved.fish.size(), saved.ducks.size(),
+                            water.size(), pond_directory.c_str());
+            }
+        }
+        auto save = [&]() {
+            std::vector<FluidParticle> water;
+            if (!simulation.read_particles(water) || !save_pond(pond_directory, pond.state(), water))
+                std::fprintf(stderr, "Could not save the pond in %s\n", pond_directory.c_str());
+        };
+        auto next_save = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         for (unsigned i = 0; i < initial_fish; ++i) pond.add_fish(drop_point());
         float sprinkle_wait = 0;
         BrainWindow brain_window;
@@ -348,10 +392,15 @@ int main(int argc, char** argv) {
                         move_hose_window(app.renderer, selected.canvas);
                         input.pointer.x += canvas.x - selected.canvas.x;
                         input.pointer.y += canvas.y - selected.canvas.y;
+                        // The pond moves with the display, scaled to fit.
+                        const PondState moving = pond.state();
+                        std::vector<FluidParticle> water;
+                        simulation.read_particles(water);
                         canvas = selected.canvas;
                         pond.reset(static_cast<float>(canvas.w), static_cast<float>(canvas.h));
                         require(simulation.reset(static_cast<float>(canvas.w), static_cast<float>(canvas.h)),
                                 "Resize fluid simulation");
+                        bring_back(moving, water);
                         accumulator = 0;
                         std::printf("Display: %s — %d × %d points at (%d, %d)\n", selected.name.c_str(),
                                     canvas.w, canvas.h, canvas.x, canvas.y);
@@ -366,6 +415,10 @@ int main(int argc, char** argv) {
                 }
             }
             require(tracker.update(canvas, obstacles), "Refresh window geometry");
+            if (now >= next_save) {
+                save();
+                next_save = now + std::chrono::seconds(30);
+            }
             if (input.tilt != requested_tilt) {
                 requested_tilt = input.tilt;
                 tilt.reset();
@@ -475,6 +528,7 @@ int main(int argc, char** argv) {
         }, [&]() {
             return stop_requested || (duration && std::chrono::duration<float>(Clock::now() - start).count() >= duration);
         });
+        save();
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

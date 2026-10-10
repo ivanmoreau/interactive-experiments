@@ -530,6 +530,22 @@ bool FluidSimulation::read_particles(std::vector<FluidParticle>& output) {
     return true;
 }
 
+bool FluidSimulation::restore_particles(const std::vector<FluidParticle>& particles) {
+    if (!flush()) return false;
+    clear();
+    auto& s = *impl_;
+    const std::size_t count = std::min<std::size_t>(particles.size(), capacity);
+    auto* target = static_cast<FluidParticle*>(particle_buffer().contents);
+    for (std::size_t i = 0; i < count; ++i) {
+        FluidParticle p = particles[i];
+        p.x = std::clamp(p.x, 1.0f, s.width - 1);
+        p.y = std::clamp(p.y, 1.0f, s.height - 1);
+        target[i] = p;
+    }
+    s.count = s.encoded_count = static_cast<std::uint32_t>(count);
+    return true;
+}
+
 FluidPoint place_hose(FluidPoint pointer, const std::vector<WindowObstacle>& windows, float width, float height) {
     auto free = [&](FluidPoint point) {
         if (point.x < 8 || point.y < 8 || point.x > width - 8 || point.y > height - 8) return false;

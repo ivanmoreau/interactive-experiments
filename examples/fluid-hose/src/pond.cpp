@@ -2,6 +2,8 @@
 #include "fish_brain.h"
 #include "fish_genome.h"
 #include "fluid_sim.h"
+#include "pond_store.h"
+#include <filesystem>
 #include <Jolt/Jolt.h>
 #include <Jolt/Core/Factory.h>
 #include <Jolt/Core/JobSystemSingleThreaded.h>
@@ -215,6 +217,7 @@ struct Pond::Impl {
         float growth = 1;       // 0 hatchling to 1 full grown
         unsigned generation = 1;
         std::uint32_t mother = 0, father = 0;
+        std::uint32_t brain_seed = 0;
         float shape_scale = 1;  // the scale of its current collision shape
         FluidPoint probes[3] = {};
         float energy = fish_start_energy, fullness = 0, oxygen = 1;
@@ -551,6 +554,8 @@ struct Pond::Impl {
 
     float particle_area = 0;
 
+    bool create_duck(FluidPoint position, float signed_scale, float variant);
+
     void refresh_bodies() {
         bodies.clear();
         auto& interface = bodies_interface();
@@ -634,12 +639,19 @@ void Pond::reset(float width, float height) {
 
 bool Pond::add_duck(FluidPoint position) {
     auto& s = *impl_;
-    if (s.ducks.size() >= max_ducks) return false;
     const float facing = s.random() < 0.5f ? -1.0f : 1.0f;
     const float scale = 0.9f + s.random() * 0.25f;
     // Mostly classic yellow, sometimes pink or mint, rarely gold.
     const float roll = s.random();
     const float variant = roll < 0.6f ? 0 : roll < 0.8f ? 1 : roll < 0.95f ? 2 : 3;
+    return s.create_duck(position, facing * scale, variant);
+}
+
+bool Pond::Impl::create_duck(FluidPoint position, float signed_scale, float variant) {
+    auto& s = *this;
+    if (s.ducks.size() >= max_ducks) return false;
+    const float facing = signed_scale < 0 ? -1.0f : 1.0f;
+    const float scale = std::abs(signed_scale);
     position.x = std::clamp(position.x, DUCK_REACH, std::max(DUCK_REACH, s.width - DUCK_REACH));
     position.y = std::clamp(position.y, DUCK_REACH, std::max(DUCK_REACH, s.height - DUCK_REACH));
     BodyCreationSettings settings(duck_shape(facing, scale), to_world(position),
@@ -657,6 +669,38 @@ bool Pond::add_duck(FluidPoint position) {
     s.ducks.push_back({id, facing * scale, variant, s.next_tag++});
     s.refresh_bodies();
     return true;
+}
+
+PondState Pond::state() const {
+    const auto& s = *impl_;
+    PondState state;
+    state.width = s.width;
+    state.height = s.height;
+    state.next_fish_number = s.next_fish_number;
+    for (const auto& f : s.fish)
+        state.fish.push_back({f.number, {f.genome, f.female, f.growth, f.generation, f.mother, f.father, f.brain_seed},
+                              impl_->position(f.id), f.energy, f.fullness, f.oxygen, f.alive, f.meals});
+    for (const auto& duck : s.ducks) state.ducks.push_back({impl_->position(duck.id), duck.facing, duck.variant});
+    return state;
+}
+
+void Pond::restore(const PondState& state) {
+    auto& s = *impl_;
+    const float sx = state.width > 0 ? s.width / state.width : 1, sy = state.height > 0 ? s.height / state.height : 1;
+    for (const auto& duck : state.ducks) s.create_duck({duck.position.x * sx, duck.position.y * sy}, duck.facing, duck.variant);
+    for (const auto& saved : state.fish) {
+        if (!add_fish({saved.position.x * sx, saved.position.y * sy}, saved.birth)) break;
+        auto& f = s.fish.back();
+        f.number = saved.number;
+        f.energy = saved.energy;
+        f.fullness = saved.fullness;
+        f.oxygen = saved.oxygen;
+        f.alive = saved.alive;
+        f.meals = saved.meals;
+        if (!f.alive) f.foreshorten = 1;
+    }
+    s.next_fish_number = std::max(s.next_fish_number, state.next_fish_number);
+    s.refresh_bodies();
 }
 
 void Pond::clear_ducks() {
@@ -697,8 +741,9 @@ bool Pond::add_fish(FluidPoint position, const FishBirth& birth) {
     const BodyID id = s.bodies_interface().CreateAndAddBody(settings, EActivation::Activate);
     if (id.IsInvalid()) return false;
     const FishTraits traits{birth.genome.boldness, birth.genome.appetite, birth.genome.curiosity};
+    const std::uint32_t brain_seed = birth.brain_seed ? birth.brain_seed : static_cast<std::uint32_t>(s.random() * 4e9f) | 1u;
     Impl::Fish fish{id, scale, s.bodies_interface().GetShape(id)->GetMassProperties().mMass,
-                    FishBrain(static_cast<std::uint32_t>(s.random() * 4e9f) | 1u, s.hindbrain, false, traits), s.next_tag,
+                    FishBrain(brain_seed, s.hindbrain, false, traits), s.next_tag,
                     {s.next_tag + 1, s.next_tag + 2, s.next_tag + 3}};
     s.next_tag += 4;
     fish.number = s.next_fish_number++;
@@ -708,6 +753,7 @@ bool Pond::add_fish(FluidPoint position, const FishBirth& birth) {
     fish.generation = birth.generation;
     fish.mother = birth.mother;
     fish.father = birth.father;
+    fish.brain_seed = brain_seed;
     fish.shape_scale = scale;
     fish.upright = left ? -1.0f : 1.0f;
     s.fish.push_back(std::move(fish));
@@ -791,7 +837,7 @@ const FishBrain* Pond::fish_brain(std::size_t index) const {
 std::vector<FishVitals> Pond::fish_vitals() const {
     std::vector<FishVitals> result;
     for (const auto& f : impl_->fish)
-        result.push_back({f.number, fish_name(f.number), {f.genome, f.female, f.growth, f.generation, f.mother, f.father},
+        result.push_back({f.number, fish_name(f.number), {f.genome, f.female, f.growth, f.generation, f.mother, f.father, f.brain_seed},
                           f.growth, fish_stage(f.growth), impl_->position(f.id), impl_->velocity(f.id), f.energy, f.oxygen, f.alive,
                           std::asin(std::clamp(-std::sin(impl_->heading(f.id)), -1.0f, 1.0f)), f.in_water, f.meals, f.escapes,
                           f.alive ? f.brain.hunting() : 0.0f});
@@ -983,6 +1029,14 @@ bool run_duck_checks(const char* shader_file) {
 }
 
 bool run_fish_checks(const char* shader_file, std::shared_ptr<const HindbrainConnectome> hindbrain) {
+    {
+        // Saving and loading.
+        const auto scratch = std::filesystem::temp_directory_path() / "fluid-hose-pond-check";
+        const bool stored = run_pond_store_checks(scratch);
+        std::error_code ignored;
+        std::filesystem::remove_all(scratch, ignored);
+        if (!stored) return false;
+    }
     // Every fish's brain is wired from its own seed, so check several.
     for (const std::uint32_t seed : {7u, 101u, 2024u, 4242u, 31337u, 99991u}) {
         std::printf("Brain seed %u\n", seed);
@@ -1096,6 +1150,19 @@ bool run_fish_checks(const char* shader_file, std::shared_ptr<const HindbrainCon
                 grown.meals);
     if (!check(grown.alive && grown.stage == FishStage::adult, "a well-fed hatchling grows into an adult")) return false;
     pond.clear_food();
+
+    // A pond's state brings back the same fish in a new pond: their
+    // genomes, growth, numbers, and brain wiring.
+    {
+        Pond copy;
+        copy.reset(width, height);
+        copy.restore(pond.state());
+        const auto a = pond.fish_vitals(), b = copy.fish_vitals();
+        const bool same = a.size() == b.size() && !a.empty() && a[0].number == b[0].number &&
+                          std::abs(a[0].growth - b[0].growth) < 1e-4f && a[0].birth.female == b[0].birth.female &&
+                          a[0].birth.brain_seed == b[0].birth.brain_seed && a[0].birth.brain_seed != 0;
+        if (!check(same, "a restored pond has the same fish")) return false;
+    }
 
     // A fish out of water flops about and suffocates.
     pond.clear_fish();
