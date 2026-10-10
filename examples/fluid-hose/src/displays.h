@@ -1,18 +1,22 @@
 #pragma once
-#include <SDL3/SDL_video.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 
+using DesktopDisplayID = std::uint32_t;
+// Global desktop points, with the origin at the main display's top-left.
+struct DesktopRect { int x, y, w, h; };
+
 struct DesktopDisplay {
-    SDL_DisplayID id;
+    DesktopDisplayID id;
     std::string name;
     std::string uuid;
-    SDL_Rect bounds;
-    SDL_Rect canvas;
+    DesktopRect bounds;
+    DesktopRect canvas;
     bool primary;
 };
 
-inline bool same_rect(const SDL_Rect& a, const SDL_Rect& b) {
+inline bool same_rect(const DesktopRect& a, const DesktopRect& b) {
     return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h;
 }
 
@@ -22,5 +26,6 @@ inline bool operator==(const DesktopDisplay& a, const DesktopDisplay& b) {
 }
 
 const DesktopDisplay* choose_hose_display(const std::vector<DesktopDisplay>& displays,
-                                        const std::string& preferred_uuid, SDL_DisplayID current = 0);
+                                        const std::string& preferred_uuid, DesktopDisplayID current = 0);
+DesktopRect desktop_rect_from_appkit(double x, double y, double width, double height, double desktop_top);
 bool run_display_checks();

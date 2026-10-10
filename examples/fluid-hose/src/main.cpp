@@ -1,7 +1,3 @@
-#define SDL_MAIN_HANDLED
-#include <SDL3/SDL_main.h>
-#include <SDL3/SDL_init.h>
-#include <SDL3/SDL_events.h>
 #include "desktop.h"
 #include "fluid_sim.h"
 #include "motion.h"
@@ -15,14 +11,13 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 static volatile std::sig_atomic_t stop_requested = 0;
 static void stop(int) { stop_requested = 1; }
 
 static void require(bool success, const char* operation) {
-    if (!success) throw std::runtime_error(std::string(operation) + ": " + SDL_GetError());
+    if (!success) throw std::runtime_error(std::string(operation) + ": " + desktop_error());
 }
 template<typename T> static T* require(T* value, const char* operation) {
     require(value != nullptr, operation);
@@ -43,14 +38,11 @@ static std::filesystem::path shader_path() {
 }
 
 struct App {
-    SDL_Window* window = nullptr;
     HoseRenderer* renderer = nullptr;
     MotionProcess motion;
     ~App() {
         motion.stop();
         if (renderer) destroy_hose_renderer(renderer);
-        if (window) SDL_DestroyWindow(window);
-        SDL_Quit();
     }
 };
 
@@ -64,6 +56,7 @@ int main(int argc, char** argv) {
         bool motion_check = false;
         bool display_check = false;
         bool list_displays = false;
+        bool window_check = false;
         unsigned display_number = 0;
         unsigned duration = 0;
         for (int i = 1; i < argc; ++i) {
@@ -76,6 +69,7 @@ int main(int argc, char** argv) {
             else if (argument == "--motion-check") motion_check = true;
             else if (argument == "--display-check") display_check = true;
             else if (argument == "--list-displays") list_displays = true;
+            else if (argument == "--window-check") window_check = true;
             else if (argument == "--display" && i + 1 < argc) {
                 const char* value = argv[++i];
                 const auto result = std::from_chars(value, value + std::strlen(value), display_number);
@@ -88,7 +82,7 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("--duration requires a positive integer number of seconds");
             } else if (argument == "--help") {
                 std::puts("Fluid Hose\nUsage: fluid-hose [--pour] [--tilt] [--display NUMBER] [--duration SECONDS] "
-                          "[--list-displays | --probe | --physics-check | --motion-check | --display-check | --smoke-test]\n"
+                          "[--list-displays | --probe | --physics-check | --motion-check | --display-check | --smoke-test | --window-check]\n"
                           "Hold Option to pour at the mouse pointer. Release Option to stop.\n"
                           "The overlay lets clicks pass through: arrange windows normally.\n"
                           "Use the droplet menu in the menu bar to pour continuously, pause, clear, or quit.\n"
@@ -104,15 +98,18 @@ int main(int argc, char** argv) {
         if (display_check) return run_display_checks() ? 0 : 1;
         const auto motion_helper = (executable_directory() / "probe-motion").string();
         if (motion_check) return run_motion_checks(motion_helper) ? 0 : 1;
-        SDL_SetMainReady();
         App app;
-        require(SDL_Init(smoke ? 0 : SDL_INIT_VIDEO), "Initialize SDL3");
         const auto shaders = shader_path().string();
         if (smoke) {
             require(smoke_test_hose_renderer(shaders.c_str()), "Check fluid renderer");
             return 0;
         }
 
+        require(initialize_hose_desktop(), "Initialize AppKit");
+        if (window_check) {
+            require(run_hose_window_checks(shaders.c_str()), "Check native desktop windows");
+            return 0;
+        }
         std::vector<DesktopDisplay> displays;
         require(read_desktop_displays(displays), "Read desktop displays");
         std::string preferred_display = saved_hose_display();
@@ -129,7 +126,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (display_number) preferred_display = active_display.uuid;
-        SDL_Rect canvas = active_display.canvas;
+        DesktopRect canvas = active_display.canvas;
         std::vector<WindowRect> obstacles;
         require(read_window_obstacles(canvas, obstacles), "Read window geometry");
         std::printf("Fluid Hose\nDisplay: %s\nDesktop: %d × %d points at (%d, %d)\nWindow obstacles: %zu\n",
@@ -140,25 +137,19 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        const SDL_WindowFlags flags = SDL_WINDOW_BORDERLESS | SDL_WINDOW_TRANSPARENT | SDL_WINDOW_ALWAYS_ON_TOP |
-                                      SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_METAL | SDL_WINDOW_NOT_FOCUSABLE | SDL_WINDOW_HIDDEN;
-        app.window = require(SDL_CreateWindow("Fluid Hose", canvas.w, canvas.h, flags), "Create fluid overlay");
-        require(SDL_SetWindowPosition(app.window, canvas.x, canvas.y), "Position fluid overlay");
-        require(SDL_SyncWindow(app.window), "Wait for fluid overlay position");
-        // SDL GPU rejects transparent windows. This example uses SDL's supported
-        // Metal-view API and native Metal rendering, as in the working triangle.
-        app.renderer = require(create_hose_renderer(app.window, shaders.c_str(), continuous, tilt_enabled), "Create fluid renderer");
+        app.renderer = require(create_hose_renderer(canvas, shaders.c_str(), continuous, tilt_enabled), "Create fluid overlay");
         set_hose_displays(app.renderer, displays, active_display.id);
         if (display_number) save_hose_display(active_display);
-        require(SDL_ShowWindow(app.window), "Show fluid overlay");
-        std::printf("Device: %s\nHold Option to pour; use the droplet menu to clear or quit.\n", hose_device_name(app.renderer));
+        show_hose_window(app.renderer);
+        std::printf("Backend: AppKit + native Metal\nDevice: %s\nHold Option to pour; use the droplet menu to clear or quit.\n",
+                    hose_device_name(app.renderer));
         std::signal(SIGINT, stop);
         std::signal(SIGTERM, stop);
 
         FluidSimulation simulation(static_cast<float>(canvas.w), static_cast<float>(canvas.h));
         TiltGravity tilt;
         bool requested_tilt = false;
-        SDL_DisplayID pending_display = 0;
+        DesktopDisplayID pending_display = 0;
         using Clock = std::chrono::steady_clock;
         const auto start = Clock::now();
         auto previous = start;
@@ -167,28 +158,20 @@ int main(int argc, char** argv) {
         float accumulator = 0;
         float time = 0;
         constexpr float step = 1.0f / 120.0f;
-        bool running = true;
-        while (running && !stop_requested) {
-            bool displays_changed = false;
-            SDL_Event event{};
-            while (SDL_PollEvent(&event)) {
-                if (event.type == SDL_EVENT_QUIT) running = false;
-                if (event.type >= SDL_EVENT_DISPLAY_FIRST && event.type <= SDL_EVENT_DISPLAY_LAST) displays_changed = true;
-            }
-            if (!running) break;
+        run_hose_event_loop(app.renderer, [&]() {
+            const bool displays_changed = take_hose_display_changes(app.renderer);
             const auto now = Clock::now();
             const float delta = std::min(std::chrono::duration<float>(now - previous).count(), 0.05f);
             previous = now;
             time += delta;
-            if (duration && std::chrono::duration<float>(now - start).count() >= duration) break;
             auto input = poll_desktop_input(app.renderer, canvas);
-            if (input.quit) break;
+            if (input.quit) return false;
             if (input.display) pending_display = input.display;
             if (displays_changed || input.display || now >= next_display_poll) {
                 std::vector<DesktopDisplay> refreshed;
                 if (read_desktop_displays(refreshed)) {
                     displays = std::move(refreshed);
-                    SDL_DisplayID requested_display = active_display.id;
+                    DesktopDisplayID requested_display = active_display.id;
                     if (pending_display) {
                         const auto choice = std::find_if(displays.begin(), displays.end(),
                             [&](const auto& display) { return display.id == pending_display; });
@@ -201,17 +184,13 @@ int main(int argc, char** argv) {
                     }
                     const auto selected = *choose_hose_display(displays, preferred_display, requested_display);
                     if (selected.id != active_display.id || !same_rect(selected.canvas, canvas)) {
-                        require(SDL_HideWindow(app.window), "Hide fluid overlay while switching displays");
-                        require(SDL_SetWindowSize(app.window, selected.canvas.w, selected.canvas.h), "Resize fluid overlay");
-                        require(SDL_SetWindowPosition(app.window, selected.canvas.x, selected.canvas.y), "Move fluid overlay to display");
-                        require(SDL_SyncWindow(app.window), "Wait for display switch");
+                        move_hose_window(app.renderer, selected.canvas);
                         input.pointer.x += canvas.x - selected.canvas.x;
                         input.pointer.y += canvas.y - selected.canvas.y;
                         canvas = selected.canvas;
                         simulation = FluidSimulation(static_cast<float>(canvas.w), static_cast<float>(canvas.h));
                         accumulator = 0;
                         next_window_poll = now;
-                        require(SDL_ShowWindow(app.window), "Show fluid overlay on selected display");
                         std::printf("Display: %s — %d × %d points at (%d, %d)\n", selected.name.c_str(),
                                     canvas.w, canvas.h, canvas.x, canvas.y);
                     }
@@ -219,7 +198,7 @@ int main(int argc, char** argv) {
                     set_hose_displays(app.renderer, displays, active_display.id);
                     next_display_poll = now + std::chrono::seconds(1);
                 } else {
-                    // NSScreen and SDL can briefly disagree during a hot-plug.
+                    // Screen geometry can be temporarily unavailable during a hot-plug.
                     // Keep the current simulation until a complete list is available.
                     next_display_poll = now + std::chrono::milliseconds(250);
                 }
@@ -256,8 +235,10 @@ int main(int argc, char** argv) {
                                       nozzle.x, nozzle.y, pouring ? 1.0f : 0.0f, time, 0, 0};
             bool presented = false;
             require(draw_hose_frame(app.renderer, simulation.vertices(), scene, presented), "Draw fluid overlay");
-            if (!presented) std::this_thread::sleep_for(std::chrono::milliseconds(16));
-        }
+            return true;
+        }, [&]() {
+            return stop_requested || (duration && std::chrono::duration<float>(Clock::now() - start).count() >= duration);
+        });
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

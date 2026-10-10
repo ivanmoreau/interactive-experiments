@@ -2,15 +2,90 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
-#include <SDL3/SDL_metal.h>
+#import <QuartzCore/CAMetalDisplayLink.h>
 #include "desktop.h"
 #include "fluid_sim.h"
 #include <algorithm>
 #include <cstdio>
+#include <cstdarg>
+#include <cmath>
+#include <chrono>
+#include <exception>
 #include <cstring>
 #include <memory>
 #include <string>
 #include <unistd.h>
+
+static thread_local std::string last_desktop_error;
+
+const char* desktop_error() { return last_desktop_error.c_str(); }
+
+static bool set_desktop_error(const char* format, ...) {
+    char message[2048];
+    va_list arguments;
+    va_start(arguments, format);
+    std::vsnprintf(message, sizeof(message), format, arguments);
+    va_end(arguments);
+    last_desktop_error = message;
+    return false;
+}
+
+bool initialize_hose_desktop() {
+    @autoreleasepool {
+        NSApplication* application = [NSApplication sharedApplication];
+        if (!application) return set_desktop_error("Cannot create the macOS application");
+        // LSUIElement already sets this policy for the packaged app. A request
+        // to set the existing policy can return NO, so inspect the actual policy.
+        if (application.activationPolicy != NSApplicationActivationPolicyAccessory)
+            [application setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        if (application.activationPolicy != NSApplicationActivationPolicyAccessory)
+            return set_desktop_error("Cannot initialize a macOS accessory application");
+        return true;
+    }
+}
+
+@interface HoseOverlayWindow : NSWindow
+@end
+@implementation HoseOverlayWindow
+- (BOOL)canBecomeKeyWindow { return NO; }
+- (BOOL)canBecomeMainWindow { return NO; }
+@end
+
+@interface HoseMetalView : NSView
+- (void)updateDrawableSize;
+@end
+@implementation HoseMetalView
+- (BOOL)isOpaque { return NO; }
+- (BOOL)wantsUpdateLayer { return YES; }
+- (CALayer*)makeBackingLayer { return [CAMetalLayer layer]; }
+- (void)updateLayer { [self updateDrawableSize]; }
+- (void)setFrameSize:(NSSize)size {
+    [super setFrameSize:size];
+    [self updateDrawableSize];
+}
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    [self updateDrawableSize];
+}
+- (void)viewDidChangeBackingProperties {
+    [super viewDidChangeBackingProperties];
+    [self updateDrawableSize];
+}
+- (void)updateDrawableSize {
+    CAMetalLayer* layer = (CAMetalLayer*)self.layer;
+    if (!layer) return;
+    const CGFloat scale = self.window ? self.window.backingScaleFactor : 1;
+    const NSRect pixels = [self convertRectToBacking:self.bounds];
+    layer.contentsScale = scale;
+    layer.drawableSize = CGSizeMake(std::max<CGFloat>(1, std::round(pixels.size.width)),
+                                    std::max<CGFloat>(1, std::round(pixels.size.height)));
+}
+@end
+
+static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
+    NSScreen* primary = NSScreen.screens.firstObject;
+    return NSMakeRect(canvas.x, NSMaxY(primary.frame) - canvas.y - canvas.h, canvas.w, canvas.h);
+}
 
 @interface FluidMenuController : NSObject
 @property(nonatomic) BOOL pouring;
@@ -19,7 +94,7 @@
 @property(nonatomic) BOOL quitRequested;
 @property(nonatomic) BOOL tiltEnabled;
 @property(nonatomic) BOOL reverseTilt;
-@property(nonatomic) SDL_DisplayID requestedDisplay;
+@property(nonatomic) DesktopDisplayID requestedDisplay;
 - (void)togglePour:(NSMenuItem*)sender;
 - (void)togglePause:(NSMenuItem*)sender;
 - (void)clearWater:(NSMenuItem*)sender;
@@ -54,7 +129,12 @@
 @end
 
 struct HoseRenderer {
-    SDL_MetalView view = nullptr;
+    HoseOverlayWindow* window = nil;
+    HoseMetalView* view = nil;
+    id<CAMetalDrawable> current_drawable = nil;
+    bool displays_changed = false;
+    bool has_pending_canvas = false;
+    DesktopRect pending_canvas{};
     CAMetalLayer* layer = nil;
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
@@ -70,7 +150,7 @@ struct HoseRenderer {
     NSMenuItem* tilt_status = nil;
     NSMenu* display_menu = nil;
     std::vector<DesktopDisplay> display_options;
-    SDL_DisplayID selected_display = 0;
+    DesktopDisplayID selected_display = 0;
     TiltStatus previous_tilt_status = TiltStatus::off;
     std::string device_name;
 
@@ -82,21 +162,24 @@ struct HoseRenderer {
                 [barrier commit];
                 [barrier waitUntilCompleted];
             }
-            if (view) SDL_Metal_DestroyView(view);
+            if (window) {
+                [window orderOut:nil];
+                [window close];
+            }
         }
     }
 
     bool initialize(const char* shader_file) {
         device = MTLCreateSystemDefaultDevice();
-        if (!device) return SDL_SetError("No Metal device is accessible to this process");
+        if (!device) return set_desktop_error("No Metal device is accessible to this process");
         device_name = device.name.UTF8String;
         queue = [device newCommandQueue];
-        if (!queue) return SDL_SetError("Cannot create the fluid command queue");
+        if (!queue) return set_desktop_error("Cannot create the fluid command queue");
         NSError* error = nil;
         NSString* filename = [NSString stringWithUTF8String:shader_file];
-        if (!filename) return SDL_SetError("Invalid shader path encoding");
+        if (!filename) return set_desktop_error("Invalid shader path encoding");
         id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:filename] error:&error];
-        if (!library) return SDL_SetError("Load fluid shaders: %s", error.localizedDescription.UTF8String);
+        if (!library) return set_desktop_error("Load fluid shaders: %s", error.localizedDescription.UTF8String);
 
         MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
         descriptor.vertexFunction = [library newFunctionWithName:@"density_vertex"];
@@ -108,17 +191,17 @@ struct HoseRenderer {
         descriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
         descriptor.colorAttachments[0].writeMask = MTLColorWriteMaskRed;
         density_pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
-        if (!density_pipeline) return SDL_SetError("Create fluid density pipeline: %s", error.localizedDescription.UTF8String);
+        if (!density_pipeline) return set_desktop_error("Create fluid density pipeline: %s", error.localizedDescription.UTF8String);
 
         descriptor = [[MTLRenderPipelineDescriptor alloc] init];
         descriptor.vertexFunction = [library newFunctionWithName:@"surface_vertex"];
         descriptor.fragmentFunction = [library newFunctionWithName:@"surface_fragment"];
         descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         surface_pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
-        if (!surface_pipeline) return SDL_SetError("Create fluid surface pipeline: %s", error.localizedDescription.UTF8String);
+        if (!surface_pipeline) return set_desktop_error("Create fluid surface pipeline: %s", error.localizedDescription.UTF8String);
         for (auto& buffer : buffers) {
             buffer = [device newBufferWithLength:FluidSimulation::capacity * sizeof(FluidVertex) options:MTLResourceStorageModeShared];
-            if (!buffer) return SDL_SetError("Cannot allocate fluid particle buffers");
+            if (!buffer) return set_desktop_error("Cannot allocate fluid particle buffers");
         }
         return true;
     }
@@ -131,10 +214,10 @@ struct HoseRenderer {
             descriptor.storageMode = MTLStorageModePrivate;
             descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             field = [device newTextureWithDescriptor:descriptor];
-            if (!field) { SDL_SetError("Cannot allocate the fluid density field"); return nil; }
+            if (!field) { set_desktop_error("Cannot allocate the fluid density field"); return nil; }
         }
         id<MTLCommandBuffer> commands = [queue commandBuffer];
-        if (!commands) { SDL_SetError("Cannot allocate fluid commands"); return nil; }
+        if (!commands) { set_desktop_error("Cannot allocate fluid commands"); return nil; }
         const std::size_t count = std::min(particles.size(), FluidSimulation::capacity);
         if (count) std::memcpy(buffers[slot].contents, particles.data(), count * sizeof(FluidVertex));
 
@@ -144,7 +227,7 @@ struct HoseRenderer {
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
         id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
-        if (!encoder) { SDL_SetError("Cannot begin the fluid density pass"); return nil; }
+        if (!encoder) { set_desktop_error("Cannot begin the fluid density pass"); return nil; }
         if (count) {
             [encoder setRenderPipelineState:density_pipeline];
             [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:0];
@@ -159,7 +242,7 @@ struct HoseRenderer {
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
         encoder = [commands renderCommandEncoderWithDescriptor:pass];
-        if (!encoder) { SDL_SetError("Cannot begin the fluid surface pass"); return nil; }
+        if (!encoder) { set_desktop_error("Cannot begin the fluid surface pass"); return nil; }
         [encoder setRenderPipelineState:surface_pipeline];
         [encoder setFragmentBytes:&scene length:sizeof(scene) atIndex:0];
         [encoder setFragmentTexture:field atIndex:0];
@@ -169,35 +252,38 @@ struct HoseRenderer {
     }
 };
 
-HoseRenderer* create_hose_renderer(SDL_Window* window, const char* shader_file, bool continuous, bool tilt) {
+HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader_file, bool continuous, bool tilt) {
     @autoreleasepool {
         auto renderer = std::make_unique<HoseRenderer>();
         if (!renderer->initialize(shader_file)) return nullptr;
-        renderer->view = SDL_Metal_CreateView(window);
-        if (!renderer->view) return nullptr;
-        renderer->layer = (__bridge CAMetalLayer*)SDL_Metal_GetLayer(renderer->view);
-        if (!renderer->layer) { SDL_SetError("SDL did not provide a Metal layer"); return nullptr; }
+        renderer->window = [[HoseOverlayWindow alloc] initWithContentRect:appkit_canvas_frame(canvas)
+            styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+        if (!renderer->window) { set_desktop_error("Cannot create the native overlay window"); return nullptr; }
+        renderer->window.title = @"Fluid Hose";
+        renderer->window.releasedWhenClosed = NO;
+        renderer->window.opaque = NO;
+        renderer->window.backgroundColor = NSColor.clearColor;
+        renderer->window.hasShadow = NO;
+        renderer->window.ignoresMouseEvents = YES;
+        renderer->window.hidesOnDeactivate = NO;
+        renderer->window.level = NSFloatingWindowLevel;
+        renderer->window.collectionBehavior = NSWindowCollectionBehaviorFullScreenAuxiliary |
+                                               NSWindowCollectionBehaviorIgnoresCycle;
+        renderer->window.animationBehavior = NSWindowAnimationBehaviorNone;
+
+        renderer->view = [[HoseMetalView alloc] initWithFrame:NSMakeRect(0, 0, canvas.w, canvas.h)];
+        renderer->view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        renderer->view.wantsLayer = YES;
+        renderer->layer = (CAMetalLayer*)renderer->view.layer;
+        if (!renderer->layer) { set_desktop_error("Cannot create the native Metal layer"); return nullptr; }
         renderer->layer.device = renderer->device;
         renderer->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         renderer->layer.opaque = NO;
         renderer->layer.framebufferOnly = YES;
         renderer->layer.displaySyncEnabled = YES;
         renderer->layer.maximumDrawableCount = 3;
-
-        NSWindow* native_window = (__bridge NSWindow*)SDL_GetPointerProperty(SDL_GetWindowProperties(window),
-                                                                            SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
-        if (!native_window) { SDL_SetError("Fluid Hose requires a Cocoa window"); return nullptr; }
-
-        // SDL's Cocoa mouse handler recomputes ignoresMouseEvents from the shape
-        // on pointer movement. An empty input shape keeps the overlay click-through;
-        // the native Metal layer draws the visible water independently on macOS.
-        std::unique_ptr<SDL_Surface, decltype(&SDL_DestroySurface)> input_shape(
-            SDL_CreateSurface(2, 2, SDL_PIXELFORMAT_RGBA32), SDL_DestroySurface);
-        if (!input_shape || !SDL_ClearSurface(input_shape.get(), 0, 0, 0, 0) ||
-            !SDL_SetWindowShape(window, input_shape.get())) return nullptr;
-        native_window.ignoresMouseEvents = YES;
-        native_window.hasShadow = NO;
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        renderer->window.contentView = renderer->view;
+        [renderer->view updateDrawableSize];
 
         renderer->controls = [[FluidMenuController alloc] init];
         renderer->controls.pouring = continuous;
@@ -246,9 +332,134 @@ HoseRenderer* create_hose_renderer(SDL_Window* window, const char* shader_file, 
 }
 
 void destroy_hose_renderer(HoseRenderer* renderer) { delete renderer; }
+
+void show_hose_window(HoseRenderer* renderer) {
+    [renderer->window orderFrontRegardless];
+    [renderer->view updateDrawableSize];
+}
+
+void move_hose_window(HoseRenderer* renderer, const DesktopRect& canvas) {
+    // Apply geometry after the current drawable has been submitted.
+    [renderer->window orderOut:nil];
+    if (renderer->current_drawable) {
+        renderer->pending_canvas = canvas;
+        renderer->has_pending_canvas = true;
+        return;
+    }
+    [renderer->window setFrame:appkit_canvas_frame(canvas) display:YES];
+    [renderer->view updateDrawableSize];
+    show_hose_window(renderer);
+}
+
+bool take_hose_display_changes(HoseRenderer* renderer) {
+    const bool changed = renderer->displays_changed;
+    renderer->displays_changed = false;
+    return changed;
+}
+
+@interface HoseAppDelegate : NSObject <NSApplicationDelegate, CAMetalDisplayLinkDelegate> {
+@public
+    HoseRenderer* renderer;
+    std::function<bool()> render_frame;
+    std::function<bool()> should_stop;
+    std::exception_ptr failure;
+}
+@property(nonatomic, strong) CAMetalDisplayLink* displayLink;
+@property(nonatomic, strong) NSTimer* stopTimer;
+@property(nonatomic) BOOL stopping;
+- (void)start;
+- (void)stop;
+- (void)checkStop:(NSTimer*)timer;
+- (void)updateFrameRate;
+@end
+
+@implementation HoseAppDelegate
+- (void)start {
+    self.displayLink = [[CAMetalDisplayLink alloc] initWithMetalLayer:renderer->layer];
+    self.displayLink.delegate = self;
+    [self updateFrameRate];
+    [self.displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    // Signals, menu quit, and --duration must work even if no drawable is available.
+    self.stopTimer = [NSTimer timerWithTimeInterval:0.1 target:self selector:@selector(checkStop:)
+                                          userInfo:nil repeats:YES];
+    [NSRunLoop.mainRunLoop addTimer:self.stopTimer forMode:NSRunLoopCommonModes];
+}
+- (void)stop {
+    if (self.stopping) return;
+    self.stopping = YES;
+    [self.displayLink invalidate];
+    [self.stopTimer invalidate];
+    [NSApp stop:nil];
+    NSEvent* wake = [NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint
+        modifierFlags:0 timestamp:0 windowNumber:0 context:nil subtype:0 data1:0 data2:0];
+    [NSApp postEvent:wake atStart:NO];
+}
+- (void)checkStop:(NSTimer*)timer {
+    (void)timer;
+    try {
+        if (renderer->controls.quitRequested || should_stop()) [self stop];
+    } catch (...) {
+        failure = std::current_exception();
+        [self stop];
+    }
+}
+- (void)updateFrameRate {
+    const NSInteger maximum = renderer->window.screen.maximumFramesPerSecond;
+    const float rate = std::min(120.0f, static_cast<float>(maximum > 0 ? maximum : 60));
+    self.displayLink.preferredFrameRateRange = CAFrameRateRangeMake(rate, rate, rate);
+}
+- (void)metalDisplayLink:(CAMetalDisplayLink*)link needsUpdate:(CAMetalDisplayLinkUpdate*)update {
+    (void)link;
+    @autoreleasepool {
+        if (self.stopping) return;
+        try {
+            if (renderer->controls.quitRequested || should_stop()) { [self stop]; return; }
+            renderer->current_drawable = update.drawable;
+            if (!render_frame()) [self stop];
+        } catch (...) {
+            failure = std::current_exception();
+            [self stop];
+        }
+        renderer->current_drawable = nil;
+        if (renderer->has_pending_canvas) {
+            renderer->has_pending_canvas = false;
+            move_hose_window(renderer, renderer->pending_canvas);
+            [self updateFrameRate];
+        }
+    }
+}
+- (void)applicationDidChangeScreenParameters:(NSNotification*)notification {
+    (void)notification;
+    renderer->displays_changed = true;
+    [renderer->view updateDrawableSize];
+    [self updateFrameRate];
+}
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)application {
+    (void)application;
+    [self stop];
+    // Return through main so C++ destructors close the motion helper's control pipe.
+    return NSTerminateCancel;
+}
+@end
+
+void run_hose_event_loop(HoseRenderer* renderer, const std::function<bool()>& frame,
+                         const std::function<bool()>& should_stop) {
+    @autoreleasepool {
+        HoseAppDelegate* delegate = [[HoseAppDelegate alloc] init];
+        delegate->renderer = renderer;
+        delegate->render_frame = frame;
+        delegate->should_stop = should_stop;
+        NSApp.delegate = delegate;
+        [delegate start];
+        [NSApp run];
+        [delegate stop];
+        NSApp.delegate = nil;
+        if (delegate->failure) std::rethrow_exception(delegate->failure);
+    }
+}
 const char* hose_device_name(const HoseRenderer* renderer) { return renderer->device_name.c_str(); }
 
-DesktopInput poll_desktop_input(HoseRenderer* renderer, const SDL_Rect& canvas) {
+DesktopInput poll_desktop_input(HoseRenderer* renderer, const DesktopRect& canvas) {
     @autoreleasepool {
         FluidPoint pointer{-100, -100};
         CGEventRef event = CGEventCreate(nullptr);
@@ -284,37 +495,30 @@ void set_hose_tilt_status(HoseRenderer* renderer, TiltStatus status) {
 
 bool read_desktop_displays(std::vector<DesktopDisplay>& output) {
     @autoreleasepool {
-        int count = 0;
-        std::unique_ptr<SDL_DisplayID, decltype(&SDL_free)> ids(SDL_GetDisplays(&count), SDL_free);
-        if (!ids) return false;
+        NSArray<NSScreen*>* screens = NSScreen.screens;
+        if (!screens.count) return set_desktop_error("No accessible macOS desktop displays");
+        const double desktop_top = NSMaxY(screens.firstObject.frame);
         output.clear();
-        const auto primary = SDL_GetPrimaryDisplay();
-        for (int i = 0; i < count; ++i) {
-            SDL_Rect bounds{}, canvas{};
-            if (!SDL_GetDisplayBounds(ids.get()[i], &bounds) ||
-                !SDL_GetDisplayUsableBounds(ids.get()[i], &canvas)) return false;
+        for (NSScreen* screen in screens) {
+            const CGDirectDisplayID id = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+            if (!id) continue;
+            const NSRect frame = screen.frame, visible = screen.visibleFrame;
+            const auto bounds = desktop_rect_from_appkit(frame.origin.x, frame.origin.y,
+                                                         frame.size.width, frame.size.height, desktop_top);
+            const auto canvas = desktop_rect_from_appkit(visible.origin.x, visible.origin.y,
+                                                         visible.size.width, visible.size.height, desktop_top);
             if (canvas.w < 64 || canvas.h < 64) continue;
-            const char* name = SDL_GetDisplayName(ids.get()[i]);
             std::string uuid;
-            // SDL's Cocoa display bounds use Quartz coordinates. Match the full
-            // bounds, not visibleFrame, which excludes the menu bar and Dock.
-            for (NSScreen* screen in NSScreen.screens) {
-                const CGDirectDisplayID native_id = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
-                const CGRect native_bounds = CGDisplayBounds(native_id);
-                const SDL_Rect native_rect{static_cast<int>(native_bounds.origin.x), static_cast<int>(native_bounds.origin.y),
-                                           static_cast<int>(native_bounds.size.width), static_cast<int>(native_bounds.size.height)};
-                if (!same_rect(native_rect, bounds)) continue;
-                CFUUIDRef identifier = CGDisplayCreateUUIDFromDisplayID(native_id);
-                if (identifier) {
-                    NSString* value = CFBridgingRelease(CFUUIDCreateString(kCFAllocatorDefault, identifier));
-                    if (value.UTF8String) uuid = value.UTF8String;
-                    CFRelease(identifier);
-                }
-                break;
+            CFUUIDRef identifier = CGDisplayCreateUUIDFromDisplayID(id);
+            if (identifier) {
+                NSString* value = CFBridgingRelease(CFUUIDCreateString(kCFAllocatorDefault, identifier));
+                if (value.UTF8String) uuid = value.UTF8String;
+                CFRelease(identifier);
             }
-            output.push_back({ids.get()[i], name ? name : "Display", uuid, bounds, canvas, ids.get()[i] == primary});
+            const char* name = screen.localizedName.UTF8String;
+            output.push_back({id, name ? name : "Display", uuid, bounds, canvas, id == CGMainDisplayID()});
         }
-        if (output.empty()) return SDL_SetError("No usable desktop display is available");
+        if (output.empty()) return set_desktop_error("No usable desktop display is available");
         return true;
     }
 }
@@ -335,7 +539,7 @@ void save_hose_display(const DesktopDisplay& display) {
     }
 }
 
-void set_hose_displays(HoseRenderer* renderer, const std::vector<DesktopDisplay>& displays, SDL_DisplayID selected) {
+void set_hose_displays(HoseRenderer* renderer, const std::vector<DesktopDisplay>& displays, DesktopDisplayID selected) {
     if (renderer->display_options == displays && renderer->selected_display == selected) return;
     renderer->display_options = displays;
     renderer->selected_display = selected;
@@ -358,11 +562,11 @@ void set_hose_displays(HoseRenderer* renderer, const std::vector<DesktopDisplay>
     }
 }
 
-bool read_window_obstacles(const SDL_Rect& canvas, std::vector<WindowRect>& output) {
+bool read_window_obstacles(const DesktopRect& canvas, std::vector<WindowRect>& output) {
     @autoreleasepool {
         NSArray* windows = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly |
                                                                       kCGWindowListExcludeDesktopElements, kCGNullWindowID));
-        if (!windows) return SDL_SetError("Window geometry is unavailable: no accessible Quartz desktop session");
+        if (!windows) return set_desktop_error("Window geometry is unavailable: no accessible Quartz desktop session");
         output.clear();
         for (NSDictionary* info in windows) {
             NSNumber* layer = info[(__bridge NSString*)kCGWindowLayer];
@@ -392,16 +596,17 @@ bool draw_hose_frame(HoseRenderer* renderer, const std::vector<FluidVertex>& par
     @autoreleasepool {
         presented = false;
         if (renderer->last_submission.status == MTLCommandBufferStatusError)
-            return SDL_SetError("Fluid GPU command failed: %s", renderer->last_submission.error.localizedDescription.UTF8String);
-        id<CAMetalDrawable> drawable = [renderer->layer nextDrawable];
+            return set_desktop_error("Fluid GPU command failed: %s", renderer->last_submission.error.localizedDescription.UTF8String);
+        id<CAMetalDrawable> drawable = renderer->current_drawable;
         if (!drawable) return true;
         dispatch_semaphore_wait(renderer->available, DISPATCH_TIME_FOREVER);
         id<MTLCommandBuffer> commands = renderer->encode(drawable.texture, particles, scene);
         if (!commands) { dispatch_semaphore_signal(renderer->available); return false; }
         dispatch_semaphore_t completion = renderer->available;
         [commands addCompletedHandler:^(id<MTLCommandBuffer> finished) { (void)finished; dispatch_semaphore_signal(completion); }];
-        [commands presentDrawable:drawable];
+        // CAMetalDisplayLink supplies this drawable. Submit before presenting it.
         [commands commit];
+        [drawable present];
         renderer->last_submission = commands;
         renderer->slot = (renderer->slot + 1) % 3;
         presented = true;
@@ -418,7 +623,7 @@ bool smoke_test_hose_renderer(const char* shader_file) {
         descriptor.usage = MTLTextureUsageRenderTarget;
         descriptor.storageMode = MTLStorageModeShared;
         id<MTLTexture> texture = [renderer.device newTextureWithDescriptor:descriptor];
-        if (!texture) return SDL_SetError("Cannot allocate fluid test texture");
+        if (!texture) return set_desktop_error("Cannot allocate fluid test texture");
         const std::vector<FluidVertex> particles{{24, 32, 12, 0}, {40, 32, 12, 0}};
         const SceneUniforms scene{64, 64, 0, 0, 0, 0, 0, 0};
         id<MTLCommandBuffer> commands = renderer.encode(texture, particles, scene);
@@ -426,14 +631,86 @@ bool smoke_test_hose_renderer(const char* shader_file) {
         [commands commit];
         [commands waitUntilCompleted];
         if (commands.status == MTLCommandBufferStatusError)
-            return SDL_SetError("Fluid smoke-test command failed: %s", commands.error.localizedDescription.UTF8String);
+            return set_desktop_error("Fluid smoke-test command failed: %s", commands.error.localizedDescription.UTF8String);
         std::vector<unsigned char> pixels(64 * 64 * 4);
         [texture getBytes:pixels.data() bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
         const auto* center = pixels.data() + (32 * 64 + 32) * 4;
         if (center[3] < 170 || center[3] > 205 || center[0] + center[1] + center[2] < 80 ||
             pixels[0] != 0 || pixels[1] != 0 || pixels[2] != 0 || pixels[3] != 0)
-            return SDL_SetError("Fluid density did not merge into a translucent surface on a transparent background");
+            return set_desktop_error("Fluid density did not merge into a translucent surface on a transparent background");
         std::puts("PASS: Metal density accumulation, translucent merged water surface, and transparent background.");
+        return true;
+    }
+}
+
+bool run_hose_window_checks(const char* shader_file) {
+    @autoreleasepool {
+        std::vector<DesktopDisplay> displays;
+        if (!read_desktop_displays(displays)) return false;
+        std::unique_ptr<HoseRenderer, decltype(&destroy_hose_renderer)> renderer(
+            create_hose_renderer(displays.front().canvas, shader_file, false), destroy_hose_renderer);
+        if (!renderer) return false;
+        show_hose_window(renderer.get());
+        for (std::size_t index = 0; index < displays.size(); ++index) {
+            const auto& display = displays[index];
+            const auto& canvas = display.canvas;
+            renderer->controls.quitRequested = NO;
+            set_hose_displays(renderer.get(), displays, display.id);
+            [renderer->display_menu performActionForItemAtIndex:index];
+            if (poll_desktop_input(renderer.get(), canvas).display != display.id)
+                return set_desktop_error("Native Display menu did not dispatch the selected monitor");
+            const SceneUniforms scene{static_cast<float>(canvas.w), static_cast<float>(canvas.h), 0, 0, 0, 0, 0, 0};
+            const std::vector<FluidVertex> particles{{canvas.w * 0.5f, canvas.h * 0.5f, 12, 0}};
+            unsigned frames = 0;
+            bool moved = false;
+            bool draw_success = true;
+            bool dimensions_match = true;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            run_hose_event_loop(renderer.get(), [&]() {
+                if (!moved) {
+                    moved = true;
+                    move_hose_window(renderer.get(), canvas);
+                    return true;
+                }
+                const auto texture = renderer->current_drawable.texture;
+                const CGFloat scale = renderer->window.backingScaleFactor;
+                dimensions_match = dimensions_match &&
+                    texture.width == static_cast<NSUInteger>(std::lround(canvas.w * scale)) &&
+                    texture.height == static_cast<NSUInteger>(std::lround(canvas.h * scale));
+                bool presented = false;
+                draw_success = draw_hose_frame(renderer.get(), particles, scene, presented);
+                if (!draw_success) return false;
+                if (presented && ++frames == 3)
+                    [renderer->status_item.menu performActionForItemAtIndex:renderer->status_item.menu.numberOfItems - 1];
+                return true;
+            }, [&]() { return std::chrono::steady_clock::now() >= deadline; });
+            if (!draw_success) return false;
+            if (frames < 3 || !renderer->controls.quitRequested)
+                return set_desktop_error("Native display link or menu quit did not complete on %s", display.name.c_str());
+            if (!dimensions_match)
+                return set_desktop_error("Metal drawable size does not match native backing scale on %s", display.name.c_str());
+            if (!renderer->window.ignoresMouseEvents || renderer->window.isKeyWindow ||
+                renderer->window.canBecomeKeyWindow || renderer->window.isOpaque ||
+                renderer->view.isOpaque || renderer->layer.isOpaque)
+                return set_desktop_error("Native overlay lost its click-through, non-focusing, or transparent behavior");
+
+            NSArray* windows = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow,
+                                                                           static_cast<CGWindowID>(renderer->window.windowNumber)));
+            NSDictionary* info = windows.firstObject;
+            NSDictionary* bounds = info[(__bridge NSString*)kCGWindowBounds];
+            CGRect actual;
+            if (!bounds || !CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)bounds, &actual) ||
+                std::abs(actual.origin.x - canvas.x) > 1 || std::abs(actual.origin.y - canvas.y) > 1 ||
+                std::abs(actual.size.width - canvas.w) > 1 || std::abs(actual.size.height - canvas.h) > 1)
+                return set_desktop_error("WindowServer bounds do not match the selected canvas on %s", display.name.c_str());
+            if (renderer->last_submission) [renderer->last_submission waitUntilCompleted];
+            if (renderer->last_submission.status == MTLCommandBufferStatusError)
+                return set_desktop_error("Live Metal rendering failed: %s", renderer->last_submission.error.localizedDescription.UTF8String);
+            std::printf("PASS: %s — native window at (%d,%d), %d × %d points, %.0f× backing, %u frames, Display/Quit menu actions.\n",
+                        display.name.c_str(), canvas.x, canvas.y, canvas.w, canvas.h,
+                        renderer->window.backingScaleFactor, frames);
+        }
+        std::puts("PASS: native overlays remain transparent, click-through, and unable to take keyboard focus.");
         return true;
     }
 }

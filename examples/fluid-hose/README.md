@@ -2,19 +2,18 @@
 
 A desktop fluid toy for macOS. Hold **Option** to pour blue water from a nozzle controlled by the mouse. Water lands on window tops, spills around their sides, and pools at the bottom of the usable desktop, above the Dock.
 
-The overlay is transparent and lets mouse clicks pass through. You can move and resize the real windows normally while the simulation runs.
+The overlay uses **AppKit + native Metal**, with C++ physics. It is transparent and lets mouse clicks pass through, so you can move and resize the real windows normally while the simulation runs.
 
 ## Run
 
 From the workspace root:
 
 ```sh
-devenv shell
 ./examples/fluid-hose/build.sh
 ./examples/fluid-hose/run.sh
 ```
 
-The shared environment provides complete SDL3 headers and its library. See the [repository setup](../../README.md) for Nix, devenv, and Xcode requirements. Once built, the app bundle runs without Nix or devenv.
+Building requires macOS 14 or newer and full Xcode with its C++ and Metal tools. This example links only macOS system frameworks and requires no SDL SDK or third-party runtime library. The shared [devenv environment](../../README.md) provides the repository's development and checking tools; it is optional for building and running the hose itself.
 
 Or open `build/Fluid Hose.app` from this example folder in Finder.
 
@@ -42,7 +41,7 @@ You can also select a display from Terminal:
 ./examples/fluid-hose/run.sh --display 2
 ```
 
-Display numbers match the current menu order; the saved choice uses the monitor's macOS UUID, so a different SDL display ID on reconnect does not lose the selection. The overlay uses each screen's logical desktop coordinates, including screens to the left of or above the main display.
+Display numbers match the current menu order; the saved choice uses the monitor's macOS UUID, so a different native display ID on reconnect does not lose the selection. The overlay uses each screen's logical desktop coordinates, including screens to the left of or above the main display.
 
 For gravity controlled by Mac tilt from launch:
 
@@ -54,15 +53,17 @@ Tilt is off by default. Its menu status shows whether fresh motion is available.
 
 ## How it works
 
-SDL handles the overlay window and event loop. The native macOS bridge reads normal on-screen windows using [Quartz Window Services](https://developer.apple.com/documentation/coregraphics/cgwindowlistcopywindowinfo%28_%3A_%3A%29?language=_5). Their bounding rectangles become collision obstacles in the selected display's desktop coordinate system. [SDL enumerates the connected displays](https://wiki.libsdl.org/SDL3/SDL_GetDisplays) and provides their [usable bounds](https://wiki.libsdl.org/SDL3/SDL_GetDisplayUsableBounds), excluding the menu bar and Dock. Bounds refresh eight times per second; the app does not capture window contents or read window titles.
+AppKit owns the borderless, non-focusing overlay window and the application event loop. [NSScreen](https://developer.apple.com/documentation/appkit/nsscreen) provides connected displays and their usable frames, excluding the menu bar and Dock. AppKit's bottom-left screen coordinates are converted into the top-left desktop coordinates used by Quartz and the physics. Display notifications and a periodic refresh handle monitor changes; the view updates its Metal drawable size when its backing scale changes.
+
+The native bridge reads normal on-screen windows using [Quartz Window Services](https://developer.apple.com/documentation/coregraphics/cgwindowlistcopywindowinfo%28_%3A_%3A%29?language=_5). Their bounding rectangles become collision obstacles in the selected display's desktop coordinate system. Window bounds refresh eight times per second; the app does not capture window contents or read window titles.
 
 The C++ simulation applies gravity and particle density constraints, using a spatial grid for neighboring particles. Each relaxation iteration caches a particle's neighbors and distances for its pressure pass, with scratch memory reused across steps. Water is retained until you clear it, so it accumulates instead of disappearing. The current capacity is 8,000 particles.
 
 Native Metal renders in two passes: particle splats add into a density texture, then a surface shader merges and shades that field into water. Water opacity is capped at 78% after merging, with a softer edge transition, so the desktop shows through drops and settled pools. The final output uses premultiplied alpha. Three particle buffers allow GPU work to overlap safely with CPU updates.
 
-SDL GPU rejects transparent windows, so this example uses SDL's supported native Metal-view API, following the working floating triangle's approach.
+The native view directly owns its [CAMetalLayer](https://developer.apple.com/documentation/quartzcore/cametallayer). [CAMetalDisplayLink](https://developer.apple.com/documentation/quartzcore/cametaldisplaylink) drives rendering on the AppKit main run loop, including while menus are open. Physics retains its fixed 120 Hz timestep. Signals, menu quit, and the duration limit are also checked by a small timer so shutdown works when no drawable is available. AppKit termination returns through C++ cleanup, which stops the motion helper.
 
-On macOS, a fully transparent [SDL window shape](https://wiki.libsdl.org/SDL3/SDL_SetWindowShape) supplies the input mask while the native Metal layer supplies the visible water. SDL updates mouse interception from this shape on pointer movement, so setting the native window's `ignoresMouseEvents` flag alone is insufficient.
+The native window's [ignoresMouseEvents](https://developer.apple.com/documentation/appkit/nswindow/ignoresmouseevents) property keeps it click-through. The window, view, and Metal layer are non-opaque. This replaces the SDL input-shape workaround used by the earlier version.
 
 After rebuilding, quit any running copy through the **💧 menu → Quit Fluid Hose** or **Ctrl+C**, then relaunch. An already running process continues using its original code.
 
@@ -78,19 +79,22 @@ This is a 2D prototype on **one selected display at a time**. Windows are solid,
 ./examples/fluid-hose/run.sh --display-check
 ./examples/fluid-hose/run.sh --probe
 ./examples/fluid-hose/run.sh --smoke-test
+./examples/fluid-hose/run.sh --window-check
+"./examples/fluid-hose/build/Fluid Hose.app/Contents/MacOS/fluid-hose" --window-check
 ```
 
 - `--physics-check` requires no graphics access and checks gravity, pooling, collision, hose placement, displacement by moving and overlapping windows, and clearing.
 - `--motion-check` checks gravity projection, stale/invalid data, fluid moving toward side walls and the ceiling, and helper transport/shutdown using synthetic data without opening sensors.
-- `--display-check` checks saved selection, disconnect fallback, reconnect with changed SDL IDs, and negative-origin display selection without requiring graphics access.
+- `--display-check` checks saved selection, disconnect fallback, reconnect with changed native IDs, and conversion between AppKit and Quartz coordinates without requiring graphics access.
 - Interactive display switching requires a normal desktop session; `--list-displays` enumerates the screens without creating an overlay.
 - `--probe` prints desktop bounds and the window collision rectangles without launching the overlay.
 - `--smoke-test` checks Metal density accumulation, a translucent merged fluid surface, and transparent background pixels without creating a window.
+- `--window-check` briefly shows a native overlay on each connected display. It checks actual WindowServer bounds, Metal drawable dimensions and frame delivery, display switching, menu actions, and transparent, click-through, non-focusing window settings. It requires a live desktop, does not save a display preference, and does not open sensors. Physical monitor disconnection and manual mouse interaction remain interactive checks.
 - `--duration 10` runs the overlay for ten seconds and exits.
 
-Requires macOS 14 or newer and full Xcode's C++ and Metal tools to rebuild. Enter the root devenv shell for the locked SDL3 SDK and helper tools; `SDL3_ROOT` and `SDL3_LIBRARY` select its separate header and library outputs.
+Requires macOS 14 or newer and full Xcode's C++ and Metal tools to rebuild. The root devenv shell supplies helper tools for the shared checks; the hose build does not read `SDL3_ROOT` or `SDL3_LIBRARY`.
 
-On October 9, 2026, `devenv test` rebuilt both examples using the locked, complete SDL 3.4.10 SDK and passed the physics, display selection, helper, signing, and bundled-dependency checks. Native Metal pixel readback passed for both the CLI executable and packaged app. Display enumeration recognized the built-in Retina display and two LG UltraFine monitors. The fluid overlay and mouse pass-through have also been confirmed interactively. GPU timing remains unmeasured.
+On October 9, 2026, `devenv test` rebuilt both examples and passed the physics, display selection, helper, signing, and bundled-dependency checks after the AppKit migration. The hose also built outside devenv with the SDL environment variables removed. Native Metal pixel readback passed for both the CLI executable and packaged app. Both executables' `--window-check` moved the overlay across the built-in Retina display and two LG UltraFine monitors, verified actual window bounds and 2× drawable dimensions, rendered frames, and dispatched Display and Quit menu actions. Duration, SIGINT, and SIGTERM shutdown checks passed, as did a packaged launch through LaunchServices/Finder with a duration limit. The packaged hose links only macOS system libraries. GPU timing remains unmeasured.
 
 ## Motion sensor probe
 
@@ -165,13 +169,11 @@ Raw results: [original solver](benchmarks/2026-10-08-physics-baseline.csv), [nei
 
 ## Code
 
-- [src/main.cpp](src/main.cpp): fixed-step simulation loop and desktop overlay setup.
+- [src/main.cpp](src/main.cpp): command-line options and C++ fixed-step simulation callbacks.
 - [src/fluid_sim.cpp](src/fluid_sim.cpp): gravity, density relaxation, collision, and nozzle placement.
-- [src/desktop.mm](src/desktop.mm): window metadata, Option-key state, click-through window, menu-bar controls, and native Metal rendering.
+- [src/desktop.mm](src/desktop.mm): AppKit application lifecycle and display link, native overlay window, display and window metadata, Option-key state, menu-bar controls, and Metal rendering.
 - [src/fluid.metal](src/fluid.metal): density splats, water surface shading, and the nozzle.
 - [src/fluid_types.h](src/fluid_types.h): shared CPU/GPU data layouts.
 - [tools/probe_motion.cpp](tools/probe_motion.cpp): SPU motion sensor activation and live sample diagnostics.
 - [src/motion.cpp](src/motion.cpp): gravity estimation, display projection, and ownership of the reader process.
 - [src/displays.cpp](src/displays.cpp): selecting a connected display and recovering the saved monitor after reconnect.
-
-SDL's license is in [SDL3-LICENSE.txt](SDL3-LICENSE.txt) and the app bundle.

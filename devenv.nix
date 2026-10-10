@@ -17,14 +17,14 @@
     pkgs.sdl3
   ];
 
-  # SDL's headers and dylib are separate Nix outputs. Build scripts copy the
-  # library into each app before changing its install name and signing it.
+  # SDL's headers and dylib are separate Nix outputs. The triangle build copies
+  # the library before changing its install name and signing it.
   env.SDL3_ROOT = "${lib.getDev pkgs.sdl3}";
   env.SDL3_LIBRARY = "${lib.getLib pkgs.sdl3}/lib/libSDL3.0.dylib";
   env.SDL3_VERSION = pkgs.sdl3.version;
 
   scripts.project-doctor = {
-    description = "Check Xcode, Metal tools, and the pinned SDL SDK.";
+    description = "Check Xcode, Metal tools, and the triangle's pinned SDL SDK.";
     exec = ''
       set -euo pipefail
       "$DEVENV_ROOT/tools/check-native-tools.sh"
