@@ -42,6 +42,7 @@ struct BodyOutput {
     float2 local;  // body points, facing right, y down
     float kind;
     float4 look;
+    float3 style;
 };
 
 vertex BodyOutput body_vertex(uint vertex_id [[vertex_id]], uint body_id [[instance_id]],
@@ -54,14 +55,16 @@ vertex BodyOutput body_vertex(uint vertex_id [[vertex_id]], uint body_id [[insta
     const PondBody body = bodies[body_id];
     const float4 look = float4(body.look[0], body.look[1], body.look[2], body.look[3]);
     // Probes are invisible: their quad collapses to nothing.
-    if (body.kind > 2.5) return {float4(2, 2, 0, 1), float2(0), body.kind, look};
-    const float reach = body.kind < 0.5 ? DUCK_REACH + 2.0 : body.kind < 1.5 ? FISH_REACH + 2.0 : FOOD_RADIUS * 1.6 + 2.0;
+    const float3 style = float3(body.style[0], body.style[1], body.style[2]);
+    if (body.kind > 2.5 && body.kind < 3.5) return {float4(2, 2, 0, 1), float2(0), body.kind, look, style};
+    const float reach = body.kind < 0.5 ? DUCK_REACH + 2.0 : body.kind < 1.5 ? FISH_REACH + 2.0 :
+                        body.kind < 2.5 ? FOOD_RADIUS * 1.6 + 2.0 : EGG_RADIUS + 2.0;
     const float2 local = corners[vertex_id] * reach;
     const float2 scaled = local * float2(body.facing, abs(body.facing));
     const float c = cos(body.angle), s = sin(body.angle);
     const float2 point = float2(body.x, body.y) + float2(c * scaled.x - s * scaled.y, s * scaled.x + c * scaled.y);
     const float2 clip = float2(point.x / scene.width * 2 - 1, 1 - point.y / scene.height * 2);
-    return {float4(clip, 0, 1), local, body.kind, look};
+    return {float4(clip, 0, 1), local, body.kind, look, style};
 }
 
 namespace {
@@ -129,7 +132,10 @@ float fish_depth(float x) {
 // A zebrafish: golden body with blue stripes that run on into the tail fin.
 // look: tail bend, eye vergence, health (0 is dead), and the belly's side
 // times how foreshortened the fish looks partway through turning around.
-float4 draw_fish(float2 p, float4 look) {
+// style: inherited stripe hue and pattern, and sex times growth (negative
+// for a female). Hatchlings are see-through with big eyes; adult females
+// are rounder and silvery, males slimmer and more golden.
+float4 draw_fish(float2 p, float4 look, float3 style) {
     const float pixel = max(fwidth(p.x) + fwidth(p.y), 1e-3) * 0.7;
     const float side = look.w < 0 ? -1.0 : 1.0;
     p.x /= max(abs(look.w), 0.12);
@@ -137,7 +143,12 @@ float4 draw_fish(float2 p, float4 look) {
     // The tail swings from a fixed head.
     const float sway = saturate((6.0 - p.x) / 30.0);
     const float2 q = float2(p.x, p.y - look.x * sway * sway);
-    const float depth = fish_depth(q.x);
+    const float growth = saturate(abs(style.z) - 0.01);
+    const float mature = smoothstep(0.5, 0.95, growth);
+    const float female = style.z < 0 ? mature : 0.0, male = style.z > 0 ? mature : 0.0;
+    // A female's belly swells with eggs; a male is slimmer.
+    const float swell = 1.0 + 0.2 * female * smoothstep(-16.0, 4.0, q.x) * step(0.5, q.y) - 0.06 * male;
+    const float depth = fish_depth(q.x) * swell;
     const float centre = 0.5;  // the belly is slightly rounder than the back
     const float body = max(max(abs(q.y - centre) - depth, -25.0 - q.x), q.x - 23.6) * 0.85;
 
@@ -151,7 +162,12 @@ float4 draw_fish(float2 p, float4 look) {
     if (min(body, fins) > pixel * 2) return 0;
 
     const float health = saturate(look.z * 1.2);
-    const float3 stripe_blue = float3(0.14, 0.24, 0.56);
+    // Stripe colour runs from teal through blue to violet with the hue gene.
+    const float3 stripe_blue = style.x < 0 ? mix(float3(0.14, 0.24, 0.56), float3(0.08, 0.38, 0.46), -style.x)
+                                           : mix(float3(0.14, 0.24, 0.56), float3(0.36, 0.18, 0.58), style.x);
+    // Stripes appear as the fish grows; a low stripe gene breaks them into spots.
+    const float spots = saturate((0.3 - style.y) / 0.3);
+    const float stripe_width = 0.75 + 0.5 * style.y;
     // Fins: translucent, striped like the body.
     float4 fish = 0;
     {
@@ -164,14 +180,26 @@ float4 draw_fish(float2 p, float4 look) {
 
     // Body: back darker, flank golden, belly pale, with stripes and a sheen.
     const float across = (q.y - centre) / max(depth, 0.5);
-    float3 color = mix(float3(0.62, 0.55, 0.32), float3(0.95, 0.85, 0.58), smoothstep(-0.9, -0.3, across));
-    color = mix(color, float3(0.98, 0.96, 0.9), smoothstep(0.35, 0.9, across));
-    const float stripes = smoothstep(0.1, 0.03, abs(across + 0.5)) + smoothstep(0.11, 0.04, abs(across + 0.02)) +
-                          smoothstep(0.09, 0.03, abs(across - 0.42));
-    color = mix(color, stripe_blue, saturate(stripes) * smoothstep(13.0, 7.0, q.x) * 0.9);
+    const float3 flank = mix(float3(0.95, 0.85, 0.58), float3(1.0, 0.8, 0.42), male) * mix(1.0, 1.04, female);
+    float3 color = mix(float3(0.62, 0.55, 0.32), flank, smoothstep(-0.9, -0.3, across));
+    color = mix(color, float3(0.98, 0.96, 0.9), smoothstep(0.35 - 0.3 * female, 0.9, across));
+    const float w = stripe_width;
+    float stripes = smoothstep(0.1 * w, 0.03 * w, abs(across + 0.5)) + smoothstep(0.11 * w, 0.04 * w, abs(across + 0.02)) +
+                    smoothstep(0.09 * w, 0.03 * w, abs(across - 0.42));
+    // Spots sit on wider versions of the stripe rows.
+    const float rows = smoothstep(0.2, 0.08, abs(across + 0.5)) + smoothstep(0.2, 0.08, abs(across + 0.02)) +
+                       smoothstep(0.2, 0.08, abs(across - 0.42));
+    const float2 cell = fract(float2(q.x / 4.0 + step(0.0, across) * 0.5, 0.5)) - 0.5;
+    stripes = mix(stripes, saturate(rows) * smoothstep(0.34, 0.2, abs(cell.x)), spots);
+    color = mix(color, stripe_blue, saturate(stripes) * smoothstep(13.0, 7.0, q.x) * 0.9 * smoothstep(0.25, 0.7, growth));
+    // Hatchlings: a pale, see-through body with a dark line along the belly.
+    const float larva = 1.0 - smoothstep(0.1, 0.55, growth);
+    color = mix(color, float3(0.9, 0.88, 0.78), larva * 0.7);
+    color = mix(color, float3(0.25, 0.22, 0.2), larva * smoothstep(0.25, 0.0, abs(across - 0.75)));
     color *= mix(0.7, 1.05, saturate(-body / 3.5));
     color += float3(1.0, 0.98, 0.9) * exp(-pow((across + 0.25) / 0.16, 2.0)) * 0.2 * smoothstep(-20.0, 0.0, q.x);
     fish = over(fish, color, body, pixel);
+    fish *= mix(1.0, 0.6, larva);
     // Gill cover and mouth.
     const float gill = abs(length((q - float2(17.0, centre)) * float2(1.0, 0.75)) - 5.5) - 0.3;
     fish = over(fish, color * 0.78, max(gill, max(q.x - 13.5, abs(q.y - centre) - depth * 0.8)), pixel);
@@ -184,11 +212,13 @@ float4 draw_fish(float2 p, float4 look) {
     fish = float4(fish.rgb * (1.0 - pectoral_coverage) + float3(1.0, 0.95, 0.8) * pectoral_coverage, fish.a);
 
     // Eye: a silver iris; the pupil moves forward as the eyes turn in to hunt.
+    // Hatchlings have big eyes for their size.
     const float2 eye = float2(15.6, -1.3);
-    fish = over(fish, float3(0.82, 0.78, 0.66), length(q - eye) - 3.3, pixel);
+    const float eye_size = 1.0 + 0.35 * larva;
+    fish = over(fish, float3(0.82, 0.78, 0.66), length(q - eye) - 3.3 * eye_size, pixel);
     if (look.z > 0.0) {
-        fish = over(fish, float3(0.04, 0.04, 0.07), length(q - eye - float2(0.9 * look.y, 0.0)) - 2.1, pixel);
-        fish = over(fish, float3(1.0), length(q - eye - float2(0.9 * look.y - 0.8, -0.9)) - 0.65, pixel);
+        fish = over(fish, float3(0.04, 0.04, 0.07), length(q - eye - float2(0.9 * look.y, 0.0)) - 2.1 * eye_size, pixel);
+        fish = over(fish, float3(1.0), length(q - eye - float2(0.9 * look.y - 0.8, -0.9)) - 0.65 * eye_size, pixel);
     } else {
         // Dead: crossed-out eyes.
         const float2 e = q - eye;
@@ -214,9 +244,34 @@ float4 draw_food(float2 p, float4 look) {
 }
 }
 
+// An egg: a clear shell around a yolk; the embryo curls and its eyes darken
+// as it develops. look: development 0 to 1, and 1 when dead (gone white).
+float4 draw_egg(float2 p, float4 look) {
+    constexpr float drawn = 2.6;  // drawn at this radius, then scaled
+    p *= drawn / EGG_RADIUS;
+    const float pixel = max(fwidth(p.x) + fwidth(p.y), 1e-3) * 0.7;
+    const float shell = length(p) - drawn;
+    if (shell > pixel * 2) return 0;
+    if (look.y > 0.5) return float4(0.9, 0.9, 0.86, 1.0) * saturate(0.5 - shell / pixel);
+    float4 egg = float4(float3(0.85, 0.92, 0.95) * 0.35, 0.35) * saturate(0.5 - shell / pixel);
+    egg = over(egg, float3(1.0), abs(shell + 0.35) - 0.12, pixel);  // the shell's rim
+    const float develop = look.x;
+    // The yolk shrinks as the embryo grows around it.
+    egg = over(egg, float3(0.98, 0.82, 0.45), length(p - float2(0.2, 0.3)) - mix(1.2, 0.6, develop), pixel);
+    if (develop > 0.3) {
+        const float angle = atan2(p.y, p.x);
+        const float body = abs(length(p) - 1.5) - 0.35;
+        const float curl = angle - mix(3.0, 0.5, develop);  // the tail grows around the yolk
+        egg = over(egg, float3(0.92, 0.88, 0.8), max(body, curl), pixel);
+        egg = over(egg, float3(0.1, 0.1, 0.12), length(p - float2(-1.1, -0.9)) - 0.42 * smoothstep(0.4, 0.8, develop), pixel);
+    }
+    return egg;
+}
+
 fragment float4 body_fragment(BodyOutput in [[stage_in]]) {
     const float4 color = in.kind < 0.5 ? draw_duck(in.local, in.look.x) :
-                         in.kind < 1.5 ? draw_fish(in.local, in.look) : draw_food(in.local, in.look);
+                         in.kind < 1.5 ? draw_fish(in.local, in.look, in.style) :
+                         in.kind < 2.5 ? draw_food(in.local, in.look) : draw_egg(in.local, in.look);
     if (color.a <= 0.0) discard_fragment();
     return color;
 }

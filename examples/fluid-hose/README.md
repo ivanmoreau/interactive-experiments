@@ -23,7 +23,7 @@ Or open `build/Fluid Hose.app` from this example folder in Finder.
 - Choose a monitor through **💧 → Display**. Names, sizes, and a checkmark identify the active display. Your choice is remembered for the next launch.
 - **Option+scroll** while pouring changes the flow, from a slow drip (0.25×) to a strong jet (3×); **💧 → Flow** shows the current rate and offers presets. The nozzle's opening widens and brightens with the flow. With the Accessibility permission (System Settings → Privacy & Security → Accessibility), the scroll is consumed so the window under the pointer does not also scroll; without it, that window scrolls too.
 - **💧 → Add rubber duck 🦆** drops a duck from a random point along the top of the screen; **Remove ducks** takes them all away. Clearing the water leaves the ducks. Up to 32 ducks fit.
-- **💧 → Add fish 🐟** drops a fish the same way, so pour some water first. **Hold Control** to sprinkle food from the pointer, or use **💧 → Feed the fish** to drop a pinch above one. A status line under **Remove fish** says how they are doing: happy, hungry, starving, out of water, or dead. **Show fish brain** opens a window of a fish's neurons firing; click it to watch the next fish. See [Fish](#fish). Up to 8 fish fit.
+- **💧 → Add fish 🐟** drops a young adult fish the same way, so pour some water first; it is a female or a male, whichever the pond has fewer of. **Hold Control** to sprinkle food from the pointer, or use **💧 → Feed the fish** to drop a pinch above one. A status line under **Remove fish** says how they are doing: happy, hungry, starving, out of water, or dead. **Show fish brain** opens a window of a fish's neurons firing; click it to watch the next fish. See [Fish](#fish). Up to 16 fish fit.
 - **💧 → Liquid** sets how the water moves: **Water** is runny and splashy, **Thick** flows slowly, and **Goo** clings and stretches. It applies to the water already on screen.
 - **💧 → Particle size** trades detail for volume. **Fine** gives the most detailed streams and drops; **Coarse** holds the most water. Changing the size clears the water.
 - **💧 → Refract the desktop** bends the desktop seen through the water, like a lens. It needs the Screen Recording permission; see [Refraction](#refraction).
@@ -48,7 +48,7 @@ The flow, liquid, particle size, and refraction choices are remembered. The defa
 
 The app has no Dock icon or visible window frame. Its menu-bar icon provides the controls.
 
-Switching displays clears the water and moves the overlay, hose, and window collisions to that display. If the selected monitor disconnects, the app falls back to an available display and returns to the saved monitor when it reconnects. The menu also refreshes when monitors are added, rearranged, or resized. The first launch defaults to the main display.
+Switching displays moves the overlay, hose, window collisions, and the pond (water, ducks, and fish, scaled to fit) to that display. If the selected monitor disconnects, the app falls back to an available display and returns to the saved monitor when it reconnects. The menu also refreshes when monitors are added, rearranged, or resized. The first launch defaults to the main display.
 
 You can also select a display from Terminal:
 
@@ -149,7 +149,41 @@ Fish need water and food:
 
 Food flakes are small Jolt bodies that pass through ducks and fish but rest on windows. They float until they soak up water (about 25 seconds), then sink slowly and dissolve after two and a half minutes. Up to 48 flakes exist at once.
 
-Fish start moderately hungry, and nothing is saved between launches: each launch starts a new pond.
+Fish start moderately hungry.
+
+The pond is saved: fish (with their genomes, growth, family, energy, and brain wiring), ducks, and the water itself go to `~/Library/Application Support/Fluid Hose` every 30 seconds and when the app quits, and come back at the next launch, scaled to the display. Hunger and breath are paused while the app is closed. Switching displays carries the pond along instead of clearing it. `--new-pond` starts an empty pond (the old one is replaced at the next save), and `--pond DIR` keeps the pond in another folder. Food flakes are not saved. New creatures drop from a point clear of windows.
+
+#### Genes and growing up
+
+Every fish carries a genome ([src/fish_genome.h](src/fish_genome.h)) and has a sex. Fish from the menu are founders, varied a little around the standard type; children (see below) mix their parents' genes, gene by gene, with a small random mutation.
+
+| Gene | Effect |
+|---|---|
+| Boldness | Weakens the looming input to the Mauthner cells: bold fish ignore threats that timid fish flee |
+| Appetite | Strengthens how much hunger drives the hunger neurons |
+| Curiosity | More bouts, and exploration streaks add up to turning around sooner |
+| Size | Adult length, 80% to 125% of the standard 50 points |
+| Metabolism | How fast energy burns |
+| Hue | Stripe colour, from teal through blue to violet |
+| Stripes | Stripe width; low values break the stripes into spots, like the zebrafish leopard mutant |
+
+The behavioural genes tune strengths in the brain; they do not rewire it. Each fish's wiring is still drawn freshly from the same rules, so brains vary on top of their genes: of eleven wirings tried in the pond check, one often missed food it could see.
+
+#### Courtship, eggs, and generations
+
+Zebrafish spawn at first light, and so do these: from 7:00 to 7:45 local time, or for five minutes after **💧 → Lights on 🌅**, adults with energy to spare feel the urge to spawn. Three hand-wired populations carry it:
+
+- **Mate detectors**, laid out by direction like the prey detectors, see adults of the other sex.
+- A hypothalamic **spawning drive** carries the morning urge.
+- A **courtship** command needs both a mate in view and the urge, and is put off by hunger. Males in courtship chase and circle the female; females lead, turning gently.
+
+A female courted by a male close by lays her clutch, one egg every half second, about 5 to 13 eggs depending on her energy, and then rests for ten minutes before she can spawn again. Each egg is fertilized by that male. It carries a child genome (each gene somewhere between the parents' values, plus a small mutation), a sex, and the next generation number.
+
+Eggs are a little heavier than water: they sink slowly and rest on the floor or on window ledges, passing through fish and ducks. The embryo develops visibly inside the shell and hatches after three minutes (real zebrafish take two or three days) into a larva, if the pond has room for another fish. Eggs left out of water dry out and die. Juveniles and adults eat eggs they find, their parents included, as real zebrafish do, so eggs on window ledges above the water are the safest. Larvae are too small to eat eggs.
+
+Over generations, the fish that eat well grow, spawn, and pass on their genes, and those that do not starve: the pond drifts toward whatever suits the desktop it lives on. The menu status counts eggs, young fish, and generations; the brain window shows a fish's parents and when it is courting or being courted.
+
+Fish grow from hatchlings 40% of their adult length to full size. Growth needs food: a fish with spare energy reaches adulthood in about 20 minutes, and each flake adds a little. Hatchlings are pale and see-through with big eyes; stripes appear as they grow. Adult females are rounder and silvery-bellied, males slimmer and more golden. Bigger fish swim faster and burn more energy, and their collision shapes grow with them. The brain window's header gives each fish's name, sex, stage, generation, and parents; the menu counts young fish and generations.
 
 **Show fish brain** (or `--brain`) opens a floating window, drawn by [src/brain_view.mm](src/brain_view.mm), with every neuron of one fish as a dot on a side view of a larval zebrafish brain, snout to the left. Each population sits roughly where its counterpart does in a real larva: retina in the eye, the tectum's dome over the midbrain, hunger and satiety in the hypothalamus below, and the Mauthner cells, turning region, and swim commands in the hindbrain. Direction-mapped populations (retina, tectum, looming) are laid out in order around an arc, so the part facing the food or the threat lights up. Dots glow with each neuron's spikes over the last tenth of a second and are coloured by role: senses, decisions, movement, and hunger and breath. The header gives the fish's state, energy, air, meals, and escapes; clicking moves to the next fish. `--brain-snapshot FILE.png` draws the window offscreen for a hungry fish watching food that is then startled.
 
@@ -200,7 +234,7 @@ This is a 2D toy on **one selected display at a time**. Windows are solid rounde
 - `--brain-snapshot FILE.png` draws the fish brain window offscreen, without a desktop session; it only needs AppKit.
 - `--snapshot FILE.png` simulates a scripted scene offscreen (a stream pouring onto one window while a second window slides into the pool) and writes it over a synthetic desktop. `--ducks` and `--fish` add ducks and fish; fish are fed during the last few seconds. `--duration` sets the simulated seconds; the default is 8. `--size` and `--liquid` select the preset; `--refraction` uses the synthetic desktop, which has grid lines, rings, and text-like rows, as the refracted image. It is useful for tuning the solver and shaders without a live desktop.
 - `--duck-check` couples Jolt and the GPU fluid headlessly. It checks that a dry duck lands on and rests on a window, that dragging the window carries the duck, that a duck dropped into a pool floats at the surface and stays level, and that it falls to the floor when the water is cleared.
-- `--fish-check` first checks the brain alone, for six wiring seeds: that an idle fish swims in regular bouts and turns around every so often, levels out when tilted, hunts food it sees, turns its eyes in while hunting, turns around for food behind it, strikes at food in front of its mouth, ignores food when full, escapes a looming threat within 0.15 s by turning away (including one from straight behind), stops escaping from a threat repeated from one direction but still escapes one from a new direction or after a rest, and thrashes when suffocating. For the same seeds it checks the spinal cord: under steady drive the two sides take turns, faster with more drive; each bout beats the tail back and forth; and a Mauthner spike curls the tail away from the threat at once. With the hindbrain connectome downloaded, it checks that the measured integrator holds activity after a brief push while shuffled wiring with the same synapse counts does not (worst of three wirings each), that only one side holds at a time, and that the gaze follows the turning region. It then couples brain, Jolt, and the GPU fluid in a pool: the fish swims around, stays in the water and roughly level, finds and eats sprinkled flakes, darts away from a rushing pointer, starves when its metabolism is sped up, floats up when dead, and flops about and suffocates when stranded on a dry floor.
+- `--fish-check` first checks the brain alone, for six wiring seeds: that an idle fish swims in regular bouts and turns around every so often, levels out when tilted, hunts food it sees, turns its eyes in while hunting, turns around for food behind it, strikes at food in front of its mouth, ignores food when full, escapes a looming threat within 0.15 s by turning away (including one from straight behind), stops escaping from a threat repeated from one direction but still escapes one from a new direction or after a rest, and thrashes when suffocating, that a bolder fish flees less, that with the urge to spawn a male chases a female he sees (and ignores her without it), and that a courted female leads, turning less than the male. For the same seeds it checks the spinal cord: under steady drive the two sides take turns, faster with more drive; each bout beats the tail back and forth; and a Mauthner spike curls the tail away from the threat at once. With the hindbrain connectome downloaded, it checks that the measured integrator holds activity after a brief push while shuffled wiring with the same synapse counts does not (worst of three wirings each), that only one side holds at a time, and that the gaze follows the turning region. It checks that a saved pond loads back the same and that a restored pond has the same fish. It then couples brain, Jolt, and the GPU fluid in a pool: the fish swims around, stays in the water and roughly level, finds and eats sprinkled flakes, darts away from a rushing pointer, starves when its metabolism is sped up, floats up when dead, a hatchling that is fed grows into an adult, a fed male and female with the morning urge court and spawn, the eggs hatch into larvae of the next generation with both parents, a hungry fish eats eggs it finds, and a stranded fish flops about and suffocates on a dry floor.
 - `--capture-check` captures the main display briefly and reports the size of the first frame received; it saves nothing. It requires the Screen Recording permission.
 - `--smoke-test` checks that splats merge into a translucent, premultiplied water surface on transparent background pixels without creating a window.
 - `--window-check` briefly shows a native overlay on each connected display. It checks actual WindowServer bounds, Metal drawable dimensions and frame delivery, display switching, menu actions, and transparent, click-through, non-focusing window settings. It requires a live desktop, does not save a display preference, and does not open sensors. Physical monitor disconnection and manual mouse interaction remain interactive checks.
@@ -284,6 +318,8 @@ Raw results: [benchmarks/2026-10-09-gpu-solver.csv](benchmarks/2026-10-09-gpu-so
 - [src/pond.cpp](src/pond.cpp): the Jolt Physics pond: rubber ducks, fish bodies, senses, bouts, eating, breathing, food flakes, window and wall bodies, buoyancy and drag, and the duck and fish checks.
 - [src/fish_brain.cpp](src/fish_brain.cpp): the fish's spiking brain, its motor readout, its diagram layout, and the brain checks.
 - [src/brain_view.mm](src/brain_view.mm): the floating fish brain window and its offscreen snapshot.
+- [src/fish_genome.h](src/fish_genome.h): fish genes, inheritance, and names.
+- [src/pond_store.cpp](src/pond_store.cpp): saving and loading the pond between launches.
 - [tools/fetch-connectome.sh](tools/fetch-connectome.sh), [tools/convert_connectome.py](tools/convert_connectome.py), [tools/matlab_file.py](tools/matlab_file.py): download, check, and convert the measured hindbrain wiring.
 - [tools/build-jolt.sh](tools/build-jolt.sh): builds the pinned Jolt Physics submodule into a cached static library.
 - [src/fluid.metal](src/fluid.metal): particle splats, field smoothing, duck, fish, and food drawing, water surface shading, and the nozzle.

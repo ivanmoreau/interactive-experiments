@@ -58,20 +58,23 @@ struct SolverUniforms {
 // the same convention. facing is +scale for a duck facing right and -scale
 // for one facing left; other kinds use +scale. look holds drawing details:
 // a duck's colour variant in look[0]; for a fish, tail bend, eye vergence,
-// health, and its belly side times how foreshortened it looks mid-turn.
-// tag identifies the body in its water sample.
+// health, and its belly side times how foreshortened it looks mid-turn;
+// style holds a fish's inherited looks: stripe hue, stripe pattern, and its
+// sex times its growth (negative for a female). tag identifies the body in
+// its water sample.
 struct PondBody {
     float x, y, angle, facing;
     float vx, vy, spin, kind;
     float look[4];
     fluid_uint tag;
-    float padding0, padding1, padding2;
+    float style[3];
 };
 
 #define BODY_DUCK 0.0f
 #define BODY_FISH 1.0f
 #define BODY_FOOD 2.0f
 #define BODY_PROBE 3.0f  // senses water for a fish and is never drawn
+#define BODY_EGG 4.0f
 // Only ducks and fish stir the water; food and probes just measure it.
 
 // Water overlapping one body, measured on the GPU: particle count, the sums
@@ -106,6 +109,7 @@ struct BodySample {
 #define FISH_RY 7.5f
 #define FISH_REACH 36.0f
 #define FOOD_RADIUS 3.5f
+#define EGG_RADIUS 3.4f
 #define FOOD_WET_RADIUS 8.0f  // flakes are tiny, so they sense water over a wider circle
 #define PROBE_RADIUS 9.0f
 
@@ -118,12 +122,17 @@ inline float2 body_local(float2 p, PondBody body) {
 }
 
 inline float body_reach(PondBody body) {
-    const float reach = body.kind < 0.5f ? DUCK_REACH : body.kind < 1.5f ? FISH_RX : body.kind < 2.5f ? FOOD_WET_RADIUS : PROBE_RADIUS;
+    // Food and eggs sense water over the same small circle; probes over a wider one.
+    const float reach = body.kind < 0.5f ? DUCK_REACH : body.kind < 1.5f ? FISH_RX :
+                        (body.kind < 2.5f || body.kind > 3.5f) ? FOOD_WET_RADIUS : PROBE_RADIUS;
     return reach * metal::abs(body.facing);
 }
 
 inline bool body_contains(float2 local, float kind) {
-    if (kind > 1.5f) return metal::dot(local, local) < (kind < 2.5f ? FOOD_WET_RADIUS * FOOD_WET_RADIUS : PROBE_RADIUS * PROBE_RADIUS);
+    if (kind > 1.5f) {
+        const float radius = (kind < 2.5f || kind > 3.5f) ? FOOD_WET_RADIUS : PROBE_RADIUS;
+        return metal::dot(local, local) < radius * radius;
+    }
     if (kind > 0.5f) {
         const float2 fish = local / float2(FISH_RX, FISH_RY);
         return metal::dot(fish, fish) < 1;

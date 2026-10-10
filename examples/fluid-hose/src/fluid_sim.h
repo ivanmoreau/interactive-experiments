@@ -69,6 +69,8 @@ public:
     bool flush();
     double last_flush_gpu_seconds() const;
     bool read_particles(std::vector<FluidParticle>& output);
+    // Replaces the water with these particles (for restoring a saved pond).
+    bool restore_particles(const std::vector<FluidParticle>& particles);
 
 #ifdef __OBJC__
     bool encode(id<MTLCommandBuffer> commands);

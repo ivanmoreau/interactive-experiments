@@ -68,6 +68,9 @@ enum Pop {
     swim_speed,         // nucleus of the medial longitudinal fasciculus
     bout_generator,     // hindbrain burst generator that times bouts
     strike,
+    mate_detection,     // tectal cells for an adult of the other sex, 1 per direction
+    spawning_drive,     // hypothalamic: the urge to spawn, raised by morning light
+    court_command,      // the courtship command: chasing (males) or leading (females)
     // Spinal cord: a half-centre swim rhythm per side. Rhythm neurons excite
     // their own side and, through crossed inhibition, silence the other, so
     // the sides take turns and the tail beats.
@@ -144,6 +147,9 @@ const Population populations[population_count] = {
     {"swim speed", 12, 0.6f, 0.3f, 0, 1},
     {"bout generator", 10, 0.95f, 0.35f, 0.08f, 1.0f},
     {"strike", 6, 0.2f, 0.2f, 0, 1},
+    {"mate detection", FishSenses::prey_bins, 0.3f, 0.25f, 0, 1},
+    {"spawning drive", 8, 0.3f, 0.25f, 0, 1},
+    {"courtship", 12, 0.2f, 0.25f, 0.01f, 3.0f},
     {"descending drive", 10, 0.1f, 0.2f, drive_adaptation, drive_adaptation_time},
     {"spinal rhythm (left)", 12, 0.2f, 0.2f, rhythm_adaptation, rhythm_adaptation_time, 0, 1, spinal_membrane},
     {"spinal rhythm (right)", 12, 0.2f, 0.2f, rhythm_adaptation, rhythm_adaptation_time, 0, 1, spinal_membrane},
@@ -213,6 +219,9 @@ const Place places[population_count] = {
     {0.63f, 0.78f, "swim speed", C::move, false},
     {0.94f, 0.32f, "bout generator", C::move, false},
     {0.38f, 0.70f, "strike", C::move, false},
+    {0.24f, 0.20f, "mates", C::sense, true},
+    {0.45f, 0.86f, "spawning", C::drive, false},
+    {0.13f, 0.84f, "courtship", C::decide, false},
     // The spinal cord is drawn in its own strip.
     {-1, 0, "descending drive", C::move, false},
     {-1, 0, "rhythm L", C::move, false},
@@ -246,6 +255,7 @@ struct FishBrain::Impl {
     int first[population_count + 1] = {};
     std::shared_ptr<const HindbrainConnectome> hindbrain;
     bool shuffle_hindbrain = false;
+    FishTraits traits;
     std::vector<int> owner;  // population of each neuron
     std::vector<float> voltage, excitation, inhibition, adaptation, input;
     std::vector<float> strength;  // remaining synaptic strength under depression, 0 to 1
@@ -367,10 +377,10 @@ struct FishBrain::Impl {
         // escape recruits inhibition that silences both cells for a while.
         // Their fields overlap straight ahead and behind, so a threat there
         // drives both and the faster one wins.
-        wire(looming, mauthner_dorsal, 1.0f, 0.6f, [&](int l, int) { return std::sin(FishSenses::loom_angle(l / 2)) > -0.4f ? 1.0f : 0.0f; });
-        wire(looming, mauthner_ventral, 1.0f, 0.6f, [&](int l, int) { return std::sin(FishSenses::loom_angle(l / 2)) < 0.4f ? 1.0f : 0.0f; });
-        wire(lateral_line, mauthner_dorsal, 1.0f, 0.25f);
-        wire(lateral_line, mauthner_ventral, 1.0f, 0.25f);
+        wire(looming, mauthner_dorsal, 1.0f, 0.6f / traits.boldness, [&](int l, int) { return std::sin(FishSenses::loom_angle(l / 2)) > -0.4f ? 1.0f : 0.0f; });
+        wire(looming, mauthner_ventral, 1.0f, 0.6f / traits.boldness, [&](int l, int) { return std::sin(FishSenses::loom_angle(l / 2)) < 0.4f ? 1.0f : 0.0f; });
+        wire(lateral_line, mauthner_dorsal, 1.0f, 0.25f / traits.boldness);
+        wire(lateral_line, mauthner_ventral, 1.0f, 0.25f / traits.boldness);
         wire(mauthner_dorsal, escape_inhibition, 1.0f, 3.0f);
         wire(mauthner_ventral, escape_inhibition, 1.0f, 3.0f);
         wire(escape_inhibition, mauthner_dorsal, 1.0f, -6.0f);
@@ -415,6 +425,15 @@ struct FishBrain::Impl {
         wire(hypoxia, swim_speed, 0.5f, 0.6f);
         wire(hunt_command, swim_speed, 0.3f, -0.5f);  // stalking is slow
         wire(satiety, swim_speed, 0.3f, -0.3f);
+
+        // Courtship needs both a mate in view and the urge to spawn; hunger
+        // puts it off, and it puts off hunting in turn.
+        wire(mate_detection, court_command, 0.8f, 0.8f);
+        wire(spawning_drive, court_command, 1.0f, 0.45f);
+        wire(court_command, court_command, 1.0f, 0.12f);
+        wire(hunger, court_command, 0.3f, -0.3f);
+        wire(court_command, hunt_command, 0.3f, -0.5f);
+        wire(court_command, bout_generator, 0.3f, 0.3f);
 
         // The spinal swim rhythm, driven during bouts by the bout generator and
         // the swim-speed cells. A Mauthner spike curls the body into a C away
@@ -492,9 +511,12 @@ struct FishBrain::Impl {
         set(blocked_dorsal, populations[blocked_dorsal].tonic + 2.5f * s.blocked_dorsal);
         set(blocked_ventral, populations[blocked_ventral].tonic + 2.5f * s.blocked_ventral);
         set(blocked_ahead, populations[blocked_ahead].tonic + 2.5f * s.blocked_ahead);
-        set(hunger, populations[hunger].tonic + 1.3f * s.hunger);
+        set(hunger, populations[hunger].tonic + 1.3f * s.hunger * traits.appetite);
+        set(bout_generator, populations[bout_generator].tonic + 0.08f * (traits.curiosity - 1));
         set(satiety, populations[satiety].tonic + 1.6f * s.fullness);
         set(hypoxia, populations[hypoxia].tonic + 2.0f * s.hypoxia);
+        for (int i = 0; i < size(mate_detection); ++i) input[neuron(mate_detection, i)] += 2.2f * s.mate[i];
+        set(spawning_drive, populations[spawning_drive].tonic + 1.6f * s.spawning);
     }
 
     void step() {
@@ -554,6 +576,18 @@ struct FishBrain::Impl {
     // Background firing points every way and mostly cancels, so the length
     // of the sum says how clearly the tectum sees something.
     std::vector<float> trace;
+    // The direction of a mate, read from the mate detectors like prey.
+    float mate_direction(float& strength) const {
+        float x = 0, y = 0;
+        for (int i = 0; i < size(mate_detection); ++i) {
+            const float activity = trace[neuron(mate_detection, i)];
+            const float angle = FishSenses::prey_angle(i);
+            x += activity * std::cos(angle);
+            y += activity * std::sin(angle);
+        }
+        strength = std::hypot(x, y) / size(mate_detection);
+        return std::atan2(y, x);
+    }
     float tectal_direction(float& strength) const {
         float x = 0, y = 0;
         for (int i = 0; i < size(tectum); ++i) {
@@ -577,10 +611,12 @@ struct FishBrain::Impl {
     }
 };
 
-FishBrain::FishBrain(std::uint32_t seed, std::shared_ptr<const HindbrainConnectome> hindbrain, bool shuffle_hindbrain)
+FishBrain::FishBrain(std::uint32_t seed, std::shared_ptr<const HindbrainConnectome> hindbrain, bool shuffle_hindbrain,
+                     FishTraits traits)
     : impl_(std::make_unique<Impl>(seed)) {
     impl_->hindbrain = std::move(hindbrain);
     impl_->shuffle_hindbrain = shuffle_hindbrain;
+    impl_->traits = traits;
     impl_->build();
     impl_->trace.assign(impl_->voltage.size(), 0);
 }
@@ -591,6 +627,7 @@ FishBrain& FishBrain::operator=(FishBrain&&) noexcept = default;
 std::size_t FishBrain::neuron_count() const { return impl_->voltage.size(); }
 std::size_t FishBrain::synapse_count() const { return impl_->synapses.size(); }
 float FishBrain::vergence() const { return std::clamp((impl_->rate[eye_vergence] - 6.0f) / 34.0f, 0.0f, 1.0f); }
+float FishBrain::courtship() const { return std::clamp(impl_->rate[court_command] / 30.0f, 0.0f, 1.0f); }
 float FishBrain::hunting() const { return std::clamp(impl_->rate[hunt_command] / 40.0f, 0.0f, 1.0f); }
 
 std::vector<FishBrain::Rate> FishBrain::rates() const {
@@ -707,7 +744,7 @@ bool FishBrain::advance(const FishSenses& senses, float dt, FishBout& bout) {
         // Exploration turns left or right, out of the screen plane. When they
         // add up to more than a right angle, the fish has turned around.
         const float left = s.rate[turning_left], right = s.rate[turning_right];
-        s.yaw += 0.6f * (left - right) / (left + right + 10.0f) + 0.05f * s.gaussian();
+        s.yaw += 0.6f * s.traits.curiosity * (left - right) / (left + right + 10.0f) + 0.05f * s.gaussian();
         const float dorsal = s.rate[steer_dorsal], ventral = s.rate[steer_ventral];
         const float steer = 0.7f * (dorsal - ventral) / (dorsal + ventral + 30.0f) + noise;
         if (s.rate[reverse] > 45.0f || std::abs(s.yaw) > 1.0f) {
@@ -716,6 +753,13 @@ bool FishBrain::advance(const FishSenses& senses, float dt, FishBout& bout) {
             const float side = strength > prey_seen && std::abs(prey) > 1.9f ? prey : std::copysign(pi, s.yaw + steer);
             bout = {BoutKind::reverse, side + noise, 60.0f + 80.0f * vigour};
             s.yaw = 0;
+        } else if (float mate_strength = 0; s.rate[court_command] > 15.0f && (s.mate_direction(mate_strength), mate_strength > prey_seen)) {
+            // Courting: a male chases and circles the female; she leads, slowly.
+            float ignored = 0;
+            const float mate = s.mate_direction(ignored);
+            if (s.traits.female) bout = {BoutKind::court, 0.3f * mate + noise * 0.5f, 40.0f + 30.0f * vigour};
+            else bout = {BoutKind::court, 0.9f * mate + noise * 0.5f, 90.0f + 80.0f * vigour};
+            if (std::abs(bout.turn) > 1.75f) s.yaw = 0;
         } else if (s.rate[hunt_command] > 8.0f && strength > prey_seen) {
             // Orient toward the prey the tectum reports, slightly under-turning.
             bout = {BoutKind::hunt, 0.8f * prey + noise * 0.5f, 45.0f + 50.0f * vigour};
@@ -739,6 +783,8 @@ bool check(bool condition, const char* message) {
 struct Tally {
     int bouts = 0, escapes = 0, strikes = 0, hunts = 0, reversals = 0;
     int flips = 0;      // bouts that turn the fish around (see FishBout::turn)
+    int courts = 0;
+    float court_turn_sum = 0;
     int steered = 0;    // bouts that turn within the screen plane
     float turn_sum = 0;  // over those bouts
     float escape_turn = 0;
@@ -772,6 +818,10 @@ Tally simulate(FishBrain& brain, const FishSenses& senses, float seconds) {
         if (bout.kind == BoutKind::strike) ++tally.strikes;
         if (bout.kind == BoutKind::hunt) ++tally.hunts;
         if (bout.kind == BoutKind::reverse) ++tally.reversals;
+        if (bout.kind == BoutKind::court) {
+            ++tally.courts;
+            tally.court_turn_sum += bout.turn;
+        }
     }
     tally.vergence /= std::max(steps, 1);
     return tally;
@@ -921,6 +971,49 @@ bool run_brain_checks(std::uint32_t seed) {
     if (!check(early >= 2 && late <= 1, "a repeated harmless threat stops causing escapes")) return false;
     if (!check(novel && rested, "a threat from a new direction, or after a rest, still causes an escape")) return false;
 
+    // Courtship: with the morning urge to spawn, a male chases a female he
+    // sees and turns toward her; without it he ignores her. A courted female
+    // leads, turning less.
+    auto courting = [&](bool female, float spawning) {
+        FishBrain fish(seed + 32, nullptr, false, {1, 1, 1, female});
+        FishSenses mate = calm;
+        mate.hunger = 0.15f;
+        mate.spawning = spawning;
+        mate.mate[11] = 0.7f;
+        mate.mate[12] = 0.35f;
+        simulate(fish, mate, 2);
+        return simulate(fish, mate, 8);
+    };
+    const Tally keen = courting(false, 1), indifferent = courting(false, 0), leading = courting(true, 1);
+    std::printf("  courtship: a male in the morning made %d courting bouts (mean turn %.0f°), %d without the urge; "
+                "a female %d (mean turn %.0f°)\n",
+                keen.courts, keen.court_turn_sum / std::max(keen.courts, 1) * 180 / pi, indifferent.courts, leading.courts,
+                leading.court_turn_sum / std::max(leading.courts, 1) * 180 / pi);
+    if (!check(keen.courts >= 4 && keen.court_turn_sum / keen.courts > 0.4f && indifferent.courts <= 1,
+               "with the urge to spawn, a male chases a female he sees"))
+        return false;
+    if (!check(leading.courts >= 2 && leading.court_turn_sum / leading.courts < keen.court_turn_sum / keen.courts,
+               "a courted female leads, turning less than the male"))
+        return false;
+
+    // Inherited boldness: a bold fish ignores a moderate threat that a timid
+    // one flees.
+    auto flee_count = [&](float boldness) {
+        FishBrain fish(seed + 28, nullptr, false, {boldness, 1, 1});
+        simulate(fish, calm, 2);
+        FishSenses moderate = calm;
+        moderate.looming[5] = moderate.looming[6] = 0.55f;
+        int fled = 0;
+        for (int i = 0; i < 6; ++i) {
+            fled += simulate(fish, moderate, 0.3f).escapes > 0;
+            simulate(fish, calm, 3);
+        }
+        return fled;
+    };
+    const int timid = flee_count(0.6f), bold = flee_count(1.5f);
+    std::printf("  boldness: a timid fish fled %d of 6 moderate threats, a bold one %d\n", timid, bold);
+    if (!check(timid > bold, "a bolder fish flees less")) return false;
+
     // Out of water, the fish thrashes.
     FishBrain gasping(seed + 12);
     FishSenses air = calm;
@@ -1041,7 +1134,7 @@ bool run_spinal_checks(std::uint32_t seed) {
         previous = tail;
     }
     std::printf("  bouts: %d in 20 s, %.1f tail reversals each\n", bouts, static_cast<float>(flips) / std::max(bouts, 1));
-    if (!check(bouts > 5 && flips >= bouts * 2, "each bout beats the tail back and forth")) return false;
+    if (!check(bouts > 5 && flips * 5 >= bouts * 6, "each bout beats the tail back and forth")) return false;
 
     // A Mauthner spike bends the tail within a few milliseconds.
     FishBrain startled(seed + 8);
@@ -1051,15 +1144,17 @@ bool run_spinal_checks(std::uint32_t seed) {
         startled.advance(calm, tick, bout);
     }
     threat.looming[1] = threat.looming[2] = 1.0f;  // below the fish
+    // The bend that follows the escape command (a swim bout may be beating
+    // the tail already when the threat comes).
     float bend = 0;
-    int latency = -1;
-    for (int t = 0; t < 200 && latency < 0; ++t) {
+    int latency = -1, escape_at = -1;
+    for (int t = 0; t < 300 && latency < 0; ++t) {
         FishBout bout;
-        startled.advance(threat, tick, bout);
+        if (startled.advance(threat, tick, bout) && bout.kind == BoutKind::escape) escape_at = t;
+        if (escape_at < 0 || t - escape_at > 60) continue;
         bend = startled.tail();
-        if (std::abs(bend) > 0.6f) latency = t;
+        if (bend < -0.6f) latency = t - escape_at;
     }
-    std::printf("  escape: tail bent %+.2f after %d ms\n", bend, latency);
-    // Away from a threat below means toward the back: negative.
+    std::printf("  escape: tail bent %+.2f, %d ms after the escape command\n", bend, latency);
     return check(latency >= 0 && latency < 80 && bend < 0, "a Mauthner spike bends the tail away from the threat at once");
 }

@@ -27,6 +27,7 @@ struct DesktopInput {
     unsigned feed;       // pinches of food requested from the menu
     bool sprinkling;     // Control is held: food falls from the pointer
     bool show_brain;     // the fish brain window is wanted
+    bool lights_on;      // Lights on was chosen since the last poll
 };
 struct FluidPreferences {
     FluidSettings fluid;

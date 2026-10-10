@@ -48,7 +48,7 @@ done
 xcrun clang++ -std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror \
     -mmacosx-version-min=14.0 \
     -isystem "$JOLT_DIR" \
-    "$PROJECT_DIR/src/main.cpp" "$PROJECT_DIR/src/motion.cpp" "$PROJECT_DIR/src/displays.cpp" "$PROJECT_DIR/src/pond.cpp" "$PROJECT_DIR/src/fish_brain.cpp" \
+    "$PROJECT_DIR/src/main.cpp" "$PROJECT_DIR/src/motion.cpp" "$PROJECT_DIR/src/displays.cpp" "$PROJECT_DIR/src/pond.cpp" "$PROJECT_DIR/src/fish_brain.cpp" "$PROJECT_DIR/src/pond_store.cpp" \
     "$BUILD_DIR/desktop.o" "$BUILD_DIR/fluid_sim.o" "$BUILD_DIR/window_tracker.o" "$BUILD_DIR/screen_capture.o" "$BUILD_DIR/brain_view.o" \
     -framework AppKit -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics -framework ImageIO \
     -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo \
