@@ -47,26 +47,41 @@ struct SolverUniforms {
     float friction;
     float max_speed;
     float particle_radius;
-    fluid_uint duck_count;
-    float duck_stir;           // per second: how quickly water inside a duck takes on its motion
+    fluid_uint body_count;
+    float body_stir;           // per second: how quickly water inside a body takes on its motion
     float padding0, padding1;
 };
 
-// A rubber duck in screen space (points, y down). angle is clockwise in
-// radians, facing is +scale when the duck faces right and -scale when left,
-// and spin is the angular velocity in the same convention as angle.
-struct DuckBody {
+// Something floating in or falling through the water, in screen space
+// (points, y down): a rubber duck, a fish, a food flake, or a fish's water
+// probe. angle is clockwise in radians and spin is the angular velocity in
+// the same convention. facing is +scale for a duck facing right and -scale
+// for one facing left; other kinds use +scale. look holds drawing details:
+// a duck's colour variant in look[0]; for a fish, tail bend, eye vergence,
+// health, and its belly side times how foreshortened it looks mid-turn.
+// tag identifies the body in its water sample.
+struct PondBody {
     float x, y, angle, facing;
-    float vx, vy, spin, variant;
+    float vx, vy, spin, kind;
+    float look[4];
+    fluid_uint tag;
+    float padding0, padding1, padding2;
 };
 
-// Water overlapping one duck, measured on the GPU: particle count, and the
-// sums of their positions and velocities.
-struct DuckSample {
+#define BODY_DUCK 0.0f
+#define BODY_FISH 1.0f
+#define BODY_FOOD 2.0f
+#define BODY_PROBE 3.0f  // senses water for a fish and is never drawn
+// Only ducks and fish stir the water; food and probes just measure it.
+
+// Water overlapping one body, measured on the GPU: particle count, the sums
+// of their positions and velocities, and the body's tag.
+struct BodySample {
     float count;
     float x, y;
     float vx, vy;
-    float padding0, padding1, padding2;
+    fluid_uint tag;
+    float padding0, padding1;
 };
 
 // Duck silhouette in local points, facing right with y down: an elliptical
@@ -85,15 +100,34 @@ struct DuckSample {
 #define DUCK_BEAK_RY 3.0f
 #define DUCK_REACH 30.0f  // radius around the origin that contains the duck at scale 1
 
+// A fish's body is an ellipse centred on its origin, head toward +x; the
+// tail fin is drawn beyond it but does not displace water.
+#define FISH_RX 22.0f
+#define FISH_RY 7.5f
+#define FISH_REACH 36.0f
+#define FOOD_RADIUS 3.5f
+#define FOOD_WET_RADIUS 8.0f  // flakes are tiny, so they sense water over a wider circle
+#define PROBE_RADIUS 9.0f
+
 #ifdef __METAL_VERSION__
-// Converts a screen point into a duck's local frame.
-inline float2 duck_local(float2 p, DuckBody duck) {
-    const float2 d = p - float2(duck.x, duck.y);
-    const float c = metal::cos(duck.angle), s = metal::sin(duck.angle);
-    return float2(c * d.x + s * d.y, -s * d.x + c * d.y) / duck.facing * float2(1, metal::sign(duck.facing));
+// Converts a screen point into a body's local frame.
+inline float2 body_local(float2 p, PondBody body) {
+    const float2 d = p - float2(body.x, body.y);
+    const float c = metal::cos(body.angle), s = metal::sin(body.angle);
+    return float2(c * d.x + s * d.y, -s * d.x + c * d.y) / body.facing * float2(1, metal::sign(body.facing));
 }
 
-inline bool duck_contains(float2 local) {
+inline float body_reach(PondBody body) {
+    const float reach = body.kind < 0.5f ? DUCK_REACH : body.kind < 1.5f ? FISH_RX : body.kind < 2.5f ? FOOD_WET_RADIUS : PROBE_RADIUS;
+    return reach * metal::abs(body.facing);
+}
+
+inline bool body_contains(float2 local, float kind) {
+    if (kind > 1.5f) return metal::dot(local, local) < (kind < 2.5f ? FOOD_WET_RADIUS * FOOD_WET_RADIUS : PROBE_RADIUS * PROBE_RADIUS);
+    if (kind > 0.5f) {
+        const float2 fish = local / float2(FISH_RX, FISH_RY);
+        return metal::dot(fish, fish) < 1;
+    }
     const float2 body = (local - float2(DUCK_BODY_X, DUCK_BODY_Y)) / float2(DUCK_BODY_RX, DUCK_BODY_RY);
     const float2 beak = (local - float2(DUCK_BEAK_X, DUCK_BEAK_Y)) / float2(DUCK_BEAK_RX, DUCK_BEAK_RY);
     return metal::dot(body, body) < 1 || metal::length(local - float2(DUCK_HEAD_X, DUCK_HEAD_Y)) < DUCK_HEAD_R ||
@@ -124,6 +158,6 @@ static_assert(sizeof(WindowObstacle) == 48, "Window layout must match Metal");
 static_assert(sizeof(FluidParticle) == 32, "Particle layout must match Metal");
 static_assert(sizeof(SolverUniforms) == 112,"Solver layout must match Metal");
 static_assert(sizeof(SceneUniforms) == 64, "Scene layout must match Metal");
-static_assert(sizeof(DuckBody) == 32, "Duck layout must match Metal");
-static_assert(sizeof(DuckSample) == 32, "Duck sample layout must match Metal");
+static_assert(sizeof(PondBody) == 64, "Body layout must match Metal");
+static_assert(sizeof(BodySample) == 32, "Body sample layout must match Metal");
 #endif

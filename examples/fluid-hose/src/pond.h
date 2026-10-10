@@ -1,0 +1,81 @@
+#pragma once
+#include "fluid_types.h"
+#include <cstddef>
+#include <memory>
+#include <vector>
+
+struct FishStatus {
+    unsigned alive = 0;
+    unsigned hungry = 0;    // could use a meal
+    unsigned starving = 0;  // will die soon without one
+    unsigned gasping = 0;   // out of the water
+    unsigned dead = 0;
+};
+
+// One fish's vital signs, for checks and the menu.
+struct FishVitals {
+    FluidPoint position;
+    FluidPoint velocity;
+    float energy;  // 0 starved to 1 well fed
+    float oxygen;  // 0 suffocated to 1
+    bool alive;
+    float pitch;  // radians, positive nose up
+    bool in_water;
+    unsigned meals;
+    unsigned escapes;
+};
+
+// Rubber ducks, fish, and fish food simulated with Jolt Physics, locked to
+// the screen plane. Windows are kinematic bodies that follow the window
+// tracker, the screen edges are walls, and the water measured on the GPU
+// supplies buoyancy and drag. Each fish has a spiking brain (fish_brain.h)
+// that sees food and threats and swims in bouts.
+class Pond {
+public:
+    static constexpr std::size_t max_ducks = 32;
+    static constexpr std::size_t max_fish = 8;
+    static constexpr std::size_t max_food = 48;
+
+    Pond();
+    ~Pond();
+    Pond(const Pond&) = delete;
+    Pond& operator=(const Pond&) = delete;
+
+    // Rebuilds the screen walls for a new canvas and removes everything else.
+    void reset(float width, float height);
+    // Drops a duck with its centre at position. Returns false when full.
+    bool add_duck(FluidPoint position);
+    void clear_ducks();
+    std::size_t duck_count() const;
+    // Drops a fish at position. Returns false when full.
+    bool add_fish(FluidPoint position);
+    void clear_fish();
+    std::size_t fish_count() const;
+    // Drops one food flake; the oldest flake goes when there are too many.
+    void add_food(FluidPoint position);
+    std::size_t food_count() const;
+    // Fish watch the mouse pointer and flee when it rushes at them.
+    void set_pointer(FluidPoint position);
+    // Multiplies how fast fish get hungry and run out of air (for checks).
+    void set_metabolism(float hunger, float breath = 1);
+    FishStatus fish_status() const;
+    std::vector<FishVitals> fish_vitals() const;
+
+    // Sets the windows' positions for this frame; steps move them there
+    // gradually from where the previous frame left them.
+    void set_windows(const std::vector<WindowObstacle>& windows);
+    // Advances one fixed step. progress is how far through the frame's window
+    // motion this step ends (0 to 1). water holds the latest GPU measurement
+    // for each body, and particle_area the water area of one particle.
+    void step(float dt, float progress, FluidPoint gravity, const std::vector<BodySample>& water, float particle_area);
+
+    // Ducks, then fish, then food, then each fish's water probes.
+    const std::vector<PondBody>& bodies() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+bool run_duck_checks(const char* shader_file);
+bool run_fish_checks(const char* shader_file);

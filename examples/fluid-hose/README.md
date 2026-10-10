@@ -1,6 +1,6 @@
 # Fluid Hose
 
-A desktop fluid toy for macOS. Hold **Option** to pour water from a nozzle controlled by the mouse. Water lands on window tops, drips off their edges, and pools at the bottom of the usable desktop, above the Dock. Drag a window through the water and it sloshes; water resting on a window rides along with it. Drop in rubber ducks: they bob on the water, drift with the current, ride on windows, and get batted around when you drag a window into them.
+A desktop fluid toy for macOS. Hold **Option** to pour water from a nozzle controlled by the mouse. Water lands on window tops, drips off their edges, and pools at the bottom of the usable desktop, above the Dock. Drag a window through the water and it sloshes; water resting on a window rides along with it. Drop in rubber ducks: they bob on the water, drift with the current, ride on windows, and get batted around when you drag a window into them. Or keep fish: each one has a small spiking brain that hunts the food you sprinkle, darts away when the pointer rushes at it, needs water to breathe, and dies if you forget to feed it.
 
 The overlay uses **AppKit + native Metal**. The fluid is a position-based fluid solver running in Metal compute shaders, and windows are tracked live through WindowServer notifications. The overlay is transparent and lets mouse clicks pass through, so you can move and resize the real windows normally while the simulation runs.
 
@@ -13,7 +13,7 @@ From the workspace root:
 ./examples/fluid-hose/run.sh
 ```
 
-Building requires macOS 14 or newer and Apple's C++ compiler. With full Xcode the build compiles the shaders into `fluid.metallib`; with only the Command Line Tools it bundles the shader source instead, and Metal compiles it when the app launches. Rubber ducks use [Jolt Physics](https://github.com/jrouwe/JoltPhysics) v5.6.0 (MIT), pinned as a Git submodule in `third_party/JoltPhysics`. The build fetches the submodule if needed and compiles Jolt once into a cached static library (about 15 seconds); the app bundles Jolt's license as `JoltPhysics-LICENSE.txt`. Otherwise the app links only macOS system frameworks and requires no SDL SDK or third-party runtime library. The shared [devenv environment](../../README.md) provides the repository's development and checking tools; it is optional for building and running the hose itself.
+Building requires macOS 14 or newer and Apple's C++ compiler. With full Xcode the build compiles the shaders into `fluid.metallib`; with only the Command Line Tools it bundles the shader source instead, and Metal compiles it when the app launches. Rubber ducks, fish, and fish food use [Jolt Physics](https://github.com/jrouwe/JoltPhysics) v5.6.0 (MIT), pinned as a Git submodule in `third_party/JoltPhysics`. The build fetches the submodule if needed and compiles Jolt once into a cached static library (about 15 seconds); the app bundles Jolt's license as `JoltPhysics-LICENSE.txt`. Otherwise the app links only macOS system frameworks and requires no SDL SDK or third-party runtime library. The shared [devenv environment](../../README.md) provides the repository's development and checking tools; it is optional for building and running the hose itself.
 
 Or open `build/Fluid Hose.app` from this example folder in Finder.
 
@@ -23,6 +23,7 @@ Or open `build/Fluid Hose.app` from this example folder in Finder.
 - Choose a monitor through **💧 → Display**. Names, sizes, and a checkmark identify the active display. Your choice is remembered for the next launch.
 - **Option+scroll** while pouring changes the flow, from a slow drip (0.25×) to a strong jet (3×); **💧 → Flow** shows the current rate and offers presets. The nozzle's opening widens and brightens with the flow. With the Accessibility permission (System Settings → Privacy & Security → Accessibility), the scroll is consumed so the window under the pointer does not also scroll; without it, that window scrolls too.
 - **💧 → Add rubber duck 🦆** drops a duck from a random point along the top of the screen; **Remove ducks** takes them all away. Clearing the water leaves the ducks. Up to 32 ducks fit.
+- **💧 → Add fish 🐟** drops a fish the same way, so pour some water first. **Hold Control** to sprinkle food from the pointer, or use **💧 → Feed the fish** to drop a pinch above one. A status line under **Remove fish** says how they are doing: happy, hungry, starving, out of water, or dead. See [Fish](#fish). Up to 8 fish fit.
 - **💧 → Liquid** sets how the water moves: **Water** is runny and splashy, **Thick** flows slowly, and **Goo** clings and stretches. It applies to the water already on screen.
 - **💧 → Particle size** trades detail for volume. **Fine** gives the most detailed streams and drops; **Coarse** holds the most water. Changing the size clears the water.
 - **💧 → Refract the desktop** bends the desktop seen through the water, like a lens. It needs the Screen Recording permission; see [Refraction](#refraction).
@@ -42,6 +43,7 @@ The flow, liquid, particle size, and refraction choices are remembered. The defa
 ./examples/fluid-hose/run.sh --refraction
 ./examples/fluid-hose/run.sh --flow 2
 ./examples/fluid-hose/run.sh --ducks 5
+./examples/fluid-hose/run.sh --fish 3
 ```
 
 The app has no Dock icon or visible window frame. Its menu-bar icon provides the controls.
@@ -99,7 +101,7 @@ Water is retained until you clear it. The capacity is 65,536 particles, which is
 
 ### Rubber ducks
 
-[src/duck_world.cpp](src/duck_world.cpp) simulates ducks with [Jolt Physics](https://github.com/jrouwe/JoltPhysics), a rigid-body engine. Ducks are dynamic bodies locked to the screen plane with Jolt's `Plane2D` degrees of freedom: they move in x and y and rotate about the axis facing you. Each duck is a compound of three extruded convex hulls (body, head, and beak) built from the same silhouette the shaders use, scaled 90–115% and facing left or right. Like a weighted bath toy, its centre of mass sits under the middle of its body, so it floats level and rights itself. Rubber friction (0.9) and some bounce (restitution 0.35) apply. Windows are kinematic boxes with rounded edges that move to the tracker's positions each step, interpolated across the frame like the water's colliders, so a dragged window carries or bats ducks with real momentum. The screen edges are static walls. Jolt runs at the same 120 Hz fixed step in points converted to metres (100 points per metre, so 950 points/s² gravity is about Earth gravity), with a single-threaded job system; 32 ducks need no more.
+[src/pond.cpp](src/pond.cpp) simulates ducks with [Jolt Physics](https://github.com/jrouwe/JoltPhysics), a rigid-body engine. Ducks are dynamic bodies locked to the screen plane with Jolt's `Plane2D` degrees of freedom: they move in x and y and rotate about the axis facing you. Each duck is a compound of three extruded convex hulls (body, head, and beak) built from the same silhouette the shaders use, scaled 90–115% and facing left or right. Like a weighted bath toy, its centre of mass sits under the middle of its body, so it floats level and rights itself. Rubber friction (0.9) and some bounce (restitution 0.35) apply. Windows are kinematic boxes with rounded edges that move to the tracker's positions each step, interpolated across the frame like the water's colliders, so a dragged window carries or bats ducks with real momentum. The screen edges are static walls. Jolt runs at the same 120 Hz fixed step in points converted to metres (100 points per metre, so 950 points/s² gravity is about Earth gravity), with a single-threaded job system; 32 ducks need no more.
 
 Jolt does not simulate fluids, so the two simulations are coupled every step:
 
@@ -107,6 +109,35 @@ Jolt does not simulate fluids, so the two simulations are coupled every step:
 - **Duck → water.** Particles inside a duck's outline blend toward the velocity of the duck's surface at that point, so falling ducks splash and moving ducks stir the water. Water is not pushed out of ducks: in this side view it passes in front of and behind them, like water around a toy in a tank.
 
 Ducks are drawn procedurally into their own layer: a soft-shaded plastic body and tail, a wing crescent, an orange beak, and a glossy eye, mostly yellow, sometimes pink or mint, and rarely gold. The surface pass draws that layer under the water. Where water covers a duck, the duck is tinted by the water's depth and bent along with the desktop by refraction, so the waterline reads naturally.
+
+### Fish
+
+Fish are larval-zebrafish-like: about 50 points long, golden with blue stripes, and swimming the way real larvae do, in discrete flicks (bouts) of a tenth of a second or so, then gliding. [src/fish_brain.cpp](src/fish_brain.cpp) gives each fish its own brain: about 300 leaky integrate-and-fire neurons in 29 populations, connected by about 3,800 synapses, simulated in 1 ms ticks on the CPU. The wiring is drawn by hand from published diagrams of larval zebrafish circuits; it is not traced from a connectome. (The fly projects that inspired this, [desktop-fly](https://github.com/DenisSergeevitch/desktop-fly) and [fly-brain](https://github.com/eonsystemspbc/fly-brain), can use the FlyWire connectome; the zebrafish's whole-brain wiring is still being mapped.) Each fish's connections are drawn randomly from the same wiring rules with its own seed, so no two brains are identical; the checks run several seeds.
+
+| Circuit | Senses | Behaviour |
+|---|---|---|
+| Retina → optic tectum, with pooled inhibition | Food flakes in view, by direction, brighter when closer; windows block the view; the 30° behind the tail is blind | The tectum's activity map points at the prey |
+| Hunting command, eye vergence | Prey in the tectum, plus hunger | A self-sustaining hunting state: the eyes turn in, bouts become slow turns toward the prey, and a full fish ignores food |
+| Pretectal strike zone → strike | Food right in front of the mouth | A fast lunge; food within reach of the mouth during it is eaten |
+| Looming detectors → Mauthner cells, with feedback inhibition | The pointer, a window, or a duck rushing at the fish | A C-start escape away from the threat within a few tens of milliseconds |
+| Turning region (two halves that trade the lead every few seconds) | Nothing; it runs on its own | Exploration turns come in streaks, as in real larvae. Those turns are left and right, toward and away from you in this side view, so a streak adds up until the fish turns around: idle fish patrol back and forth |
+| Tilt sense, blocked-direction cells, reticulospinal steering | Pitch, and air, windows, or the screen edge ahead | Levels out, and steers or turns away from dead ends |
+| Hypothalamic hunger and satiety | Energy and how full the gut is | Hunger drives searching and hunting; satiety calms the fish |
+| Hindbrain bout generator and swim-speed cells | Arousal from hunger, hunting, water flow, and suffocation | When bouts happen, about once a second at rest, and how vigorous they are |
+
+The screen is a side view, so the brain's two visual halves cover the half of the plane above the fish's heading and the half below it rather than its left and right eyes. Turning more than about 100° flips the fish around, drawn as it swinging its head through the screen.
+
+The body is a Jolt ellipse in the same pond as the ducks. A swim bladder makes a living fish weightless in water; drag is low along its body and high sideways, so it glides forward. A fins-and-balance righting reflex eases it back toward level, except while hunting. Small probe circles ahead of the fish measure the water there on the GPU, like the duck measurement, so the fish knows where the surface is. Fish stir the water like ducks do.
+
+Fish need water and food:
+
+- **Air.** Out of water a fish thrashes in flops and suffocates after about 50 seconds; back in water it recovers.
+- **Food.** Energy runs down over about 40 minutes and each flake restores some. Hunger shows as paler colours and weaker bouts, and the menu reports hungry and then starving fish. A starved fish dies.
+- **Death.** Dead fish turn grey, roll over, cross out their eyes, and float belly up until you remove them.
+
+Food flakes are small Jolt bodies that pass through ducks and fish but rest on windows. They float until they soak up water (about 25 seconds), then sink slowly and dissolve after two and a half minutes. Up to 48 flakes exist at once.
+
+Fish start moderately hungry, and nothing is saved between launches: each launch starts a new pond.
 
 ### Rendering
 
@@ -140,6 +171,7 @@ This is a 2D toy on **one selected display at a time**. Windows are solid rounde
 ./examples/fluid-hose/run.sh --snapshot refraction.png --refraction --duration 30
 ./examples/fluid-hose/run.sh --capture-check
 ./examples/fluid-hose/run.sh --duck-check
+./examples/fluid-hose/run.sh --fish-check
 ./examples/fluid-hose/run.sh --window-check
 "./examples/fluid-hose/build/Fluid Hose.app/Contents/MacOS/fluid-hose" --window-check
 ```
@@ -149,8 +181,9 @@ This is a 2D toy on **one selected display at a time**. Windows are solid rounde
 - `--display-check` checks saved selection, disconnect fallback, reconnect with changed native IDs, and conversion between AppKit and Quartz coordinates without requiring graphics access.
 - Interactive display switching requires a normal desktop session; `--list-displays` enumerates the screens without creating an overlay.
 - `--probe` prints desktop bounds, the window tracking mode, and each window collider with its corner radius, without launching the overlay.
-- `--snapshot FILE.png` simulates a scripted scene offscreen (a stream pouring onto one window while a second window slides into the pool) and writes it over a synthetic desktop. `--duration` sets the simulated seconds; the default is 8. `--size` and `--liquid` select the preset; `--refraction` uses the synthetic desktop, which has grid lines, rings, and text-like rows, as the refracted image. It is useful for tuning the solver and shaders without a live desktop.
+- `--snapshot FILE.png` simulates a scripted scene offscreen (a stream pouring onto one window while a second window slides into the pool) and writes it over a synthetic desktop. `--ducks` and `--fish` add ducks and fish; fish are fed during the last few seconds. `--duration` sets the simulated seconds; the default is 8. `--size` and `--liquid` select the preset; `--refraction` uses the synthetic desktop, which has grid lines, rings, and text-like rows, as the refracted image. It is useful for tuning the solver and shaders without a live desktop.
 - `--duck-check` couples Jolt and the GPU fluid headlessly. It checks that a dry duck lands on and rests on a window, that dragging the window carries the duck, that a duck dropped into a pool floats at the surface and stays level, and that it falls to the floor when the water is cleared.
+- `--fish-check` first checks the brain alone, for six wiring seeds: that an idle fish swims in regular bouts and turns around every so often, levels out when tilted, hunts food it sees, turns its eyes in while hunting, strikes at food in front of its mouth, ignores food when full, escapes a looming threat within 0.15 s by turning away, and thrashes when suffocating. It then couples brain, Jolt, and the GPU fluid in a pool: the fish swims around, stays in the water and roughly level, finds and eats sprinkled flakes, darts away from a rushing pointer, starves when its metabolism is sped up, floats up when dead, and flops about and suffocates when stranded on a dry floor.
 - `--capture-check` captures the main display briefly and reports the size of the first frame received; it saves nothing. It requires the Screen Recording permission.
 - `--smoke-test` checks that splats merge into a translucent, premultiplied water surface on transparent background pixels without creating a window.
 - `--window-check` briefly shows a native overlay on each connected display. It checks actual WindowServer bounds, Metal drawable dimensions and frame delivery, display switching, menu actions, and transparent, click-through, non-focusing window settings. It requires a live desktop, does not save a display preference, and does not open sensors. Physical monitor disconnection and manual mouse interaction remain interactive checks.
@@ -161,6 +194,8 @@ On October 9, 2026, after the GPU solver and window tracking were added, the hos
 After the liquid presets, particle sizes, and refraction were added, the same machine passed `--physics-check` across all nine size and liquid combinations in ten consecutive runs, plus `--smoke-test`, `--display-check`, `--motion-check`, code signing, and bundled-dependency checks. A launch with saved preferences exited cleanly. Refraction was checked with `--snapshot --refraction`. `--capture-check` could not run there because that process lacked the Screen Recording permission, so live capture and refraction still need checking on a desktop where the permission is granted.
 
 With rubber ducks added (Jolt Physics v5.6.0), `--duck-check` passed repeatedly on the same machine, along with the earlier checks and a launch with `--ducks 3`. Floating ducks settled within 0.05 radians of level. The look was checked with `--snapshot --ducks 5`; dropping ducks with the menu and dragging windows into them are interactive checks.
+
+On October 10, 2026, with fish added, `--fish-check` passed in six consecutive runs on the same machine, along with `--duck-check`, `--physics-check`, and `--smoke-test`. The fish's look was checked with `--snapshot --fish 3 --ducks 2 --refraction`. Feeding with Control, the menu status, and how the fish react to real pointer movement and window drags are interactive checks.
 
 ## Motion sensor probe
 
@@ -229,9 +264,10 @@ Raw results: [benchmarks/2026-10-09-gpu-solver.csv](benchmarks/2026-10-09-gpu-so
 - [src/window_tracker.mm](src/window_tracker.mm): live window tracking through SkyLight notifications, with a polling fallback.
 - [src/desktop.mm](src/desktop.mm): AppKit application lifecycle and display link, native overlay window, display metadata, Option-key state, menu-bar controls and saved preferences, Metal rendering, and offscreen snapshots.
 - [src/screen_capture.mm](src/screen_capture.mm): ScreenCaptureKit desktop capture for refraction.
-- [src/duck_world.cpp](src/duck_world.cpp): Jolt Physics rubber ducks, window and wall bodies, buoyancy and drag, and duck checks.
+- [src/pond.cpp](src/pond.cpp): the Jolt Physics pond: rubber ducks, fish bodies, senses, bouts, eating, breathing, food flakes, window and wall bodies, buoyancy and drag, and the duck and fish checks.
+- [src/fish_brain.cpp](src/fish_brain.cpp): the fish's spiking brain, its motor readout, and the brain checks.
 - [tools/build-jolt.sh](tools/build-jolt.sh): builds the pinned Jolt Physics submodule into a cached static library.
-- [src/fluid.metal](src/fluid.metal): particle splats, field smoothing, rubber duck drawing, water surface shading, and the nozzle.
+- [src/fluid.metal](src/fluid.metal): particle splats, field smoothing, duck, fish, and food drawing, water surface shading, and the nozzle.
 - [src/fluid_types.h](src/fluid_types.h): shared CPU/GPU data layouts.
 - [tools/probe_motion.cpp](tools/probe_motion.cpp): SPU motion sensor activation and live sample diagnostics.
 - [src/motion.cpp](src/motion.cpp): gravity estimation, display projection, and ownership of the reader process.

@@ -35,28 +35,33 @@ fragment float4 splat_fragment(SplatOutput in [[stage_in]]) {
 
 struct SurfaceOutput { float4 position [[position]]; float2 uv; };
 
-// Rubber ducks are drawn into their own layer, which the surface pass places
-// under the water so submerged parts are tinted and refracted.
-struct DuckOutput {
+// Ducks, fish, and food are drawn into their own layer, which the surface
+// pass places under the water so submerged parts are tinted and refracted.
+struct BodyOutput {
     float4 position [[position]];
-    float2 local;  // duck points, facing right, y down
-    float variant;
+    float2 local;  // body points, facing right, y down
+    float kind;
+    float4 look;
 };
 
-vertex DuckOutput duck_vertex(uint vertex_id [[vertex_id]], uint duck_id [[instance_id]],
+vertex BodyOutput body_vertex(uint vertex_id [[vertex_id]], uint body_id [[instance_id]],
                               constant SceneUniforms& scene [[buffer(0)]],
-                              constant DuckBody* ducks [[buffer(1)]]) {
+                              constant PondBody* bodies [[buffer(1)]]) {
     const float2 corners[6] = {
         float2(-1, -1), float2(1, -1), float2(-1, 1),
         float2(-1, 1), float2(1, -1), float2(1, 1)
     };
-    const DuckBody duck = ducks[duck_id];
-    const float2 local = corners[vertex_id] * (DUCK_REACH + 2.0);
-    const float2 scaled = local * float2(duck.facing, abs(duck.facing));
-    const float c = cos(duck.angle), s = sin(duck.angle);
-    const float2 point = float2(duck.x, duck.y) + float2(c * scaled.x - s * scaled.y, s * scaled.x + c * scaled.y);
+    const PondBody body = bodies[body_id];
+    const float4 look = float4(body.look[0], body.look[1], body.look[2], body.look[3]);
+    // Probes are invisible: their quad collapses to nothing.
+    if (body.kind > 2.5) return {float4(2, 2, 0, 1), float2(0), body.kind, look};
+    const float reach = body.kind < 0.5 ? DUCK_REACH + 2.0 : body.kind < 1.5 ? FISH_REACH + 2.0 : FOOD_RADIUS * 1.6 + 2.0;
+    const float2 local = corners[vertex_id] * reach;
+    const float2 scaled = local * float2(body.facing, abs(body.facing));
+    const float c = cos(body.angle), s = sin(body.angle);
+    const float2 point = float2(body.x, body.y) + float2(c * scaled.x - s * scaled.y, s * scaled.x + c * scaled.y);
     const float2 clip = float2(point.x / scene.width * 2 - 1, 1 - point.y / scene.height * 2);
-    return {float4(clip, 0, 1), local, duck.variant};
+    return {float4(clip, 0, 1), local, body.kind, look};
 }
 
 namespace {
@@ -77,21 +82,21 @@ float4 over(float4 below, float3 color, float distance, float pixel) {
 }
 }
 
-fragment float4 duck_fragment(DuckOutput in [[stage_in]]) {
-    const float2 p = in.local;
+namespace {
+float4 draw_duck(float2 p, float variant) {
     const float pixel = max(fwidth(p.x) + fwidth(p.y), 1e-3) * 0.7;
     const float body = ellipse_distance(p, float2(DUCK_BODY_X, DUCK_BODY_Y), float2(DUCK_BODY_RX, DUCK_BODY_RY));
     const float tail = ellipse_distance(p, float2(DUCK_BODY_X - 17, DUCK_BODY_Y - 9), float2(7, 5));
     const float head = length(p - float2(DUCK_HEAD_X, DUCK_HEAD_Y)) - DUCK_HEAD_R;
     const float silhouette = smooth_union(smooth_union(body, tail, 4.0), head, 5.0);
     const float beak = ellipse_distance(p, float2(DUCK_BEAK_X, DUCK_BEAK_Y), float2(DUCK_BEAK_RX, DUCK_BEAK_RY));
-    if (min(silhouette, beak) > pixel * 2) discard_fragment();
+    if (min(silhouette, beak) > pixel * 2) return 0;
 
     float3 base = float3(1.0, 0.84, 0.16);           // classic yellow
-    if (in.variant > 2.5) base = float3(1.0, 0.72, 0.18);       // gold
-    else if (in.variant > 1.5) base = float3(0.52, 0.9, 0.74);  // mint
-    else if (in.variant > 0.5) base = float3(1.0, 0.58, 0.72);  // pink
-    const bool gold = in.variant > 2.5;
+    if (variant > 2.5) base = float3(1.0, 0.72, 0.18);       // gold
+    else if (variant > 1.5) base = float3(0.52, 0.9, 0.74);  // mint
+    else if (variant > 0.5) base = float3(1.0, 0.58, 0.72);  // pink
+    const bool gold = variant > 2.5;
 
     // Soft plastic shading: darker toward the rim and the underside, with a
     // glossy highlight on the back and the head.
@@ -111,6 +116,109 @@ fragment float4 duck_fragment(DuckOutput in [[stage_in]]) {
     duck = over(duck, float3(0.05, 0.05, 0.08), length(p - float2(14.5, -14.5)) - 1.9, pixel);
     duck = over(duck, float3(1.0), length(p - float2(15.1, -15.2)) - 0.6, pixel);
     return duck;
+}
+
+// Half the body's depth along it: a rounded snout, deepest just behind the
+// head, tapering to a slim tail stalk.
+float fish_depth(float x) {
+    if (x > 4.0) return 7.6 * sqrt(saturate(1.0 - pow((x - 4.0) / 19.5, 2.0)));
+    const float s = saturate((x + 22.0) / 26.0);
+    return 2.3 + 5.3 * s * (2.0 - s);
+}
+
+// A zebrafish: golden body with blue stripes that run on into the tail fin.
+// look: tail bend, eye vergence, health (0 is dead), and the belly's side
+// times how foreshortened the fish looks partway through turning around.
+float4 draw_fish(float2 p, float4 look) {
+    const float pixel = max(fwidth(p.x) + fwidth(p.y), 1e-3) * 0.7;
+    const float side = look.w < 0 ? -1.0 : 1.0;
+    p.x /= max(abs(look.w), 0.12);
+    p.y *= side;
+    // The tail swings from a fixed head.
+    const float sway = saturate((6.0 - p.x) / 30.0);
+    const float2 q = float2(p.x, p.y - look.x * sway * sway);
+    const float depth = fish_depth(q.x);
+    const float centre = 0.5;  // the belly is slightly rounder than the back
+    const float body = max(max(abs(q.y - centre) - depth, -25.0 - q.x), q.x - 23.6) * 0.85;
+
+    // Forked tail fin, then the fins along the back and belly.
+    const float behind = -22.0 - q.x;
+    const float fork = (-q.x - 29.0) * 0.9;
+    const float tail = max(max(abs(q.y - centre) - (2.3 + behind * 0.78), -36.5 - q.x), max(-behind, fork - abs(q.y - centre)));
+    const float dorsal = ellipse_distance(q, float2(-7.0, centre - fish_depth(-7.0) + 0.2), float2(6.0, 3.6));
+    const float anal = ellipse_distance(q, float2(-9.5, centre + fish_depth(-9.5) - 0.2), float2(7.5, 3.0));
+    const float fins = min(tail, min(dorsal, anal));
+    if (min(body, fins) > pixel * 2) return 0;
+
+    const float health = saturate(look.z * 1.2);
+    const float3 stripe_blue = float3(0.14, 0.24, 0.56);
+    // Fins: translucent, striped like the body.
+    float4 fish = 0;
+    {
+        const float across = (q.y - centre) / (2.3 + max(behind, 0.0) * 0.78);
+        const float banding = smoothstep(0.08, 0.0, abs(abs(across) - 0.42)) + smoothstep(0.1, 0.0, abs(across));
+        const float3 fin = mix(float3(0.95, 0.86, 0.6), stripe_blue, saturate(banding) * step(0.0, behind));
+        const float coverage = saturate(0.5 - fins / pixel) * 0.6;
+        fish = float4(fin * coverage, coverage);
+    }
+
+    // Body: back darker, flank golden, belly pale, with stripes and a sheen.
+    const float across = (q.y - centre) / max(depth, 0.5);
+    float3 color = mix(float3(0.62, 0.55, 0.32), float3(0.95, 0.85, 0.58), smoothstep(-0.9, -0.3, across));
+    color = mix(color, float3(0.98, 0.96, 0.9), smoothstep(0.35, 0.9, across));
+    const float stripes = smoothstep(0.1, 0.03, abs(across + 0.5)) + smoothstep(0.11, 0.04, abs(across + 0.02)) +
+                          smoothstep(0.09, 0.03, abs(across - 0.42));
+    color = mix(color, stripe_blue, saturate(stripes) * smoothstep(13.0, 7.0, q.x) * 0.9);
+    color *= mix(0.7, 1.05, saturate(-body / 3.5));
+    color += float3(1.0, 0.98, 0.9) * exp(-pow((across + 0.25) / 0.16, 2.0)) * 0.2 * smoothstep(-20.0, 0.0, q.x);
+    fish = over(fish, color, body, pixel);
+    // Gill cover and mouth.
+    const float gill = abs(length((q - float2(17.0, centre)) * float2(1.0, 0.75)) - 5.5) - 0.3;
+    fish = over(fish, color * 0.78, max(gill, max(q.x - 13.5, abs(q.y - centre) - depth * 0.8)), pixel);
+    fish = over(fish, float3(0.35, 0.25, 0.2), length(q - float2(22.8, 1.6)) - 0.6, pixel);
+    // Pectoral fin over the flank.
+    const float2 pectoral = q - float2(9.5, 3.6);
+    const float pectoral_fin = ellipse_distance(float2(pectoral.x * 0.9 + pectoral.y * 0.43, -pectoral.x * 0.43 + pectoral.y * 0.9),
+                                                float2(-2.5, 0.0), float2(4.5, 1.8));
+    const float pectoral_coverage = saturate(0.5 - pectoral_fin / pixel) * 0.45;
+    fish = float4(fish.rgb * (1.0 - pectoral_coverage) + float3(1.0, 0.95, 0.8) * pectoral_coverage, fish.a);
+
+    // Eye: a silver iris; the pupil moves forward as the eyes turn in to hunt.
+    const float2 eye = float2(15.6, -1.3);
+    fish = over(fish, float3(0.82, 0.78, 0.66), length(q - eye) - 3.3, pixel);
+    if (look.z > 0.0) {
+        fish = over(fish, float3(0.04, 0.04, 0.07), length(q - eye - float2(0.9 * look.y, 0.0)) - 2.1, pixel);
+        fish = over(fish, float3(1.0), length(q - eye - float2(0.9 * look.y - 0.8, -0.9)) - 0.65, pixel);
+    } else {
+        // Dead: crossed-out eyes.
+        const float2 e = q - eye;
+        const float cross = min(abs(e.x - e.y), abs(e.x + e.y)) * 0.7071 - 0.45;
+        fish = over(fish, float3(0.1, 0.1, 0.12), max(cross, length(e) - 2.4), pixel);
+    }
+    // Hunger pales the fish; death leaves it grey.
+    const float grey = dot(fish.rgb, float3(0.3, 0.55, 0.15));
+    fish.rgb = mix(float3(grey) * 0.92, fish.rgb, health);
+    return fish;
+}
+
+// An irregular flake: orange, red, or tan, darkening as it soaks.
+float4 draw_food(float2 p, float4 look) {
+    const float pixel = max(fwidth(p.x) + fwidth(p.y), 1e-3) * 0.7;
+    const float angle = atan2(p.y, p.x);
+    const float radius = FOOD_RADIUS * (1.0 + 0.22 * sin(3.0 * angle + look.x * 20.0) + 0.12 * sin(5.0 * angle + look.x * 13.0));
+    const float edge = length(p) - radius;
+    if (edge > pixel * 2) return 0;
+    float3 color = look.x < 0.4 ? float3(1.0, 0.5, 0.14) : look.x < 0.75 ? float3(0.86, 0.22, 0.12) : float3(0.88, 0.66, 0.34);
+    color *= mix(1.0, 0.72, look.y) * mix(0.8, 1.1, saturate(-edge / 2.0));
+    return float4(color, 1.0) * saturate(0.5 - edge / pixel) * look.z;
+}
+}
+
+fragment float4 body_fragment(BodyOutput in [[stage_in]]) {
+    const float4 color = in.kind < 0.5 ? draw_duck(in.local, in.look.x) :
+                         in.kind < 1.5 ? draw_fish(in.local, in.look) : draw_food(in.local, in.look);
+    if (color.a <= 0.0) discard_fragment();
+    return color;
 }
 
 vertex SurfaceOutput surface_vertex(uint id [[vertex_id]]) {

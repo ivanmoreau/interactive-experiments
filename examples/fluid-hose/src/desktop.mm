@@ -7,7 +7,7 @@
 #include "desktop.h"
 #include "fluid_sim.h"
 #include "screen_capture.h"
-#include "duck_world.h"
+#include "pond.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdarg>
@@ -104,6 +104,9 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 @property(nonatomic) double flowRate;
 @property(nonatomic) NSInteger duckRequests;
 @property(nonatomic) BOOL removeDucksRequested;
+@property(nonatomic) NSInteger fishRequests;
+@property(nonatomic) NSInteger feedRequests;
+@property(nonatomic) BOOL removeFishRequested;
 @property(nonatomic, strong) NSMenuItem* flowItem;
 @property(nonatomic, strong) NSMenu* flowMenu;
 @property(nonatomic) CFMachPortRef scrollTap;
@@ -122,6 +125,9 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 - (void)selectFlow:(NSMenuItem*)sender;
 - (void)addDuck:(NSMenuItem*)sender;
 - (void)removeDucks:(NSMenuItem*)sender;
+- (void)addFish:(NSMenuItem*)sender;
+- (void)feedFish:(NSMenuItem*)sender;
+- (void)removeFish:(NSMenuItem*)sender;
 - (void)adjustFlowByScroll:(double)points;
 - (void)updateFlowMenu;
 @end
@@ -163,6 +169,9 @@ static void check_only(NSMenu* menu, NSInteger tag) {
 static const double flow_presets[] = {0.25, 0.5, 1.0, 1.5, 2.0, 3.0};
 - (void)addDuck:(NSMenuItem*)sender { (void)sender; self.duckRequests += 1; }
 - (void)removeDucks:(NSMenuItem*)sender { (void)sender; self.removeDucksRequested = YES; }
+- (void)addFish:(NSMenuItem*)sender { (void)sender; self.fishRequests += 1; }
+- (void)feedFish:(NSMenuItem*)sender { (void)sender; self.feedRequests += 1; }
+- (void)removeFish:(NSMenuItem*)sender { (void)sender; self.removeFishRequested = YES; }
 - (void)selectFlow:(NSMenuItem*)sender {
     self.flowRate = flow_presets[sender.tag];
     [self updateFlowMenu];
@@ -199,8 +208,11 @@ struct HoseRenderer {
     id<MTLRenderPipelineState> splat_pipeline = nil;
     id<MTLRenderPipelineState> surface_pipeline = nil;
     id<MTLRenderPipelineState> blur_pipeline = nil;
-    id<MTLRenderPipelineState> duck_pipeline = nil;
-    id<MTLTexture> duck_layer = nil;
+    id<MTLRenderPipelineState> body_pipeline = nil;
+    id<MTLTexture> body_layer = nil;
+    // Bodies to draw, in a ring so frames still on the GPU keep theirs.
+    id<MTLBuffer> body_buffers[3] = {nil, nil, nil};
+    unsigned body_slot = 0;
     id<MTLTexture> blurred = nil;   // horizontal pass
     id<MTLTexture> smoothed = nil;  // both passes, with a mip chain
     id<MTLTexture> field = nil;
@@ -218,6 +230,8 @@ struct HoseRenderer {
     NSStatusItem* status_item = nil;
     FluidMenuController* controls = nil;
     NSMenuItem* tilt_status = nil;
+    NSMenuItem* fish_status = nil;
+    std::string previous_fish_status;
     NSMenu* display_menu = nil;
     std::vector<DesktopDisplay> display_options;
     DesktopDisplayID selected_display = 0;
@@ -286,16 +300,20 @@ struct HoseRenderer {
         blur_pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
         if (!blur_pipeline) return set_desktop_error("Create fluid blur pipeline: %s", error.localizedDescription.UTF8String);
         descriptor = [[MTLRenderPipelineDescriptor alloc] init];
-        descriptor.vertexFunction = [library newFunctionWithName:@"duck_vertex"];
-        descriptor.fragmentFunction = [library newFunctionWithName:@"duck_fragment"];
+        descriptor.vertexFunction = [library newFunctionWithName:@"body_vertex"];
+        descriptor.fragmentFunction = [library newFunctionWithName:@"body_fragment"];
         descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         descriptor.colorAttachments[0].blendingEnabled = YES;
         descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
         descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
         descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
         descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-        duck_pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
-        if (!duck_pipeline) return set_desktop_error("Create duck pipeline: %s", error.localizedDescription.UTF8String);
+        body_pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+        if (!body_pipeline) return set_desktop_error("Create body pipeline: %s", error.localizedDescription.UTF8String);
+        for (auto& buffer : body_buffers) {
+            buffer = [device newBufferWithLength:FluidSimulation::max_bodies * sizeof(PondBody) options:MTLResourceStorageModeShared];
+            if (!buffer) return set_desktop_error("Cannot allocate body storage");
+        }
         MTLTextureDescriptor* placeholder = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                                                               width:1 height:1 mipmapped:NO];
         no_background = [device newTextureWithDescriptor:placeholder];
@@ -306,7 +324,7 @@ struct HoseRenderer {
     // Splats particles into a fluid field at point resolution, builds its mip
     // chain for smooth thickness lookups, then shades the water surface.
     bool encode(id<MTLCommandBuffer> commands, id<MTLTexture> target, id<MTLBuffer> particles, SceneUniforms scene,
-                id<MTLTexture> background = nil, const std::vector<DuckBody>& ducks = {}) {
+                id<MTLTexture> background = nil, const std::vector<PondBody>& bodies = {}) {
         const NSUInteger reduction = scene.scale >= 1.5f ? 2 : 1;
         const NSUInteger width = std::max<NSUInteger>(1, target.width / reduction);
         const NSUInteger height = std::max<NSUInteger>(1, target.height / reduction);
@@ -360,28 +378,31 @@ struct HoseRenderer {
             [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             [encoder endEncoding];
         }
-        // Ducks are drawn at full resolution into their own layer.
-        if (!duck_layer || duck_layer.width != target.width || duck_layer.height != target.height) {
+        // Ducks, fish, and food are drawn at full resolution into their own layer.
+        if (!body_layer || body_layer.width != target.width || body_layer.height != target.height) {
             MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                                                                width:target.width height:target.height
                                                                                            mipmapped:NO];
             descriptor.storageMode = MTLStorageModePrivate;
             descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-            duck_layer = [device newTextureWithDescriptor:descriptor];
-            if (!duck_layer) return set_desktop_error("Cannot allocate the duck layer");
+            body_layer = [device newTextureWithDescriptor:descriptor];
+            if (!body_layer) return set_desktop_error("Cannot allocate the body layer");
         }
         pass = [MTLRenderPassDescriptor renderPassDescriptor];
-        pass.colorAttachments[0].texture = duck_layer;
+        pass.colorAttachments[0].texture = body_layer;
         pass.colorAttachments[0].loadAction = MTLLoadActionClear;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
         encoder = [commands renderCommandEncoderWithDescriptor:pass];
-        if (!encoder) return set_desktop_error("Cannot begin the duck pass");
-        if (!ducks.empty()) {
-            const std::size_t count = std::min(ducks.size(), FluidSimulation::max_ducks);
-            [encoder setRenderPipelineState:duck_pipeline];
+        if (!encoder) return set_desktop_error("Cannot begin the body pass");
+        if (!bodies.empty()) {
+            const std::size_t count = std::min(bodies.size(), FluidSimulation::max_bodies);
+            id<MTLBuffer> buffer = body_buffers[body_slot];
+            body_slot = (body_slot + 1) % 3;
+            std::memcpy(buffer.contents, bodies.data(), count * sizeof(PondBody));
+            [encoder setRenderPipelineState:body_pipeline];
             [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:0];
-            [encoder setVertexBytes:ducks.data() length:count * sizeof(DuckBody) atIndex:1];
+            [encoder setVertexBuffer:buffer offset:0 atIndex:1];
             [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6 instanceCount:count];
         }
         [encoder endEncoding];
@@ -402,7 +423,7 @@ struct HoseRenderer {
         [encoder setFragmentBytes:&scene length:sizeof(scene) atIndex:0];
         [encoder setFragmentTexture:smoothed atIndex:0];
         [encoder setFragmentTexture:background ? background : no_background atIndex:1];
-        [encoder setFragmentTexture:duck_layer atIndex:2];
+        [encoder setFragmentTexture:body_layer atIndex:2];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [encoder endEncoding];
         return true;
@@ -493,9 +514,11 @@ HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader
         renderer->status_item.button.title = @"💧";
         renderer->status_item.button.toolTip = @"Fluid Hose — hold Option to pour";
         NSMenu* menu = [[NSMenu alloc] initWithTitle:@"Fluid Hose"];
-        NSMenuItem* hint = [[NSMenuItem alloc] initWithTitle:@"Hold Option to pour at the pointer" action:nil keyEquivalent:@""];
-        hint.enabled = NO;
-        [menu addItem:hint];
+        for (NSString* text in @[@"Hold Option to pour at the pointer", @"Hold Control to sprinkle fish food"]) {
+            NSMenuItem* hint = [[NSMenuItem alloc] initWithTitle:text action:nil keyEquivalent:@""];
+            hint.enabled = NO;
+            [menu addItem:hint];
+        }
         [menu addItem:NSMenuItem.separatorItem];
         NSMenuItem* display = [[NSMenuItem alloc] initWithTitle:@"Display" action:nil keyEquivalent:@""];
         renderer->display_menu = [[NSMenu alloc] initWithTitle:@"Display"];
@@ -518,6 +541,19 @@ HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader
         NSMenuItem* no_ducks = [[NSMenuItem alloc] initWithTitle:@"Remove ducks" action:@selector(removeDucks:) keyEquivalent:@""];
         no_ducks.target = renderer->controls;
         [menu addItem:no_ducks];
+        [menu addItem:NSMenuItem.separatorItem];
+        NSMenuItem* fish = [[NSMenuItem alloc] initWithTitle:@"Add fish 🐟" action:@selector(addFish:) keyEquivalent:@""];
+        fish.target = renderer->controls;
+        [menu addItem:fish];
+        NSMenuItem* feed = [[NSMenuItem alloc] initWithTitle:@"Feed the fish" action:@selector(feedFish:) keyEquivalent:@""];
+        feed.target = renderer->controls;
+        [menu addItem:feed];
+        NSMenuItem* no_fish = [[NSMenuItem alloc] initWithTitle:@"Remove fish" action:@selector(removeFish:) keyEquivalent:@""];
+        no_fish.target = renderer->controls;
+        [menu addItem:no_fish];
+        renderer->fish_status = [[NSMenuItem alloc] initWithTitle:@"No fish" action:nil keyEquivalent:@""];
+        renderer->fish_status.enabled = NO;
+        [menu addItem:renderer->fish_status];
         [menu addItem:NSMenuItem.separatorItem];
         auto submenu = [&](NSString* title, NSArray<NSString*>* options, SEL action, NSInteger selected, NSString* hint) {
             NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""];
@@ -715,7 +751,9 @@ DesktopInput poll_desktop_input(HoseRenderer* renderer, const DesktopRect& canva
             pointer = {static_cast<float>(position.x) - canvas.x, static_cast<float>(position.y) - canvas.y};
             CFRelease(event);
         }
-        const bool option = (CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState) & kCGEventFlagMaskAlternate) != 0;
+        const CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
+        const bool option = (flags & kCGEventFlagMaskAlternate) != 0;
+        const bool control = (flags & kCGEventFlagMaskControl) != 0;
         DesktopInput input{pointer, option || static_cast<bool>(renderer->controls.pouring),
                            static_cast<bool>(renderer->controls.paused), static_cast<bool>(renderer->controls.clearRequested),
                            static_cast<bool>(renderer->controls.quitRequested),
@@ -726,13 +764,39 @@ DesktopInput poll_desktop_input(HoseRenderer* renderer, const DesktopRect& canva
                            static_cast<bool>(renderer->controls.refraction),
                            static_cast<float>(renderer->controls.flowRate),
                            static_cast<unsigned>(renderer->controls.duckRequests),
-                           static_cast<bool>(renderer->controls.removeDucksRequested)};
+                           static_cast<bool>(renderer->controls.removeDucksRequested),
+                           static_cast<unsigned>(renderer->controls.fishRequests),
+                           static_cast<bool>(renderer->controls.removeFishRequested),
+                           static_cast<unsigned>(renderer->controls.feedRequests), control};
         renderer->controls.duckRequests = 0;
+        renderer->controls.fishRequests = 0;
+        renderer->controls.feedRequests = 0;
+        renderer->controls.removeFishRequested = NO;
         renderer->controls.removeDucksRequested = NO;
         renderer->controls.clearRequested = NO;
         renderer->controls.requestedDisplay = 0;
         return input;
     }
+}
+
+void set_hose_fish_status(HoseRenderer* renderer, const FishStatus& status) {
+    std::string text;
+    if (!status.alive && !status.dead) text = "No fish";
+    else if (!status.alive) text = status.dead == 1 ? "Your fish died 💀" : "All your fish died 💀";
+    else {
+        const unsigned alive = status.alive;
+        text = alive == 1 ? "Fish: " : std::to_string(alive) + " fish: ";
+        std::vector<std::string> notes;
+        if (status.gasping) notes.push_back(alive == 1 ? "out of water!" : std::to_string(status.gasping) + " out of water!");
+        if (status.starving) notes.push_back(alive == 1 ? "starving" : std::to_string(status.starving) + " starving");
+        if (status.hungry) notes.push_back(alive == 1 ? "hungry" : std::to_string(status.hungry) + " hungry");
+        if (notes.empty()) notes.push_back(alive == 1 ? "happy" : "all happy");
+        for (std::size_t i = 0; i < notes.size(); ++i) text += (i ? ", " : "") + notes[i];
+        if (status.dead) text += ", " + std::to_string(status.dead) + " dead";
+    }
+    if (text == renderer->previous_fish_status) return;
+    renderer->previous_fish_status = text;
+    @autoreleasepool { renderer->fish_status.title = [NSString stringWithUTF8String:text.c_str()]; }
 }
 
 void set_hose_tilt_status(HoseRenderer* renderer, TiltStatus status) {
@@ -887,7 +951,7 @@ void set_hose_displays(HoseRenderer* renderer, const std::vector<DesktopDisplay>
     }
 }
 
-bool draw_hose_frame(HoseRenderer* renderer, FluidSimulation& simulation, const std::vector<DuckBody>& ducks,
+bool draw_hose_frame(HoseRenderer* renderer, FluidSimulation& simulation, const std::vector<PondBody>& bodies,
                      SceneUniforms scene, bool& presented) {
     @autoreleasepool {
         presented = false;
@@ -914,7 +978,7 @@ bool draw_hose_frame(HoseRenderer* renderer, FluidSimulation& simulation, const 
             scene.background_height = static_cast<float>(display.bounds.h);
         }
         if (!simulation.encode(commands) ||
-            !renderer->encode(commands, drawable.texture, simulation.particle_buffer(), scene, background.texture, ducks)) {
+            !renderer->encode(commands, drawable.texture, simulation.particle_buffer(), scene, background.texture, bodies)) {
             dispatch_semaphore_signal(renderer->available);
             return false;
         }
@@ -1092,7 +1156,7 @@ void paint_desktop(std::vector<unsigned char>& rgba, int width, int height, floa
 }
 
 bool render_hose_snapshot(const char* shader_file, const char* output_file, float seconds, const FluidSettings& settings,
-                          bool refraction, float flow, unsigned duck_count) {
+                          bool refraction, float flow, unsigned duck_count, unsigned fish_count) {
     @autoreleasepool {
         constexpr float width = 960, height = 600, scale = 2;
         HoseRenderer renderer;
@@ -1100,9 +1164,9 @@ bool render_hose_snapshot(const char* shader_file, const char* output_file, floa
         FluidSimulation simulation;
         if (!simulation.initialize(shader_file, width, height, settings)) return false;
         simulation.set_flow_rate(flow);
-        DuckWorld ducks;
-        ducks.reset(width, height);
-        std::vector<DuckSample> duck_water;
+        Pond pond;
+        pond.reset(width, height);
+        std::vector<BodySample> water;
         // A shelf window catches the stream; a second window slides into the
         // pool after a few seconds and pushes the water back.
         const int steps = static_cast<int>(seconds / FluidSimulation::step_time);
@@ -1118,16 +1182,21 @@ bool render_hose_snapshot(const char* shader_file, const char* output_file, floa
                 obstacles.push_back({r.x, r.y, r.width, r.height, r.x, r.y, r.width, r.height, 10,
                                      static_cast<fluid_uint>(w + 1), 0, 0});
             }
-            // Ducks drop in one by one across the scene.
-            if (ducks.size() < duck_count && t >= 1.0f + ducks.size() * 0.7f)
-                ducks.add_duck({150.0f + std::fmod(ducks.size() * 263.0f, width - 300), 40});
-            ducks.set_windows(obstacles);
-            if (!simulation.latest_duck_samples(duck_water)) duck_water.clear();
-            ducks.step(FluidSimulation::step_time, 1, {0, 950}, duck_water, simulation.particle_area());
-            simulation.set_ducks(ducks.bodies());
+            // Ducks drop in one by one across the scene; fish go into the pool
+            // once it has formed, and food is sprinkled over it near the end.
+            if (pond.duck_count() < duck_count && t >= 1.0f + pond.duck_count() * 0.7f)
+                pond.add_duck({150.0f + std::fmod(pond.duck_count() * 263.0f, width - 300), 40});
+            if (pond.fish_count() < fish_count && t >= 3.0f + pond.fish_count() * 0.5f)
+                pond.add_fish({120.0f + std::fmod(pond.fish_count() * 157.0f, 400.0f), height - 40});
+            if (fish_count && t >= seconds - 4 && t < seconds - 3 && i % 12 == 0)
+                pond.add_food({100.0f + std::fmod(i * 37.0f, 400.0f), height - 160});
+            pond.set_windows(obstacles);
+            if (!simulation.latest_body_samples(water)) water.clear();
+            pond.step(FluidSimulation::step_time, 1, {0, 950}, water, simulation.particle_area());
+            simulation.set_bodies(pond.bodies());
             simulation.advance(1, obstacles, true, nozzle);
-            // With ducks, flush every step so buoyancy sees the current water.
-            if ((duck_count || i % 120 == 119) && !simulation.flush()) return false;
+            // With bodies, flush every step so buoyancy sees the current water.
+            if ((duck_count || fish_count || i % 120 == 119) && !simulation.flush()) return false;
         }
         id<MTLTexture> texture = offscreen_target(renderer.device, width * scale, height * scale);
         const int w = static_cast<int>(texture.width), h = static_cast<int>(texture.height);
@@ -1157,7 +1226,7 @@ bool render_hose_snapshot(const char* shader_file, const char* output_file, floa
         scene.background_width = width;
         scene.background_height = height;
         if (!texture || !commands || !simulation.encode(commands) ||
-            !renderer.encode(commands, texture, simulation.particle_buffer(), scene, background, ducks.bodies())) return false;
+            !renderer.encode(commands, texture, simulation.particle_buffer(), scene, background, pond.bodies())) return false;
         [commands commit];
         [commands waitUntilCompleted];
         if (commands.status == MTLCommandBufferStatusError)

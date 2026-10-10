@@ -285,7 +285,7 @@ kernel void apply_viscosity(device const float2* predicted [[buffer(0)]], device
 kernel void finish_step(device FluidParticle* particles [[buffer(0)]], device const float2* predicted [[buffer(1)]],
                         device const float2* velocity [[buffer(2)]], device const float2* vorticity_density [[buffer(3)]],
                         device const uint* start [[buffer(4)]], constant SolverUniforms& u [[buffer(5)]],
-                        constant DuckBody* ducks [[buffer(6)]], uint i [[thread_position_in_grid]]) {
+                        constant PondBody* bodies [[buffer(6)]], uint i [[thread_position_in_grid]]) {
     if (i >= u.count) return;
     const float2 p = predicted[i];
     const float h = u.cell_size, h2 = h * h;
@@ -305,14 +305,15 @@ kernel void finish_step(device FluidParticle* particles [[buffer(0)]], device co
         const float2 n = toward_vortex / strength;
         v += u.vorticity * float2(n.y * curl, -n.x * curl) * u.dt;
     }
-    // Water passes in front of and behind ducks, but water inside a duck's
-    // outline takes on the duck's motion, so moving ducks stir and splash.
-    for (uint k = 0; k < u.duck_count; ++k) {
-        const DuckBody duck = ducks[k];
-        if (!duck_contains(duck_local(p, duck))) continue;
-        const float2 r = p - float2(duck.x, duck.y);
-        const float2 surface = float2(duck.vx, duck.vy) + duck.spin * float2(-r.y, r.x);
-        v = mix(v, surface, 1.0 - exp(-u.duck_stir * u.dt));
+    // Water passes in front of and behind ducks and fish, but water inside a
+    // body's outline takes on its motion, so moving bodies stir and splash.
+    for (uint k = 0; k < u.body_count; ++k) {
+        const PondBody body = bodies[k];
+        const float2 r = p - float2(body.x, body.y);
+        const float reach = body_reach(body);
+        if (body.kind > 1.5 || dot(r, r) > reach * reach || !body_contains(body_local(p, body), body.kind)) continue;
+        const float2 surface = float2(body.vx, body.vy) + body.spin * float2(-r.y, r.x);
+        v = mix(v, surface, 1.0 - exp(-u.body_stir * u.dt));
     }
     v = limit_length(v, u.max_speed);
 
@@ -331,23 +332,23 @@ kernel void finish_step(device FluidParticle* particles [[buffer(0)]], device co
     particles[i] = particle;
 }
 
-// One thread per duck sums the water overlapping its outline, for buoyancy
-// and drag on the CPU.
-kernel void sample_ducks(device const FluidParticle* particles [[buffer(0)]], device const uint* start [[buffer(1)]],
-                         constant SolverUniforms& u [[buffer(2)]], constant DuckBody* ducks [[buffer(3)]],
-                         device DuckSample* samples [[buffer(4)]], uint k [[thread_position_in_grid]]) {
-    if (k >= u.duck_count) return;
-    const DuckBody duck = ducks[k];
-    const float reach = DUCK_REACH * abs(duck.facing);
-    const int2 low = max(int2(floor((float2(duck.x, duck.y) - reach) / u.cell_size)), int2(0));
-    const int2 high = min(int2(floor((float2(duck.x, duck.y) + reach) / u.cell_size)), int2(u.grid_width - 1, u.grid_height - 1));
-    DuckSample sample = {};
+// One thread per body sums the water overlapping its outline, for buoyancy,
+// drag, and a fish's senses on the CPU.
+kernel void sample_bodies(device const FluidParticle* particles [[buffer(0)]], device const uint* start [[buffer(1)]],
+                          constant SolverUniforms& u [[buffer(2)]], constant PondBody* bodies [[buffer(3)]],
+                          device BodySample* samples [[buffer(4)]], uint k [[thread_position_in_grid]]) {
+    if (k >= u.body_count) return;
+    const PondBody body = bodies[k];
+    const float reach = body_reach(body);
+    const int2 low = max(int2(floor((float2(body.x, body.y) - reach) / u.cell_size)), int2(0));
+    const int2 high = min(int2(floor((float2(body.x, body.y) + reach) / u.cell_size)), int2(u.grid_width - 1, u.grid_height - 1));
+    BodySample sample = {};
     for (int cy = low.y; cy <= high.y; ++cy) {
         for (int cx = low.x; cx <= high.x; ++cx) {
             const uint cell = uint(cy) * u.grid_width + uint(cx);
             for (uint j = start[cell]; j < start[cell + 1]; ++j) {
                 const FluidParticle p = particles[j];
-                if (!duck_contains(duck_local(float2(p.x, p.y), duck))) continue;
+                if (!body_contains(body_local(float2(p.x, p.y), body), body.kind)) continue;
                 sample.count += 1;
                 sample.x += p.x;
                 sample.y += p.y;
@@ -356,5 +357,6 @@ kernel void sample_ducks(device const FluidParticle* particles [[buffer(0)]], de
             }
         }
     }
+    sample.tag = body.tag;
     samples[k] = sample;
 }

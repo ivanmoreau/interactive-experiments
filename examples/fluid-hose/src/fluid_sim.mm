@@ -6,6 +6,7 @@
 #include <cmath>
 #include <mutex>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 
@@ -138,13 +139,14 @@ struct FluidSimulation::Impl {
     int substeps = 4;
     int iterations = 2;
     float flow = 1.0f;
-    std::vector<DuckBody> ducks;
-    // Duck samples are written to a ring of buffers; the newest completed
-    // slot is published, with the number of ducks it measured.
-    id<MTLBuffer> duck_samples[3] = {nil, nil, nil};
-    unsigned duck_slot = 0;
+    std::vector<PondBody> bodies;
+    // Each frame's bodies and their water samples use a ring of buffers; the
+    // newest completed slot is published, with the number of bodies it measured.
+    id<MTLBuffer> body_buffers[3] = {nil, nil, nil};
+    id<MTLBuffer> body_samples[3] = {nil, nil, nil};
+    unsigned body_slot = 0;
     std::shared_ptr<std::atomic<int>> published = std::make_shared<std::atomic<int>>(-1);
-    std::uint32_t slot_ducks[3] = {0, 0, 0};
+    std::uint32_t slot_bodies[3] = {0, 0, 0};
     int last_slot = -1;  // the newest slot encoded
 
     void apply(FluidSettings next) {
@@ -168,7 +170,7 @@ struct FluidSimulation::Impl {
         base.friction = feel.friction;
         base.max_speed = 2400.0f;
         base.particle_radius = spacing * 0.5f;
-        base.duck_stir = 18.0f;
+        base.body_stir = 18.0f;
     }
 
     float random() {
@@ -214,7 +216,7 @@ bool FluidSimulation::initialize(const char* shader_file, float width, float hei
             !(s.reorder = s.pipeline(library, @"reorder_particles")) || !(s.lambda = s.pipeline(library, @"compute_lambda")) ||
             !(s.density = s.pipeline(library, @"apply_density")) || !(s.velocity = s.pipeline(library, @"derive_velocity")) ||
             !(s.viscosity = s.pipeline(library, @"apply_viscosity")) || !(s.finish = s.pipeline(library, @"finish_step")) ||
-            !(s.sample = s.pipeline(library, @"sample_ducks")))
+            !(s.sample = s.pipeline(library, @"sample_bodies")))
             return false;
         for (unsigned i = 0; i < 2; ++i) {
             s.particles[i] = s.buffer(capacity * sizeof(FluidParticle));
@@ -225,7 +227,11 @@ bool FluidSimulation::initialize(const char* shader_file, float width, float hei
         s.velocities = s.buffer(capacity * sizeof(float) * 2);
         s.smoothed = s.buffer(capacity * sizeof(float) * 2);
         s.vorticity_density = s.buffer(capacity * sizeof(float) * 2);
-        for (auto& buffer : s.duck_samples) buffer = s.buffer(max_ducks * sizeof(DuckSample));
+        for (auto& buffer : s.body_samples) buffer = s.buffer(max_bodies * sizeof(BodySample));
+        for (auto& buffer : s.body_buffers) buffer = s.buffer(max_bodies * sizeof(PondBody));
+        if (!s.body_buffers[0] || !s.body_buffers[1] || !s.body_buffers[2] || !s.body_samples[0] || !s.body_samples[1] ||
+            !s.body_samples[2])
+            return set_desktop_error("Cannot allocate fluid body storage");
         if (!s.particles[0] || !s.particles[1] || !s.predicted[0] || !s.predicted[1] || !s.cell_of || !s.lambdas ||
             !s.velocities || !s.smoothed || !s.vorticity_density)
             return set_desktop_error("Cannot allocate fluid particle storage");
@@ -281,7 +287,7 @@ void FluidSimulation::clear() {
     s.pending.clear();
     s.count = 0;
     s.encoded_count = 0;
-    // Measurements of the removed water must not keep ducks afloat.
+    // Measurements of the removed water must not keep bodies afloat.
     s.published->store(-1);
     s.last_slot = -1;
     s.emit_distance = 0;
@@ -291,16 +297,16 @@ void FluidSimulation::set_flow_rate(float flow) { impl_->flow = std::clamp(flow,
 float FluidSimulation::flow_rate() const { return impl_->flow; }
 std::uint32_t FluidSimulation::size() const { return impl_->count; }
 
-void FluidSimulation::set_ducks(const std::vector<DuckBody>& ducks) {
-    impl_->ducks.assign(ducks.begin(), ducks.begin() + std::min(ducks.size(), max_ducks));
+void FluidSimulation::set_bodies(const std::vector<PondBody>& bodies) {
+    impl_->bodies.assign(bodies.begin(), bodies.begin() + std::min(bodies.size(), max_bodies));
 }
 
-bool FluidSimulation::latest_duck_samples(std::vector<DuckSample>& output) const {
+bool FluidSimulation::latest_body_samples(std::vector<BodySample>& output) const {
     const auto& s = *impl_;
     const int slot = s.published->load();
     if (slot < 0) return false;
-    const auto* samples = static_cast<const DuckSample*>(s.duck_samples[slot].contents);
-    output.assign(samples, samples + s.slot_ducks[slot]);
+    const auto* samples = static_cast<const BodySample*>(s.body_samples[slot].contents);
+    output.assign(samples, samples + s.slot_bodies[slot]);
     return true;
 }
 
@@ -371,15 +377,16 @@ bool FluidSimulation::encode(id<MTLCommandBuffer> commands) {
     if (!encoder) return set_desktop_error("Cannot begin fluid simulation commands");
     encoder.label = @"Fluid solver";
     const WindowObstacle placeholder{};
-    const DuckBody no_duck{};
-    const void* ducks = s.ducks.empty() ? static_cast<const void*>(&no_duck) : s.ducks.data();
-    const NSUInteger duck_bytes = std::max<std::size_t>(s.ducks.size(), 1) * sizeof(DuckBody);
+    const unsigned slot = s.body_slot;
+    s.body_slot = (s.body_slot + 1) % 3;
+    id<MTLBuffer> bodies = s.body_buffers[slot];
+    if (!s.bodies.empty()) std::memcpy(bodies.contents, s.bodies.data(), s.bodies.size() * sizeof(PondBody));
     for (const auto& batch : s.pending) {
         SolverUniforms u = s.base;
         u.gravity_x = batch.gravity.x;
         u.gravity_y = batch.gravity.y;
         u.window_count = static_cast<std::uint32_t>(batch.windows.size());
-        u.duck_count = static_cast<std::uint32_t>(s.ducks.size());
+        u.body_count = static_cast<std::uint32_t>(s.bodies.size());
         const void* windows = batch.windows.empty() ? static_cast<const void*>(&placeholder) : batch.windows.data();
         const NSUInteger window_bytes = std::max<std::size_t>(batch.windows.size(), 1) * sizeof(WindowObstacle);
         const int substeps = s.substeps, iterations = s.iterations;
@@ -469,27 +476,25 @@ bool FluidSimulation::encode(id<MTLCommandBuffer> commands) {
                 [encoder setBuffer:s.vorticity_density offset:0 atIndex:3];
                 [encoder setBuffer:s.starts offset:0 atIndex:4];
                 [encoder setBytes:&u length:sizeof(u) atIndex:5];
-                [encoder setBytes:ducks length:duck_bytes atIndex:6];
+                [encoder setBuffer:bodies offset:0 atIndex:6];
                 s.dispatch(encoder, s.finish, u.count);
             }
         }
     }
-    // Measure the water around each duck after the frame's last substep,
+    // Measure the water around each body after the frame's last substep,
     // while the cell grid still matches the particle order.
-    if (!s.ducks.empty() && s.encoded_count) {
+    if (!s.bodies.empty() && s.encoded_count) {
         SolverUniforms u = s.base;
         u.count = s.encoded_count;
-        u.duck_count = static_cast<std::uint32_t>(s.ducks.size());
-        const unsigned slot = s.duck_slot;
-        s.duck_slot = (s.duck_slot + 1) % 3;
-        s.slot_ducks[slot] = u.duck_count;
+        u.body_count = static_cast<std::uint32_t>(s.bodies.size());
+        s.slot_bodies[slot] = u.body_count;
         s.last_slot = static_cast<int>(slot);
         [encoder setBuffer:s.particles[s.current] offset:0 atIndex:0];
         [encoder setBuffer:s.starts offset:0 atIndex:1];
         [encoder setBytes:&u length:sizeof(u) atIndex:2];
-        [encoder setBytes:ducks length:duck_bytes atIndex:3];
-        [encoder setBuffer:s.duck_samples[slot] offset:0 atIndex:4];
-        s.dispatch(encoder, s.sample, u.duck_count);
+        [encoder setBuffer:bodies offset:0 atIndex:3];
+        [encoder setBuffer:s.body_samples[slot] offset:0 atIndex:4];
+        s.dispatch(encoder, s.sample, u.body_count);
         auto published = s.published;
         [commands addCompletedHandler:^(id<MTLCommandBuffer>) { published->store(static_cast<int>(slot)); }];
     }
