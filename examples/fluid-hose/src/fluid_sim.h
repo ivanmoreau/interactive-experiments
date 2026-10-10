@@ -56,6 +56,13 @@ public:
     void set_flow_rate(float flow);
     float flow_rate() const;
     std::uint32_t size() const;
+    static constexpr std::size_t max_ducks = 32;
+    // Ducks stir the water inside their outlines. Each encoded frame also
+    // measures the water overlapping each duck; results arrive when that
+    // frame's GPU work completes.
+    void set_ducks(const std::vector<DuckBody>& ducks);
+    bool latest_duck_samples(std::vector<DuckSample>& output) const;
+    float particle_area() const;  // water area one particle represents, in square points
     float width() const;
     float height() const;
     // Headless use: encode pending steps, wait, and read the particles back.

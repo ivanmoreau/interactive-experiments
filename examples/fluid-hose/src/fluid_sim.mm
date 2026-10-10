@@ -2,7 +2,9 @@
 #include "fluid_sim.h"
 #include "desktop.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <mutex>
 #include <cstdio>
 #include <string>
 #include <unordered_map>
@@ -114,7 +116,7 @@ struct FluidSimulation::Impl {
     };
 
     id<MTLDevice> device = nil;
-    id<MTLComputePipelineState> clear_cells, emit, predict, scan, reorder, lambda, density, velocity, viscosity, finish;
+    id<MTLComputePipelineState> clear_cells, emit, predict, scan, reorder, lambda, density, velocity, viscosity, finish, sample;
     id<MTLBuffer> particles[2] = {nil, nil};
     id<MTLBuffer> predicted[2] = {nil, nil};
     id<MTLBuffer> cell_of, lambdas, velocities, smoothed, vorticity_density;
@@ -136,6 +138,14 @@ struct FluidSimulation::Impl {
     int substeps = 4;
     int iterations = 2;
     float flow = 1.0f;
+    std::vector<DuckBody> ducks;
+    // Duck samples are written to a ring of buffers; the newest completed
+    // slot is published, with the number of ducks it measured.
+    id<MTLBuffer> duck_samples[3] = {nil, nil, nil};
+    unsigned duck_slot = 0;
+    std::shared_ptr<std::atomic<int>> published = std::make_shared<std::atomic<int>>(-1);
+    std::uint32_t slot_ducks[3] = {0, 0, 0};
+    int last_slot = -1;  // the newest slot encoded
 
     void apply(FluidSettings next) {
         settings = next;
@@ -158,6 +168,7 @@ struct FluidSimulation::Impl {
         base.friction = feel.friction;
         base.max_speed = 2400.0f;
         base.particle_radius = spacing * 0.5f;
+        base.duck_stir = 18.0f;
     }
 
     float random() {
@@ -202,7 +213,8 @@ bool FluidSimulation::initialize(const char* shader_file, float width, float hei
             !(s.predict = s.pipeline(library, @"predict_positions")) || !(s.scan = s.pipeline(library, @"scan_cells")) ||
             !(s.reorder = s.pipeline(library, @"reorder_particles")) || !(s.lambda = s.pipeline(library, @"compute_lambda")) ||
             !(s.density = s.pipeline(library, @"apply_density")) || !(s.velocity = s.pipeline(library, @"derive_velocity")) ||
-            !(s.viscosity = s.pipeline(library, @"apply_viscosity")) || !(s.finish = s.pipeline(library, @"finish_step")))
+            !(s.viscosity = s.pipeline(library, @"apply_viscosity")) || !(s.finish = s.pipeline(library, @"finish_step")) ||
+            !(s.sample = s.pipeline(library, @"sample_ducks")))
             return false;
         for (unsigned i = 0; i < 2; ++i) {
             s.particles[i] = s.buffer(capacity * sizeof(FluidParticle));
@@ -213,6 +225,7 @@ bool FluidSimulation::initialize(const char* shader_file, float width, float hei
         s.velocities = s.buffer(capacity * sizeof(float) * 2);
         s.smoothed = s.buffer(capacity * sizeof(float) * 2);
         s.vorticity_density = s.buffer(capacity * sizeof(float) * 2);
+        for (auto& buffer : s.duck_samples) buffer = s.buffer(max_ducks * sizeof(DuckSample));
         if (!s.particles[0] || !s.particles[1] || !s.predicted[0] || !s.predicted[1] || !s.cell_of || !s.lambdas ||
             !s.velocities || !s.smoothed || !s.vorticity_density)
             return set_desktop_error("Cannot allocate fluid particle storage");
@@ -268,12 +281,30 @@ void FluidSimulation::clear() {
     s.pending.clear();
     s.count = 0;
     s.encoded_count = 0;
+    // Measurements of the removed water must not keep ducks afloat.
+    s.published->store(-1);
+    s.last_slot = -1;
     s.emit_distance = 0;
 }
 
 void FluidSimulation::set_flow_rate(float flow) { impl_->flow = std::clamp(flow, min_flow, max_flow); }
 float FluidSimulation::flow_rate() const { return impl_->flow; }
 std::uint32_t FluidSimulation::size() const { return impl_->count; }
+
+void FluidSimulation::set_ducks(const std::vector<DuckBody>& ducks) {
+    impl_->ducks.assign(ducks.begin(), ducks.begin() + std::min(ducks.size(), max_ducks));
+}
+
+bool FluidSimulation::latest_duck_samples(std::vector<DuckSample>& output) const {
+    const auto& s = *impl_;
+    const int slot = s.published->load();
+    if (slot < 0) return false;
+    const auto* samples = static_cast<const DuckSample*>(s.duck_samples[slot].contents);
+    output.assign(samples, samples + s.slot_ducks[slot]);
+    return true;
+}
+
+float FluidSimulation::particle_area() const { return impl_->spacing * impl_->spacing * std::sqrt(3.0f) * 0.5f; }
 float FluidSimulation::width() const { return impl_->width; }
 float FluidSimulation::height() const { return impl_->height; }
 
@@ -340,11 +371,15 @@ bool FluidSimulation::encode(id<MTLCommandBuffer> commands) {
     if (!encoder) return set_desktop_error("Cannot begin fluid simulation commands");
     encoder.label = @"Fluid solver";
     const WindowObstacle placeholder{};
+    const DuckBody no_duck{};
+    const void* ducks = s.ducks.empty() ? static_cast<const void*>(&no_duck) : s.ducks.data();
+    const NSUInteger duck_bytes = std::max<std::size_t>(s.ducks.size(), 1) * sizeof(DuckBody);
     for (const auto& batch : s.pending) {
         SolverUniforms u = s.base;
         u.gravity_x = batch.gravity.x;
         u.gravity_y = batch.gravity.y;
         u.window_count = static_cast<std::uint32_t>(batch.windows.size());
+        u.duck_count = static_cast<std::uint32_t>(s.ducks.size());
         const void* windows = batch.windows.empty() ? static_cast<const void*>(&placeholder) : batch.windows.data();
         const NSUInteger window_bytes = std::max<std::size_t>(batch.windows.size(), 1) * sizeof(WindowObstacle);
         const int substeps = s.substeps, iterations = s.iterations;
@@ -434,9 +469,29 @@ bool FluidSimulation::encode(id<MTLCommandBuffer> commands) {
                 [encoder setBuffer:s.vorticity_density offset:0 atIndex:3];
                 [encoder setBuffer:s.starts offset:0 atIndex:4];
                 [encoder setBytes:&u length:sizeof(u) atIndex:5];
+                [encoder setBytes:ducks length:duck_bytes atIndex:6];
                 s.dispatch(encoder, s.finish, u.count);
             }
         }
+    }
+    // Measure the water around each duck after the frame's last substep,
+    // while the cell grid still matches the particle order.
+    if (!s.ducks.empty() && s.encoded_count) {
+        SolverUniforms u = s.base;
+        u.count = s.encoded_count;
+        u.duck_count = static_cast<std::uint32_t>(s.ducks.size());
+        const unsigned slot = s.duck_slot;
+        s.duck_slot = (s.duck_slot + 1) % 3;
+        s.slot_ducks[slot] = u.duck_count;
+        s.last_slot = static_cast<int>(slot);
+        [encoder setBuffer:s.particles[s.current] offset:0 atIndex:0];
+        [encoder setBuffer:s.starts offset:0 atIndex:1];
+        [encoder setBytes:&u length:sizeof(u) atIndex:2];
+        [encoder setBytes:ducks length:duck_bytes atIndex:3];
+        [encoder setBuffer:s.duck_samples[slot] offset:0 atIndex:4];
+        s.dispatch(encoder, s.sample, u.duck_count);
+        auto published = s.published;
+        [commands addCompletedHandler:^(id<MTLCommandBuffer>) { published->store(static_cast<int>(slot)); }];
     }
     [encoder endEncoding];
     s.pending.clear();
@@ -455,6 +510,8 @@ bool FluidSimulation::flush() {
         if (commands.status == MTLCommandBufferStatusError)
             return set_desktop_error("Fluid simulation failed: %s", commands.error.localizedDescription.UTF8String);
         impl_->flush_gpu_seconds = commands.GPUEndTime - commands.GPUStartTime;
+        // Completion handlers may run after the wait returns; publish now.
+        if (impl_->last_slot >= 0) impl_->published->store(impl_->last_slot);
         return true;
     }
 }

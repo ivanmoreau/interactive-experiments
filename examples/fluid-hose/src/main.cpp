@@ -2,6 +2,8 @@
 #include "fluid_sim.h"
 #include "motion.h"
 #include "window_tracker.h"
+#include "duck_world.h"
+#include <random>
 #include <mach-o/dyld.h>
 #include <algorithm>
 #include <charconv>
@@ -64,6 +66,8 @@ int main(int argc, char** argv) {
         bool window_check = false;
         bool refraction_option = false;
         std::optional<float> flow_option;
+        unsigned initial_ducks = 0;
+        bool duck_check = false;
         bool capture_check = false;
         unsigned display_number = 0;
         unsigned duration = 0;
@@ -82,6 +86,13 @@ int main(int argc, char** argv) {
             else if (argument == "--list-displays") list_displays = true;
             else if (argument == "--window-check") window_check = true;
             else if (argument == "--refraction") refraction_option = true;
+            else if (argument == "--duck-check") duck_check = true;
+            else if (argument == "--ducks" && i + 1 < argc) {
+                const char* value = argv[++i];
+                const auto result = std::from_chars(value, value + std::strlen(value), initial_ducks);
+                if (result.ec != std::errc{} || *result.ptr != '\0' || initial_ducks > DuckWorld::max_ducks)
+                    throw std::runtime_error("--ducks requires a number of ducks from 0 to 32");
+            }
             else if (argument == "--flow" && i + 1 < argc) {
                 char* end = nullptr;
                 const float value = std::strtof(argv[++i], &end);
@@ -116,10 +127,10 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("--duration requires a positive integer number of seconds");
             } else if (argument == "--help") {
                 std::puts("Fluid Hose\nUsage: fluid-hose [--pour] [--tilt] [--display NUMBER] [--duration SECONDS]\n"
-                          "                  [--size fine|medium|coarse] [--liquid water|thick|goo] [--refraction] [--flow RATE]\n"
+                          "                  [--size fine|medium|coarse] [--liquid water|thick|goo] [--refraction] [--flow RATE] [--ducks N]\n"
                           "                  "
                           "[--list-displays | --probe | --physics-check | --motion-check | --display-check | --smoke-test | --window-check |\n"
-                          " --snapshot FILE.png | --capture-check]\n"
+                          " --snapshot FILE.png | --capture-check | --duck-check]\n"
                           "Hold Option to pour at the mouse pointer. Release Option to stop.\n"
                           "The overlay lets clicks pass through: arrange windows normally.\n"
                           "Use the droplet menu in the menu bar to pour continuously, pause, clear, or quit.\n"
@@ -129,6 +140,7 @@ int main(int argc, char** argv) {
                           "The sensor helper stops and restores its settings when tilt is off or the app exits.\n"
                           "Windows are tracked live as rounded rectangles; moving one pushes the water.\n"
                           "--size and --liquid choose particle size and how runny the liquid is; the droplet menu changes them too.\n"
+                          "--ducks drops rubber ducks at launch; the droplet menu adds and removes them too.\n"
                           "--flow sets how fast the nozzle pours, from 0.25 to 3; Option+scroll changes it while running.\n"
                           "--refraction bends the desktop seen through the water; it needs the Screen Recording permission.\n"
                           "--snapshot renders a scripted scene offscreen to a PNG (--duration sets its length).");
@@ -144,6 +156,10 @@ int main(int argc, char** argv) {
             require(run_physics_checks(shaders.c_str()), "Check fluid physics");
             return 0;
         }
+        if (duck_check) {
+            require(run_duck_checks(shaders.c_str()), "Check rubber ducks");
+            return 0;
+        }
         // Command-line choices override the saved menu choices for this launch.
         FluidPreferences preferences = smoke || physics_check ? FluidPreferences{} : saved_hose_preferences();
         if (size_option) preferences.fluid.size = *size_option;
@@ -152,7 +168,8 @@ int main(int argc, char** argv) {
         if (flow_option) preferences.flow = *flow_option;
         if (!snapshot.empty()) {
             require(render_hose_snapshot(shaders.c_str(), snapshot.c_str(), duration ? static_cast<float>(duration) : 8.0f,
-                                         preferences.fluid, refraction_option, preferences.flow), "Render fluid snapshot");
+                                         preferences.fluid, refraction_option, preferences.flow, initial_ducks),
+                    "Render fluid snapshot");
             return 0;
         }
         if (smoke) {
@@ -213,6 +230,16 @@ int main(int argc, char** argv) {
         require(simulation.initialize(shaders.c_str(), static_cast<float>(canvas.w), static_cast<float>(canvas.h),
                                       preferences.fluid),
                 "Create fluid simulation");
+        // Rubber ducks drop from random points along the top of the canvas.
+        DuckWorld ducks;
+        ducks.reset(static_cast<float>(canvas.w), static_cast<float>(canvas.h));
+        std::mt19937 duck_random(std::random_device{}());
+        auto drop_duck = [&]() {
+            std::uniform_real_distribution<float> across(0.15f, 0.85f);
+            ducks.add_duck({across(duck_random) * canvas.w, 40});
+        };
+        for (unsigned i = 0; i < initial_ducks; ++i) drop_duck();
+        std::vector<DuckSample> duck_water;
         TiltGravity tilt;
         bool requested_tilt = false;
         DesktopDisplayID pending_display = 0;
@@ -253,6 +280,7 @@ int main(int argc, char** argv) {
                         input.pointer.x += canvas.x - selected.canvas.x;
                         input.pointer.y += canvas.y - selected.canvas.y;
                         canvas = selected.canvas;
+                        ducks.reset(static_cast<float>(canvas.w), static_cast<float>(canvas.h));
                         require(simulation.reset(static_cast<float>(canvas.w), static_cast<float>(canvas.h)),
                                 "Resize fluid simulation");
                         accumulator = 0;
@@ -293,6 +321,8 @@ int main(int argc, char** argv) {
             simulation.set_flow_rate(preferences.flow);
             set_hose_refraction(app.renderer, preferences.refraction, active_display);
             if (input.clear) simulation.clear();
+            if (input.remove_ducks) ducks.clear_ducks();
+            for (unsigned i = 0; i < input.add_ducks; ++i) drop_duck();
             const auto nozzle = place_hose(input.pointer, obstacles, static_cast<float>(canvas.w), static_cast<float>(canvas.h));
             const bool in_canvas = nozzle.x > 0 && nozzle.y > 0 && nozzle.x < canvas.w && nozzle.y < canvas.h;
             const bool pouring = input.pouring && in_canvas && !input.paused;
@@ -300,6 +330,17 @@ int main(int argc, char** argv) {
                 accumulator += delta;
                 unsigned steps = 0;
                 for (; accumulator >= step; accumulator -= step) ++steps;
+                // Jolt steps the ducks with the latest water measurement, then
+                // the fluid steps with the ducks' new positions.
+                // Windows keep following the tracker even without ducks, so a
+                // newly dropped duck is not swept by stale window positions.
+                if (steps) {
+                    ducks.set_windows(obstacles);
+                    if (!simulation.latest_duck_samples(duck_water)) duck_water.clear();
+                    for (unsigned k = 0; k < steps; ++k)
+                        ducks.step(step, static_cast<float>(k + 1) / steps, gravity, duck_water, simulation.particle_area());
+                }
+                simulation.set_ducks(ducks.bodies());
                 simulation.advance(steps, obstacles, pouring, nozzle, gravity);
             } else accumulator = 0;
             SceneUniforms scene{};
@@ -311,7 +352,7 @@ int main(int argc, char** argv) {
             scene.flow = preferences.flow;
             scene.time = time;
             bool presented = false;
-            require(draw_hose_frame(app.renderer, simulation, scene, presented), "Draw fluid overlay");
+            require(draw_hose_frame(app.renderer, simulation, ducks.bodies(), scene, presented), "Draw fluid overlay");
             return true;
         }, [&]() {
             return stop_requested || (duration && std::chrono::duration<float>(Clock::now() - start).count() >= duration);

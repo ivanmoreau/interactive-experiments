@@ -19,6 +19,8 @@ struct DesktopInput {
     FluidSettings fluid;
     bool refraction;
     float flow;
+    unsigned add_ducks;  // ducks requested from the menu since the last poll
+    bool remove_ducks;
 };
 struct FluidPreferences {
     FluidSettings fluid;
@@ -50,10 +52,11 @@ void save_hose_preferences(const FluidPreferences& preferences);
 void set_hose_refraction(HoseRenderer* renderer, bool enabled, const DesktopDisplay& display);
 void set_hose_displays(HoseRenderer* renderer, const std::vector<DesktopDisplay>& displays, DesktopDisplayID selected);
 // Encodes the simulation's pending steps, then draws the water, in one command buffer.
-bool draw_hose_frame(HoseRenderer* renderer, FluidSimulation& simulation, SceneUniforms scene, bool& presented);
+bool draw_hose_frame(HoseRenderer* renderer, FluidSimulation& simulation, const std::vector<DuckBody>& ducks,
+                     SceneUniforms scene, bool& presented);
 // Renders a scripted scene offscreen over a synthetic desktop and writes a PNG.
 bool render_hose_snapshot(const char* shader_file, const char* output_file, float seconds, const FluidSettings& settings,
-                          bool refraction, float flow = 1.0f);
+                          bool refraction, float flow = 1.0f, unsigned ducks = 0);
 bool smoke_test_hose_renderer(const char* shader_file);
 bool run_hose_window_checks(const char* shader_file);
 // Briefly captures the main display to confirm refraction can receive frames. Saves nothing.

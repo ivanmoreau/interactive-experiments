@@ -32,6 +32,9 @@ else
     SHADERS="$BUILD_DIR/fluid.metal"
 fi
 
+"$PROJECT_DIR/tools/build-jolt.sh"
+JOLT_DIR="$PROJECT_DIR/third_party/JoltPhysics"
+
 printf 'Building fluid application...\n'
 xcrun clang++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -mmacosx-version-min=14.0 \
     "$PROJECT_DIR/tools/probe_motion.cpp" -framework CoreFoundation -framework IOKit \
@@ -43,10 +46,12 @@ for source in desktop fluid_sim window_tracker screen_capture; do
 done
 xcrun clang++ -std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror \
     -mmacosx-version-min=14.0 \
-    "$PROJECT_DIR/src/main.cpp" "$PROJECT_DIR/src/motion.cpp" "$PROJECT_DIR/src/displays.cpp" \
+    -isystem "$JOLT_DIR" \
+    "$PROJECT_DIR/src/main.cpp" "$PROJECT_DIR/src/motion.cpp" "$PROJECT_DIR/src/displays.cpp" "$PROJECT_DIR/src/duck_world.cpp" \
     "$BUILD_DIR/desktop.o" "$BUILD_DIR/fluid_sim.o" "$BUILD_DIR/window_tracker.o" "$BUILD_DIR/screen_capture.o" \
     -framework AppKit -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics -framework ImageIO \
     -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo \
+    "$PROJECT_DIR/build/jolt/libJolt.a" \
     -o "$BUILD_DIR/fluid-hose"
 
 cp "$BUILD_DIR/fluid-hose" "$APP_DIR/Contents/MacOS/fluid-hose"
@@ -54,5 +59,6 @@ cp "$BUILD_DIR/probe-motion" "$APP_DIR/Contents/MacOS/probe-motion"
 codesign --force --sign - "$APP_DIR/Contents/MacOS/probe-motion"
 cp "$SHADERS" "$APP_DIR/Contents/Resources/"
 cp "$PROJECT_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
+cp "$JOLT_DIR/LICENSE" "$APP_DIR/Contents/Resources/JoltPhysics-LICENSE.txt"
 codesign --force --sign - "$APP_DIR"
 printf 'Built %s\n' "$APP_DIR"

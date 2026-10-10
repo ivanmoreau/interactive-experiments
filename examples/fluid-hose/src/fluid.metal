@@ -35,6 +35,84 @@ fragment float4 splat_fragment(SplatOutput in [[stage_in]]) {
 
 struct SurfaceOutput { float4 position [[position]]; float2 uv; };
 
+// Rubber ducks are drawn into their own layer, which the surface pass places
+// under the water so submerged parts are tinted and refracted.
+struct DuckOutput {
+    float4 position [[position]];
+    float2 local;  // duck points, facing right, y down
+    float variant;
+};
+
+vertex DuckOutput duck_vertex(uint vertex_id [[vertex_id]], uint duck_id [[instance_id]],
+                              constant SceneUniforms& scene [[buffer(0)]],
+                              constant DuckBody* ducks [[buffer(1)]]) {
+    const float2 corners[6] = {
+        float2(-1, -1), float2(1, -1), float2(-1, 1),
+        float2(-1, 1), float2(1, -1), float2(1, 1)
+    };
+    const DuckBody duck = ducks[duck_id];
+    const float2 local = corners[vertex_id] * (DUCK_REACH + 2.0);
+    const float2 scaled = local * float2(duck.facing, abs(duck.facing));
+    const float c = cos(duck.angle), s = sin(duck.angle);
+    const float2 point = float2(duck.x, duck.y) + float2(c * scaled.x - s * scaled.y, s * scaled.x + c * scaled.y);
+    const float2 clip = float2(point.x / scene.width * 2 - 1, 1 - point.y / scene.height * 2);
+    return {float4(clip, 0, 1), local, duck.variant};
+}
+
+namespace {
+float ellipse_distance(float2 p, float2 centre, float2 radii) {
+    const float2 q = (p - centre) / radii;
+    return (length(q) - 1.0) * min(radii.x, radii.y);
+}
+
+float smooth_union(float a, float b, float k) {
+    const float h = saturate(0.5 + 0.5 * (b - a) / k);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+// Layers a shape with antialiased coverage over a premultiplied colour.
+float4 over(float4 below, float3 color, float distance, float pixel) {
+    const float coverage = saturate(0.5 - distance / pixel);
+    return float4(color * coverage, coverage) + below * (1.0 - coverage);
+}
+}
+
+fragment float4 duck_fragment(DuckOutput in [[stage_in]]) {
+    const float2 p = in.local;
+    const float pixel = max(fwidth(p.x) + fwidth(p.y), 1e-3) * 0.7;
+    const float body = ellipse_distance(p, float2(DUCK_BODY_X, DUCK_BODY_Y), float2(DUCK_BODY_RX, DUCK_BODY_RY));
+    const float tail = ellipse_distance(p, float2(DUCK_BODY_X - 17, DUCK_BODY_Y - 9), float2(7, 5));
+    const float head = length(p - float2(DUCK_HEAD_X, DUCK_HEAD_Y)) - DUCK_HEAD_R;
+    const float silhouette = smooth_union(smooth_union(body, tail, 4.0), head, 5.0);
+    const float beak = ellipse_distance(p, float2(DUCK_BEAK_X, DUCK_BEAK_Y), float2(DUCK_BEAK_RX, DUCK_BEAK_RY));
+    if (min(silhouette, beak) > pixel * 2) discard_fragment();
+
+    float3 base = float3(1.0, 0.84, 0.16);           // classic yellow
+    if (in.variant > 2.5) base = float3(1.0, 0.72, 0.18);       // gold
+    else if (in.variant > 1.5) base = float3(0.52, 0.9, 0.74);  // mint
+    else if (in.variant > 0.5) base = float3(1.0, 0.58, 0.72);  // pink
+    const bool gold = in.variant > 2.5;
+
+    // Soft plastic shading: darker toward the rim and the underside, with a
+    // glossy highlight on the back and the head.
+    const float depth = saturate(-silhouette / 8.0);
+    float3 color = base * mix(0.72, 1.04, depth) * mix(1.06, 0.82, saturate((p.y + 8.0) / 26.0));
+    const float gloss = exp(-dot(p - float2(-7, -4), p - float2(-7, -4)) / 30.0) +
+                        exp(-dot(p - float2(8, -17), p - float2(8, -17)) / 8.0);
+    color += float3(1.0, 1.0, 0.95) * gloss * (gold ? 0.9 : 0.55);
+    color = mix(base * 0.62, color, smoothstep(0.0, 1.2, -silhouette));  // thin darker outline
+    float4 duck = float4(color, 1.0) * saturate(0.5 - silhouette / pixel);
+
+    // Wing: a darker crescent on the body.
+    const float wing = max(ellipse_distance(p, float2(-5, 3), float2(10, 6)), -ellipse_distance(p, float2(-3, -1), float2(10, 5)));
+    duck = over(duck, base * 0.78, wing, pixel);
+    // Beak and eye.
+    duck = over(duck, mix(float3(0.95, 0.42, 0.08), float3(1.0, 0.62, 0.25), saturate((DUCK_BEAK_Y - p.y) / 3.0 + 0.5)), beak, pixel);
+    duck = over(duck, float3(0.05, 0.05, 0.08), length(p - float2(14.5, -14.5)) - 1.9, pixel);
+    duck = over(duck, float3(1.0), length(p - float2(15.1, -15.2)) - 0.6, pixel);
+    return duck;
+}
+
 vertex SurfaceOutput surface_vertex(uint id [[vertex_id]]) {
     const float2 positions[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
     const float2 p = positions[id];
@@ -108,8 +186,12 @@ float surface_height(texture2d<float> field, float2 uv, float lod, float2 inset)
 fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
                                  constant SceneUniforms& scene [[buffer(0)]],
                                  texture2d<float> field [[texture(0)]],
-                                 texture2d<float> desktop [[texture(1)]]) {
+                                 texture2d<float> desktop [[texture(1)]],
+                                 texture2d<float> ducks [[texture(2)]]) {
     constexpr sampler linear(coord::normalized, address::clamp_to_edge, filter::linear, mip_filter::linear);
+    // Ducks lie under the water: seen directly outside it, and tinted and
+    // bent by the surface where water covers them.
+    const float4 duck_here = ducks.sample(linear, in.uv, level(0));
     const float2 inset = scene.particle_radius * 1.2 / float2(scene.width, scene.height);
     const float4 sample = field_at(field, in.uv, 0, inset);
     const float coverage = sample.r;
@@ -165,17 +247,21 @@ fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
         const float foam = saturate(smoothstep(0.08, 0.45, foam_amount) * (0.55 + 0.6 * grain) + smoothstep(0.65, 1.0, speed) * 0.15);
         const float3 foam_color = float3(0.93, 0.97, 1.0);
 
+        // The surface acts as a lens: tilted surfaces and deeper water bend the
+        // view further. Thin water bends little, so edges do not drag in what
+        // lies just beyond them.
+        const float2 bend_points = -normal.xy / max(normal.z, 0.45) * (0.8 + 8.0 * thickness);
+        const float4 duck_under = ducks.sample(linear, in.uv + bend_points / float2(scene.width, scene.height), level(0));
+
         if (scene.has_background > 0.5) {
-            // Refraction: the surface acts as a lens over the captured desktop.
-            // Tilted surfaces and deeper water bend the view further, and each
-            // colour bends slightly differently.
+            // Refraction of the captured desktop; each colour bends slightly differently.
             const float2 to_uv = 1.0 / float2(scene.background_width, scene.background_height);
             const float2 base = (float2(scene.background_x, scene.background_y) + point) * to_uv;
-            // Thin water bends little, so edges do not drag in what lies just beyond them.
-            const float2 bend = -normal.xy / max(normal.z, 0.45) * (0.8 + 8.0 * thickness) * to_uv;
-            const float3 seen = float3(desktop.sample(linear, base + bend * 0.97, level(0)).r,
-                                       desktop.sample(linear, base + bend, level(0)).g,
-                                       desktop.sample(linear, base + bend * 1.03, level(0)).b);
+            const float2 bend = bend_points * to_uv;
+            const float3 desktop_seen = float3(desktop.sample(linear, base + bend * 0.97, level(0)).r,
+                                               desktop.sample(linear, base + bend, level(0)).g,
+                                               desktop.sample(linear, base + bend * 1.03, level(0)).b);
+            const float3 seen = duck_under.rgb + desktop_seen * (1.0 - duck_under.a);
             // Water absorbs red first, so depth tints the view toward cyan and blue.
             const float3 transmit = exp(-thickness * float3(0.5, 0.18, 0.08));
             float3 water = seen * transmit + float3(0.05, 0.25, 0.45) * (1.0 - transmit.g) * 0.3;
@@ -185,7 +271,8 @@ fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
             water = mix(water, sky, saturate(fresnel * 0.3 + edge * (0.08 + 0.22 * top)));
             water += float3(0.3, 0.6, 0.8) * below_surface * 0.15;
             water = mix(water + specular, foam_color, foam);
-            color = saturate(water) * alpha;
+            color = saturate(water) * alpha + duck_here.rgb * (1.0 - alpha);
+            alpha += duck_here.a * (1.0 - alpha);
         } else {
             // Without a desktop image, tint and light the water, and let the
             // real desktop show through thin water.
@@ -198,9 +285,17 @@ fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
             water += float3(0.25, 0.6, 0.85) * below_surface * 0.35;
             water += float3(0.6, 0.85, 1.0) * fresnel * 0.5;
             water = mix(water, foam_color, foam);
-            alpha *= saturate(mix(0.28, 0.85, thickness) + edge * 0.35 + foam * 0.5 + specular * 0.6);
-            color = saturate(water + specular) * alpha;
+            const float opacity = saturate(mix(0.28, 0.85, thickness) + edge * 0.35 + foam * 0.5 + specular * 0.6);
+            // Inside the water: tinted water over the submerged duck.
+            const float3 tint = exp(-thickness * float3(0.9, 0.35, 0.15));
+            const float3 inside = saturate(water + specular) * opacity + duck_under.rgb * tint * (1.0 - opacity);
+            const float inside_alpha = opacity + duck_under.a * (1.0 - opacity);
+            color = inside * alpha + duck_here.rgb * (1.0 - alpha);
+            alpha = inside_alpha * alpha + duck_here.a * (1.0 - alpha);
         }
+    } else {
+        color = duck_here.rgb;
+        alpha = duck_here.a;
     }
 
     if (scene.show_nozzle > 0.5) {

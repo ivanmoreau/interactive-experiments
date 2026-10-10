@@ -1,6 +1,6 @@
 # Fluid Hose
 
-A desktop fluid toy for macOS. Hold **Option** to pour water from a nozzle controlled by the mouse. Water lands on window tops, drips off their edges, and pools at the bottom of the usable desktop, above the Dock. Drag a window through the water and it sloshes; water resting on a window rides along with it.
+A desktop fluid toy for macOS. Hold **Option** to pour water from a nozzle controlled by the mouse. Water lands on window tops, drips off their edges, and pools at the bottom of the usable desktop, above the Dock. Drag a window through the water and it sloshes; water resting on a window rides along with it. Drop in rubber ducks: they bob on the water, drift with the current, ride on windows, and get batted around when you drag a window into them.
 
 The overlay uses **AppKit + native Metal**. The fluid is a position-based fluid solver running in Metal compute shaders, and windows are tracked live through WindowServer notifications. The overlay is transparent and lets mouse clicks pass through, so you can move and resize the real windows normally while the simulation runs.
 
@@ -13,7 +13,7 @@ From the workspace root:
 ./examples/fluid-hose/run.sh
 ```
 
-Building requires macOS 14 or newer and Apple's C++ compiler. With full Xcode the build compiles the shaders into `fluid.metallib`; with only the Command Line Tools it bundles the shader source instead, and Metal compiles it when the app launches. This example links only macOS system frameworks and requires no SDL SDK or third-party runtime library. The shared [devenv environment](../../README.md) provides the repository's development and checking tools; it is optional for building and running the hose itself.
+Building requires macOS 14 or newer and Apple's C++ compiler. With full Xcode the build compiles the shaders into `fluid.metallib`; with only the Command Line Tools it bundles the shader source instead, and Metal compiles it when the app launches. Rubber ducks use [Jolt Physics](https://github.com/jrouwe/JoltPhysics) v5.6.0 (MIT), pinned as a Git submodule in `third_party/JoltPhysics`. The build fetches the submodule if needed and compiles Jolt once into a cached static library (about 15 seconds); the app bundles Jolt's license as `JoltPhysics-LICENSE.txt`. Otherwise the app links only macOS system frameworks and requires no SDL SDK or third-party runtime library. The shared [devenv environment](../../README.md) provides the repository's development and checking tools; it is optional for building and running the hose itself.
 
 Or open `build/Fluid Hose.app` from this example folder in Finder.
 
@@ -22,6 +22,7 @@ Or open `build/Fluid Hose.app` from this example folder in Finder.
 - Use the **💧 menu-bar icon** to pour continuously, pause, clear the water, or quit.
 - Choose a monitor through **💧 → Display**. Names, sizes, and a checkmark identify the active display. Your choice is remembered for the next launch.
 - **Option+scroll** while pouring changes the flow, from a slow drip (0.25×) to a strong jet (3×); **💧 → Flow** shows the current rate and offers presets. The nozzle's opening widens and brightens with the flow. With the Accessibility permission (System Settings → Privacy & Security → Accessibility), the scroll is consumed so the window under the pointer does not also scroll; without it, that window scrolls too.
+- **💧 → Add rubber duck 🦆** drops a duck from a random point along the top of the screen; **Remove ducks** takes them all away. Clearing the water leaves the ducks. Up to 32 ducks fit.
 - **💧 → Liquid** sets how the water moves: **Water** is runny and splashy, **Thick** flows slowly, and **Goo** clings and stretches. It applies to the water already on screen.
 - **💧 → Particle size** trades detail for volume. **Fine** gives the most detailed streams and drops; **Coarse** holds the most water. Changing the size clears the water.
 - **💧 → Refract the desktop** bends the desktop seen through the water, like a lens. It needs the Screen Recording permission; see [Refraction](#refraction).
@@ -40,6 +41,7 @@ The flow, liquid, particle size, and refraction choices are remembered. The defa
 ./examples/fluid-hose/run.sh --liquid thick --size coarse
 ./examples/fluid-hose/run.sh --refraction
 ./examples/fluid-hose/run.sh --flow 2
+./examples/fluid-hose/run.sh --ducks 5
 ```
 
 The app has no Dock icon or visible window frame. Its menu-bar icon provides the controls.
@@ -95,6 +97,17 @@ Option+scroll is read through a [CGEvent tap](https://developer.apple.com/docume
 
 Water is retained until you clear it. The capacity is 65,536 particles, which is about 510,000 square points of water with fine particles, or 1.15 million with coarse ones.
 
+### Rubber ducks
+
+[src/duck_world.cpp](src/duck_world.cpp) simulates ducks with [Jolt Physics](https://github.com/jrouwe/JoltPhysics), a rigid-body engine. Ducks are dynamic bodies locked to the screen plane with Jolt's `Plane2D` degrees of freedom: they move in x and y and rotate about the axis facing you. Each duck is a compound of three extruded convex hulls (body, head, and beak) built from the same silhouette the shaders use, scaled 90–115% and facing left or right. Like a weighted bath toy, its centre of mass sits under the middle of its body, so it floats level and rights itself. Rubber friction (0.9) and some bounce (restitution 0.35) apply. Windows are kinematic boxes with rounded edges that move to the tracker's positions each step, interpolated across the frame like the water's colliders, so a dragged window carries or bats ducks with real momentum. The screen edges are static walls. Jolt runs at the same 120 Hz fixed step in points converted to metres (100 points per metre, so 950 points/s² gravity is about Earth gravity), with a single-threaded job system; 32 ducks need no more.
+
+Jolt does not simulate fluids, so the two simulations are coupled every step:
+
+- **Water → duck.** After each frame's last substep, a GPU kernel finds the particles inside each duck's outline and returns their count, centroid, and average velocity. The next steps apply buoyancy (the displaced water's weight, using the duck's 30-point thickness and water's density) at that centroid against gravity, including tilt gravity, plus drag toward the water's velocity, and damp spin in proportion to how submerged the duck is. Ducks are 28% as dense as water, so they float with about a quarter of their outline under the surface. The measurement lags the ducks by one frame.
+- **Duck → water.** Particles inside a duck's outline blend toward the velocity of the duck's surface at that point, so falling ducks splash and moving ducks stir the water. Water is not pushed out of ducks: in this side view it passes in front of and behind them, like water around a toy in a tank.
+
+Ducks are drawn procedurally into their own layer: a soft-shaded plastic body and tail, a wing crescent, an orange beak, and a glossy eye, mostly yellow, sometimes pink or mint, and rarely gold. The surface pass draws that layer under the water. Where water covers a duck, the duck is tinted by the water's depth and bent along with the desktop by refraction, so the waterline reads naturally.
+
 ### Rendering
 
 Native Metal renders in two passes ([src/fluid.metal](src/fluid.metal)). Particle splats add coverage, foam, and speed into a floating-point field at point resolution. A separable Gaussian blur, with a sigma of 60% of a splat radius, then smooths the field so the surface follows the water's shape instead of bumps a few particles wide, and a blit builds its mip chain. The surface pass thresholds the smoothed field and estimates thickness from coarse levels. Normals come from a height that rises only across the surface band, so highlights sit on the visible edge rather than on a second line inside the water; deeper inside they come from coarser levels, so the interior refracts like calm water. Field lookups are clamped a little inside the screen edges, so water resting against the floor or a side wall continues past the edge instead of drawing a bright false surface there. Thicker water absorbs more red and green light, so thin streams are pale and clear while deep pools turn a dark, more opaque blue. The surface also gets a specular highlight, a Fresnel rim, a bright meniscus along every edge that is strongest at the top of a pool, a faint glow under the surface, moving caustics inside deeper water, travelling ripples on the highlights, and white foam where fast water is thin and broken. The output uses premultiplied alpha.
@@ -126,6 +139,7 @@ This is a 2D toy on **one selected display at a time**. Windows are solid rounde
 ./examples/fluid-hose/run.sh --snapshot water.png
 ./examples/fluid-hose/run.sh --snapshot refraction.png --refraction --duration 30
 ./examples/fluid-hose/run.sh --capture-check
+./examples/fluid-hose/run.sh --duck-check
 ./examples/fluid-hose/run.sh --window-check
 "./examples/fluid-hose/build/Fluid Hose.app/Contents/MacOS/fluid-hose" --window-check
 ```
@@ -136,6 +150,7 @@ This is a 2D toy on **one selected display at a time**. Windows are solid rounde
 - Interactive display switching requires a normal desktop session; `--list-displays` enumerates the screens without creating an overlay.
 - `--probe` prints desktop bounds, the window tracking mode, and each window collider with its corner radius, without launching the overlay.
 - `--snapshot FILE.png` simulates a scripted scene offscreen (a stream pouring onto one window while a second window slides into the pool) and writes it over a synthetic desktop. `--duration` sets the simulated seconds; the default is 8. `--size` and `--liquid` select the preset; `--refraction` uses the synthetic desktop, which has grid lines, rings, and text-like rows, as the refracted image. It is useful for tuning the solver and shaders without a live desktop.
+- `--duck-check` couples Jolt and the GPU fluid headlessly. It checks that a dry duck lands on and rests on a window, that dragging the window carries the duck, that a duck dropped into a pool floats at the surface and stays level, and that it falls to the floor when the water is cleared.
 - `--capture-check` captures the main display briefly and reports the size of the first frame received; it saves nothing. It requires the Screen Recording permission.
 - `--smoke-test` checks that splats merge into a translucent, premultiplied water surface on transparent background pixels without creating a window.
 - `--window-check` briefly shows a native overlay on each connected display. It checks actual WindowServer bounds, Metal drawable dimensions and frame delivery, display switching, menu actions, and transparent, click-through, non-focusing window settings. It requires a live desktop, does not save a display preference, and does not open sensors. Physical monitor disconnection and manual mouse interaction remain interactive checks.
@@ -144,6 +159,8 @@ This is a 2D toy on **one selected display at a time**. Windows are solid rounde
 On October 9, 2026, after the GPU solver and window tracking were added, the hose was built with only the Command Line Tools (runtime shader compilation) on an Apple M3 Pro running macOS 14.3. `--physics-check`, `--display-check`, `--motion-check`, the helper self-test and lifetime check, `--smoke-test`, code signing, and bundled-dependency checks passed. `--probe` reported live WindowServer tracking, and a pouring launch with `--duration` exited cleanly. SkyLight move notifications were confirmed to arrive for every move of another process's window. `--window-check` crashes inside `CAMetalDisplayLink` on this macOS 14.3 machine; the commit before these changes crashes the same way, so the crash is not caused by them. Visual results were checked with `--snapshot`. Live window dragging, rendering on a Retina display, and the macOS 26 corner-radius path still need checking interactively.
 
 After the liquid presets, particle sizes, and refraction were added, the same machine passed `--physics-check` across all nine size and liquid combinations in ten consecutive runs, plus `--smoke-test`, `--display-check`, `--motion-check`, code signing, and bundled-dependency checks. A launch with saved preferences exited cleanly. Refraction was checked with `--snapshot --refraction`. `--capture-check` could not run there because that process lacked the Screen Recording permission, so live capture and refraction still need checking on a desktop where the permission is granted.
+
+With rubber ducks added (Jolt Physics v5.6.0), `--duck-check` passed repeatedly on the same machine, along with the earlier checks and a launch with `--ducks 3`. Floating ducks settled within 0.05 radians of level. The look was checked with `--snapshot --ducks 5`; dropping ducks with the menu and dragging windows into them are interactive checks.
 
 ## Motion sensor probe
 
@@ -212,7 +229,9 @@ Raw results: [benchmarks/2026-10-09-gpu-solver.csv](benchmarks/2026-10-09-gpu-so
 - [src/window_tracker.mm](src/window_tracker.mm): live window tracking through SkyLight notifications, with a polling fallback.
 - [src/desktop.mm](src/desktop.mm): AppKit application lifecycle and display link, native overlay window, display metadata, Option-key state, menu-bar controls and saved preferences, Metal rendering, and offscreen snapshots.
 - [src/screen_capture.mm](src/screen_capture.mm): ScreenCaptureKit desktop capture for refraction.
-- [src/fluid.metal](src/fluid.metal): particle splats, water surface shading, and the nozzle.
+- [src/duck_world.cpp](src/duck_world.cpp): Jolt Physics rubber ducks, window and wall bodies, buoyancy and drag, and duck checks.
+- [tools/build-jolt.sh](tools/build-jolt.sh): builds the pinned Jolt Physics submodule into a cached static library.
+- [src/fluid.metal](src/fluid.metal): particle splats, field smoothing, rubber duck drawing, water surface shading, and the nozzle.
 - [src/fluid_types.h](src/fluid_types.h): shared CPU/GPU data layouts.
 - [tools/probe_motion.cpp](tools/probe_motion.cpp): SPU motion sensor activation and live sample diagnostics.
 - [src/motion.cpp](src/motion.cpp): gravity estimation, display projection, and ownership of the reader process.
