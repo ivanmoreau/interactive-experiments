@@ -1,10 +1,54 @@
 #pragma once
 
-struct FluidPoint { float x; float y; };
-struct WindowRect { float x; float y; float width; float height; };
+#ifdef __METAL_VERSION__
+typedef uint fluid_uint;
+#else
+#include <cstdint>
+typedef std::uint32_t fluid_uint;
+#endif
 
-// Scalar-only layouts are shared by the C++ app and Metal shader.
-struct FluidVertex { float x; float y; float radius; float padding; };
+struct FluidPoint { float x; float y; };
+
+// A window collider in canvas points. The tracker fills the current bounds,
+// corner radius, and id; the solver fills the bounds at the start of the
+// step, so each substep sees the window partway along its real motion.
+struct WindowObstacle {
+    float x, y, width, height;
+    float from_x, from_y, from_width, from_height;
+    float radius;
+    fluid_uint id;
+    float padding0, padding1;
+};
+
+// Persistent particle state. Predicted positions live in a separate buffer.
+struct FluidParticle {
+    float x, y;
+    float vx, vy;
+    float foam;
+    float age;
+    float padding0, padding1;
+};
+
+struct SolverUniforms {
+    float width, height;
+    float gravity_x, gravity_y;
+    float dt;
+    float step_from, step_to;  // fraction of the frame's window motion covered by this substep
+    float cell_size;           // also the kernel support radius
+    fluid_uint grid_width, grid_height, cell_count, count;
+    fluid_uint window_count, spawn_count;
+    float rest_density;        // kernel sum of a particle at rest spacing
+    float relaxation;          // constraint-force mixing that keeps lambda bounded
+    float correction_scale;    // artificial pressure that prevents clumping
+    float correction_reference;
+    float tension_limit;       // how far below rest density the fluid may pull together
+    float viscosity;
+    float vorticity;
+    float friction;
+    float max_speed;
+    float particle_radius;
+};
+
 struct SceneUniforms {
     float width;
     float height;
@@ -12,8 +56,15 @@ struct SceneUniforms {
     float nozzle_y;
     float show_nozzle;
     float time;
-    float padding0;
-    float padding1;
+    float particle_radius;
+    float scale;  // drawable pixels per point
+    fluid_uint count;
+    float padding0, padding1, padding2;
 };
-static_assert(sizeof(FluidVertex) == 16, "Particle layout must match Metal");
-static_assert(sizeof(SceneUniforms) == 32, "Scene layout must match Metal");
+
+#ifndef __METAL_VERSION__
+static_assert(sizeof(WindowObstacle) == 48, "Window layout must match Metal");
+static_assert(sizeof(FluidParticle) == 32, "Particle layout must match Metal");
+static_assert(sizeof(SolverUniforms) == 96,"Solver layout must match Metal");
+static_assert(sizeof(SceneUniforms) == 48, "Scene layout must match Metal");
+#endif

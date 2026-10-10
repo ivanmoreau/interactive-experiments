@@ -1,6 +1,7 @@
 #include "desktop.h"
 #include "fluid_sim.h"
 #include "motion.h"
+#include "window_tracker.h"
 #include <mach-o/dyld.h>
 #include <algorithm>
 #include <charconv>
@@ -34,7 +35,9 @@ static std::filesystem::path executable_directory() {
 static std::filesystem::path shader_path() {
     auto directory = executable_directory();
     if (directory.filename() == "MacOS") directory = directory.parent_path() / "Resources";
-    return directory / "fluid.metallib";
+    // Builds without Xcode's offline Metal compiler bundle shader source instead.
+    const auto compiled = directory / "fluid.metallib";
+    return std::filesystem::exists(compiled) ? compiled : directory / "fluid.metal";
 }
 
 struct App {
@@ -59,6 +62,7 @@ int main(int argc, char** argv) {
         bool window_check = false;
         unsigned display_number = 0;
         unsigned duration = 0;
+        std::string snapshot;
         for (int i = 1; i < argc; ++i) {
             const std::string argument = argv[i];
             if (argument == "--physics-check") physics_check = true;
@@ -70,6 +74,7 @@ int main(int argc, char** argv) {
             else if (argument == "--display-check") display_check = true;
             else if (argument == "--list-displays") list_displays = true;
             else if (argument == "--window-check") window_check = true;
+            else if (argument == "--snapshot" && i + 1 < argc) snapshot = argv[++i];
             else if (argument == "--display" && i + 1 < argc) {
                 const char* value = argv[++i];
                 const auto result = std::from_chars(value, value + std::strlen(value), display_number);
@@ -82,7 +87,8 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("--duration requires a positive integer number of seconds");
             } else if (argument == "--help") {
                 std::puts("Fluid Hose\nUsage: fluid-hose [--pour] [--tilt] [--display NUMBER] [--duration SECONDS] "
-                          "[--list-displays | --probe | --physics-check | --motion-check | --display-check | --smoke-test | --window-check]\n"
+                          "[--list-displays | --probe | --physics-check | --motion-check | --display-check | --smoke-test | --window-check |\n"
+                          " --snapshot FILE.png]\n"
                           "Hold Option to pour at the mouse pointer. Release Option to stop.\n"
                           "The overlay lets clicks pass through: arrange windows normally.\n"
                           "Use the droplet menu in the menu bar to pour continuously, pause, clear, or quit.\n"
@@ -90,16 +96,25 @@ int main(int argc, char** argv) {
                           "The app remembers your selected display and handles display disconnection.\n"
                           "--tilt lets Mac motion change gravity; toggle Use Mac tilt in the droplet menu.\n"
                           "The sensor helper stops and restores its settings when tilt is off or the app exits.\n"
-                          "This prototype uses one selected display and ordinary window rectangles.");
+                          "Windows are tracked live as rounded rectangles; moving one pushes the water.\n"
+                          "--snapshot renders a scripted scene offscreen to a PNG (--duration sets its length).");
                 return 0;
             } else throw std::runtime_error("Unknown or incomplete option: " + argument);
         }
-        if (physics_check) return run_physics_checks() ? 0 : 1;
         if (display_check) return run_display_checks() ? 0 : 1;
         const auto motion_helper = (executable_directory() / "probe-motion").string();
         if (motion_check) return run_motion_checks(motion_helper) ? 0 : 1;
         App app;
         const auto shaders = shader_path().string();
+        if (physics_check) {
+            require(run_physics_checks(shaders.c_str()), "Check fluid physics");
+            return 0;
+        }
+        if (!snapshot.empty()) {
+            require(render_hose_snapshot(shaders.c_str(), snapshot.c_str(), duration ? static_cast<float>(duration) : 8.0f),
+                    "Render fluid snapshot");
+            return 0;
+        }
         if (smoke) {
             require(smoke_test_hose_renderer(shaders.c_str()), "Check fluid renderer");
             return 0;
@@ -127,13 +142,16 @@ int main(int argc, char** argv) {
         }
         if (display_number) preferred_display = active_display.uuid;
         DesktopRect canvas = active_display.canvas;
-        std::vector<WindowRect> obstacles;
-        require(read_window_obstacles(canvas, obstacles), "Read window geometry");
-        std::printf("Fluid Hose\nDisplay: %s\nDesktop: %d × %d points at (%d, %d)\nWindow obstacles: %zu\n",
-                    active_display.name.c_str(), canvas.w, canvas.h, canvas.x, canvas.y, obstacles.size());
+        WindowTracker tracker;
+        std::vector<WindowObstacle> obstacles;
+        require(tracker.update(canvas, obstacles), "Read window geometry");
+        std::printf("Fluid Hose\nDisplay: %s\nDesktop: %d × %d points at (%d, %d)\nWindow tracking: %s\nWindow obstacles: %zu\n",
+                    active_display.name.c_str(), canvas.w, canvas.h, canvas.x, canvas.y,
+                    tracker.live() ? "live WindowServer events" : "polling", obstacles.size());
         if (probe) {
             for (const auto& rect : obstacles)
-                std::printf("  Rectangle: x=%.0f y=%.0f width=%.0f height=%.0f\n", rect.x, rect.y, rect.width, rect.height);
+                std::printf("  Window %u: x=%.0f y=%.0f width=%.0f height=%.0f corner radius=%.0f\n",
+                            rect.id, rect.x, rect.y, rect.width, rect.height, rect.radius);
             return 0;
         }
 
@@ -146,18 +164,19 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, stop);
         std::signal(SIGTERM, stop);
 
-        FluidSimulation simulation(static_cast<float>(canvas.w), static_cast<float>(canvas.h));
+        FluidSimulation simulation;
+        require(simulation.initialize(shaders.c_str(), static_cast<float>(canvas.w), static_cast<float>(canvas.h)),
+                "Create fluid simulation");
         TiltGravity tilt;
         bool requested_tilt = false;
         DesktopDisplayID pending_display = 0;
         using Clock = std::chrono::steady_clock;
         const auto start = Clock::now();
         auto previous = start;
-        auto next_window_poll = start;
         auto next_display_poll = start + std::chrono::seconds(1);
         float accumulator = 0;
         float time = 0;
-        constexpr float step = 1.0f / 120.0f;
+        constexpr float step = FluidSimulation::step_time;
         run_hose_event_loop(app.renderer, [&]() {
             const bool displays_changed = take_hose_display_changes(app.renderer);
             const auto now = Clock::now();
@@ -188,9 +207,9 @@ int main(int argc, char** argv) {
                         input.pointer.x += canvas.x - selected.canvas.x;
                         input.pointer.y += canvas.y - selected.canvas.y;
                         canvas = selected.canvas;
-                        simulation = FluidSimulation(static_cast<float>(canvas.w), static_cast<float>(canvas.h));
+                        require(simulation.reset(static_cast<float>(canvas.w), static_cast<float>(canvas.h)),
+                                "Resize fluid simulation");
                         accumulator = 0;
-                        next_window_poll = now;
                         std::printf("Display: %s — %d × %d points at (%d, %d)\n", selected.name.c_str(),
                                     canvas.w, canvas.h, canvas.x, canvas.y);
                     }
@@ -203,10 +222,7 @@ int main(int argc, char** argv) {
                     next_display_poll = now + std::chrono::milliseconds(250);
                 }
             }
-            if (now >= next_window_poll) {
-                require(read_window_obstacles(canvas, obstacles), "Refresh window geometry");
-                next_window_poll = now + std::chrono::milliseconds(125);
-            }
+            require(tracker.update(canvas, obstacles), "Refresh window geometry");
             if (input.tilt != requested_tilt) {
                 requested_tilt = input.tilt;
                 tilt.reset();
@@ -221,20 +237,24 @@ int main(int argc, char** argv) {
                 fresh_tilt ? TiltStatus::active : app.motion.running() ? TiltStatus::waiting : TiltStatus::unavailable);
             const FluidPoint gravity = requested_tilt ? tilt.gravity(motion_time, input.reverse_tilt) : FluidPoint{0, 950};
             if (input.clear) simulation.clear();
-            const auto nozzle = simulation.place_hose(input.pointer, obstacles);
+            const auto nozzle = place_hose(input.pointer, obstacles, static_cast<float>(canvas.w), static_cast<float>(canvas.h));
             const bool in_canvas = nozzle.x > 0 && nozzle.y > 0 && nozzle.x < canvas.w && nozzle.y < canvas.h;
             const bool pouring = input.pouring && in_canvas && !input.paused;
             if (!input.paused) {
                 accumulator += delta;
-                while (accumulator >= step) {
-                    simulation.step(step, obstacles, pouring, nozzle, gravity);
-                    accumulator -= step;
-                }
+                unsigned steps = 0;
+                for (; accumulator >= step; accumulator -= step) ++steps;
+                simulation.advance(steps, obstacles, pouring, nozzle, gravity);
             } else accumulator = 0;
-            const SceneUniforms scene{static_cast<float>(canvas.w), static_cast<float>(canvas.h),
-                                      nozzle.x, nozzle.y, pouring ? 1.0f : 0.0f, time, 0, 0};
+            SceneUniforms scene{};
+            scene.width = static_cast<float>(canvas.w);
+            scene.height = static_cast<float>(canvas.h);
+            scene.nozzle_x = nozzle.x;
+            scene.nozzle_y = nozzle.y;
+            scene.show_nozzle = pouring ? 1.0f : 0.0f;
+            scene.time = time;
             bool presented = false;
-            require(draw_hose_frame(app.renderer, simulation.vertices(), scene, presented), "Draw fluid overlay");
+            require(draw_hose_frame(app.renderer, simulation, scene, presented), "Draw fluid overlay");
             return true;
         }, [&]() {
             return stop_requested || (duration && std::chrono::duration<float>(Clock::now() - start).count() >= duration);

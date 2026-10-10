@@ -1,6 +1,7 @@
 #pragma once
 #include "displays.h"
 #include "fluid_types.h"
+#include <string>
 #include <functional>
 #include <vector>
 
@@ -18,6 +19,7 @@ struct DesktopInput {
 enum class TiltStatus { off, waiting, active, unavailable };
 
 const char* desktop_error();
+bool set_desktop_error(const char* format, ...);
 bool initialize_hose_desktop();
 HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader_file, bool continuous, bool tilt = false);
 void destroy_hose_renderer(HoseRenderer* renderer);
@@ -33,8 +35,10 @@ bool read_desktop_displays(std::vector<DesktopDisplay>& output);
 std::string saved_hose_display();
 void save_hose_display(const DesktopDisplay& display);
 void set_hose_displays(HoseRenderer* renderer, const std::vector<DesktopDisplay>& displays, DesktopDisplayID selected);
-bool read_window_obstacles(const DesktopRect& canvas, std::vector<WindowRect>& output);
-bool draw_hose_frame(HoseRenderer* renderer, const std::vector<FluidVertex>& particles,
-                     const SceneUniforms& scene, bool& presented);
+class FluidSimulation;
+// Encodes the simulation's pending steps, then draws the water, in one command buffer.
+bool draw_hose_frame(HoseRenderer* renderer, FluidSimulation& simulation, SceneUniforms scene, bool& presented);
+// Renders a scripted scene offscreen over a synthetic desktop and writes a PNG.
+bool render_hose_snapshot(const char* shader_file, const char* output_file, float seconds);
 bool smoke_test_hose_renderer(const char* shader_file);
 bool run_hose_window_checks(const char* shader_file);

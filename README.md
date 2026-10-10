@@ -7,9 +7,9 @@ Native macOS examples for interactive graphics and desktop fluid simulation, bui
 | Example | Behavior | Implementation |
 | --- | --- | --- |
 | [Floating triangle](examples/floating-triangle/README.md) | A rotating colored triangle in a standard window or a transparent, draggable floating window. | SDL3 handles windows and events. Standard mode renders through SDL GPU's Metal backend; floating mode renders through native Metal. |
-| [Fluid hose](examples/fluid-hose/README.md) | A transparent desktop overlay where water lands on window tops, flows around their edges, and pools above the Dock. | AppKit handles the window, menus, displays, and event loop. C++ simulates the fluid; native Metal renders it. |
+| [Fluid hose](examples/fluid-hose/README.md) | A transparent desktop overlay where water lands on window tops, drips off their edges, pools above the Dock, and sloshes when you drag windows through it. | AppKit handles the window, menus, displays, and event loop. Position-based fluids run in Metal compute shaders; WindowServer notifications track windows live; native Metal renders the water. |
 
-The hose operates on one selected display at a time. Collision geometry consists of axis-aligned window rectangles. Display selection is remembered by monitor UUID, and optional Mac tilt controls gravity on supported sensor hardware.
+The hose operates on one selected display at a time. Windows collide as rounded rectangles that carry their motion into the water. Display selection is remembered by monitor UUID, and optional Mac tilt controls gravity on supported sensor hardware.
 
 ## Development setup
 
@@ -32,7 +32,7 @@ The same build is available as a single command:
 devenv shell -- build-examples
 ```
 
-Each example's `build.sh` builds that example individually. The triangle uses the SDL SDK supplied by devenv. The hose uses Xcode's tools and macOS system frameworks directly:
+Each example's `build.sh` builds that example individually. The triangle uses the SDL SDK supplied by devenv. The hose uses Xcode's tools and macOS system frameworks directly; without full Xcode it also builds with only the Command Line Tools, bundling its shader source for Metal to compile at launch:
 
 ```sh
 ./examples/fluid-hose/build.sh
