@@ -100,6 +100,10 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 @property(nonatomic) NSInteger particleSize;
 @property(nonatomic) NSInteger liquidFeel;
 @property(nonatomic) BOOL refraction;
+@property(nonatomic) double flowRate;
+@property(nonatomic, strong) NSMenuItem* flowItem;
+@property(nonatomic, strong) NSMenu* flowMenu;
+@property(nonatomic) CFMachPortRef scrollTap;
 @property(nonatomic, strong) NSMenu* sizeMenu;
 @property(nonatomic, strong) NSMenu* liquidMenu;
 - (void)togglePour:(NSMenuItem*)sender;
@@ -112,6 +116,9 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 - (void)selectSize:(NSMenuItem*)sender;
 - (void)selectLiquid:(NSMenuItem*)sender;
 - (void)toggleRefraction:(NSMenuItem*)sender;
+- (void)selectFlow:(NSMenuItem*)sender;
+- (void)adjustFlowByScroll:(double)points;
+- (void)updateFlowMenu;
 @end
 
 @implementation FluidMenuController
@@ -148,6 +155,22 @@ static void check_only(NSMenu* menu, NSInteger tag) {
     self.liquidFeel = sender.tag;
     check_only(self.liquidMenu, sender.tag);
 }
+static const double flow_presets[] = {0.25, 0.5, 1.0, 1.5, 2.0, 3.0};
+- (void)selectFlow:(NSMenuItem*)sender {
+    self.flowRate = flow_presets[sender.tag];
+    [self updateFlowMenu];
+}
+- (void)adjustFlowByScroll:(double)points {
+    // Exponential, so each scroll step changes the flow by the same proportion.
+    self.flowRate = std::clamp(self.flowRate * std::exp(points * 0.008), static_cast<double>(FluidSimulation::min_flow),
+                               static_cast<double>(FluidSimulation::max_flow));
+    [self updateFlowMenu];
+}
+- (void)updateFlowMenu {
+    self.flowItem.title = [NSString stringWithFormat:@"Flow: %.2g×", self.flowRate];
+    for (NSMenuItem* item in self.flowMenu.itemArray)
+        if (item.action) item.state = std::abs(flow_presets[item.tag] - self.flowRate) < 0.01 ? NSControlStateValueOn : NSControlStateValueOff;
+}
 - (void)toggleRefraction:(NSMenuItem*)sender {
     self.refraction = !self.refraction;
     // The first request shows the macOS Screen Recording prompt.
@@ -179,6 +202,9 @@ struct HoseRenderer {
     DesktopDisplay refraction_display{};
     CaptureState previous_capture_state = CaptureState::starting;
     NSMenuItem* refraction_status = nil;
+    CFMachPortRef scroll_tap = nullptr;
+    CFRunLoopSourceRef scroll_source = nullptr;
+    id scroll_monitor = nil;
     dispatch_semaphore_t available = dispatch_semaphore_create(3);
     NSStatusItem* status_item = nil;
     FluidMenuController* controls = nil;
@@ -192,6 +218,16 @@ struct HoseRenderer {
     ~HoseRenderer() {
         @autoreleasepool {
             if (status_item) [NSStatusBar.systemStatusBar removeStatusItem:status_item];
+            if (scroll_source) {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), scroll_source, kCFRunLoopCommonModes);
+                CFRelease(scroll_source);
+            }
+            if (scroll_tap) {
+                CGEventTapEnable(scroll_tap, false);
+                CFMachPortInvalidate(scroll_tap);
+                CFRelease(scroll_tap);
+            }
+            if (scroll_monitor) [NSEvent removeMonitor:scroll_monitor];
             if (queue) {
                 id<MTLCommandBuffer> barrier = [queue commandBuffer];
                 [barrier commit];
@@ -326,8 +362,43 @@ struct HoseRenderer {
     }
 };
 
+// Option+scroll changes the flow. An event tap can consume those scroll events
+// so the window under the pointer does not also scroll; it needs the
+// Accessibility permission, so without it a passive monitor is used instead.
+static CGEventRef scroll_tap_callback(CGEventTapProxy, CGEventType type, CGEventRef event, void* context) {
+    FluidMenuController* controls = (__bridge FluidMenuController*)context;
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        if (controls.scrollTap) CGEventTapEnable(controls.scrollTap, true);
+        return event;
+    }
+    if (type != kCGEventScrollWheel || !(CGEventGetFlags(event) & kCGEventFlagMaskAlternate)) return event;
+    const bool continuous = CGEventGetIntegerValueField(event, kCGScrollWheelEventIsContinuous) != 0;
+    const double points = continuous ? CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis1)
+                                     : CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1) * 12.0;
+    [controls adjustFlowByScroll:points];
+    return nullptr;
+}
+
+static bool watch_flow_scrolling(HoseRenderer* renderer) {
+    FluidMenuController* controls = renderer->controls;
+    renderer->scroll_tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
+                                            CGEventMaskBit(kCGEventScrollWheel), scroll_tap_callback,
+                                            (__bridge void*)controls);
+    if (renderer->scroll_tap) {
+        controls.scrollTap = renderer->scroll_tap;
+        renderer->scroll_source = CFMachPortCreateRunLoopSource(nullptr, renderer->scroll_tap, 0);
+        CFRunLoopAddSource(CFRunLoopGetMain(), renderer->scroll_source, kCFRunLoopCommonModes);
+        return true;
+    }
+    renderer->scroll_monitor = [NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskScrollWheel handler:^(NSEvent* event) {
+        if (!(event.modifierFlags & NSEventModifierFlagOption)) return;
+        [controls adjustFlowByScroll:event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 12.0];
+    }];
+    return false;
+}
+
 HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader_file, bool continuous, bool tilt,
-                                   FluidSettings settings, bool refraction) {
+                                   FluidSettings settings, bool refraction, float flow) {
     @autoreleasepool {
         auto renderer = std::make_unique<HoseRenderer>();
         if (!renderer->initialize(shader_file)) return nullptr;
@@ -370,6 +441,7 @@ HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader
         renderer->controls.particleSize = static_cast<NSInteger>(settings.size);
         renderer->controls.liquidFeel = static_cast<NSInteger>(settings.feel);
         renderer->controls.refraction = refraction;
+        renderer->controls.flowRate = flow;
         renderer->status_item = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
         renderer->status_item.button.title = @"💧";
         renderer->status_item.button.toolTip = @"Fluid Hose — hold Option to pour";
@@ -414,6 +486,13 @@ HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader
             [menu addItem:item];
             return choices;
         };
+        const bool scroll_consumed = watch_flow_scrolling(renderer.get());
+        renderer->controls.flowMenu = submenu(@"Flow", @[@"0.25×", @"0.5×", @"1×", @"1.5×", @"2×", @"3×"],
+                                              @selector(selectFlow:), -1,
+                                              scroll_consumed ? @"Option+scroll adjusts the flow"
+                                                              : @"Option+scroll adjusts the flow (allow Accessibility to stop it also scrolling windows)");
+        renderer->controls.flowItem = menu.itemArray.lastObject;
+        [renderer->controls updateFlowMenu];
         renderer->controls.liquidMenu = submenu(@"Liquid", @[@"Water", @"Thick", @"Goo"], @selector(selectLiquid:),
                                                 renderer->controls.liquidFeel, nil);
         renderer->controls.sizeMenu = submenu(@"Particle size", @[@"Fine — most detail", @"Medium", @"Coarse — most water"],
@@ -591,7 +670,8 @@ DesktopInput poll_desktop_input(HoseRenderer* renderer, const DesktopRect& canva
                            renderer->controls.requestedDisplay,
                            {static_cast<ParticleSize>(renderer->controls.particleSize),
                             static_cast<LiquidFeel>(renderer->controls.liquidFeel)},
-                           static_cast<bool>(renderer->controls.refraction)};
+                           static_cast<bool>(renderer->controls.refraction),
+                           static_cast<float>(renderer->controls.flowRate)};
         renderer->controls.clearRequested = NO;
         renderer->controls.requestedDisplay = 0;
         return input;
@@ -702,6 +782,9 @@ FluidPreferences saved_hose_preferences() {
         if ([preferences objectForKey:@"LiquidFeel"])
             saved.fluid.feel = static_cast<LiquidFeel>(std::clamp<NSInteger>([preferences integerForKey:@"LiquidFeel"], 0, 2));
         saved.refraction = [preferences boolForKey:@"Refraction"];
+        if ([preferences objectForKey:@"FlowRate"])
+            saved.flow = std::clamp(static_cast<float>([preferences doubleForKey:@"FlowRate"]),
+                                    FluidSimulation::min_flow, FluidSimulation::max_flow);
         return saved;
     }
 }
@@ -712,6 +795,7 @@ void save_hose_preferences(const FluidPreferences& saved) {
         [preferences setInteger:static_cast<NSInteger>(saved.fluid.size) forKey:@"ParticleSize"];
         [preferences setInteger:static_cast<NSInteger>(saved.fluid.feel) forKey:@"LiquidFeel"];
         [preferences setBool:saved.refraction forKey:@"Refraction"];
+        [preferences setDouble:saved.flow forKey:@"FlowRate"];
     }
 }
 
@@ -842,7 +926,7 @@ bool run_hose_window_checks(const char* shader_file) {
         std::vector<DesktopDisplay> displays;
         if (!read_desktop_displays(displays)) return false;
         std::unique_ptr<HoseRenderer, decltype(&destroy_hose_renderer)> renderer(
-            create_hose_renderer(displays.front().canvas, shader_file, false, false, {}, false), destroy_hose_renderer);
+            create_hose_renderer(displays.front().canvas, shader_file, false, false, {}, false, 1.0f), destroy_hose_renderer);
         if (!renderer) return false;
         show_hose_window(renderer.get());
         for (std::size_t index = 0; index < displays.size(); ++index) {
@@ -950,13 +1034,14 @@ void paint_desktop(std::vector<unsigned char>& rgba, int width, int height, floa
 }
 
 bool render_hose_snapshot(const char* shader_file, const char* output_file, float seconds, const FluidSettings& settings,
-                          bool refraction) {
+                          bool refraction, float flow) {
     @autoreleasepool {
         constexpr float width = 960, height = 600, scale = 2;
         HoseRenderer renderer;
         if (!renderer.initialize(shader_file)) return false;
         FluidSimulation simulation;
         if (!simulation.initialize(shader_file, width, height, settings)) return false;
+        simulation.set_flow_rate(flow);
         // A shelf window catches the stream; a second window slides into the
         // pool after a few seconds and pushes the water back.
         const int steps = static_cast<int>(seconds / FluidSimulation::step_time);
@@ -996,6 +1081,7 @@ bool render_hose_snapshot(const char* shader_file, const char* output_file, floa
         scene.show_nozzle = 1;
         scene.time = seconds;
         scene.particle_radius = simulation.splat_radius();
+        scene.flow = simulation.flow_rate();
         scene.scale = scale;
         scene.count = simulation.size();
         scene.has_background = background ? 1 : 0;

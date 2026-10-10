@@ -51,6 +51,10 @@ public:
     // across all substeps, so moving windows push the water smoothly.
     void advance(unsigned steps, const std::vector<WindowObstacle>& windows, bool pouring, FluidPoint nozzle,
                  FluidPoint gravity = {0, 950});
+    // Scales how fast water leaves the nozzle, and so how much is poured.
+    static constexpr float min_flow = 0.25f, max_flow = 3.0f;
+    void set_flow_rate(float flow);
+    float flow_rate() const;
     std::uint32_t size() const;
     float width() const;
     float height() const;

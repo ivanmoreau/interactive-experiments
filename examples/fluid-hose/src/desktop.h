@@ -18,10 +18,12 @@ struct DesktopInput {
     DesktopDisplayID display;
     FluidSettings fluid;
     bool refraction;
+    float flow;
 };
 struct FluidPreferences {
     FluidSettings fluid;
     bool refraction = false;
+    float flow = 1.0f;
 };
 enum class TiltStatus { off, waiting, active, unavailable };
 
@@ -29,7 +31,7 @@ const char* desktop_error();
 bool set_desktop_error(const char* format, ...);
 bool initialize_hose_desktop();
 HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader_file, bool continuous, bool tilt,
-                                   FluidSettings settings, bool refraction);
+                                   FluidSettings settings, bool refraction, float flow);
 void destroy_hose_renderer(HoseRenderer* renderer);
 void show_hose_window(HoseRenderer* renderer);
 void move_hose_window(HoseRenderer* renderer, const DesktopRect& canvas);
@@ -51,7 +53,7 @@ void set_hose_displays(HoseRenderer* renderer, const std::vector<DesktopDisplay>
 bool draw_hose_frame(HoseRenderer* renderer, FluidSimulation& simulation, SceneUniforms scene, bool& presented);
 // Renders a scripted scene offscreen over a synthetic desktop and writes a PNG.
 bool render_hose_snapshot(const char* shader_file, const char* output_file, float seconds, const FluidSettings& settings,
-                          bool refraction);
+                          bool refraction, float flow = 1.0f);
 bool smoke_test_hose_renderer(const char* shader_file);
 bool run_hose_window_checks(const char* shader_file);
 // Briefly captures the main display to confirm refraction can receive frames. Saves nothing.

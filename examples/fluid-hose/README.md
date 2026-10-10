@@ -21,6 +21,7 @@ Or open `build/Fluid Hose.app` from this example folder in Finder.
 - When the pointer is over a solid window body, the nozzle snaps to the nearest available edge.
 - Use the **💧 menu-bar icon** to pour continuously, pause, clear the water, or quit.
 - Choose a monitor through **💧 → Display**. Names, sizes, and a checkmark identify the active display. Your choice is remembered for the next launch.
+- **Option+scroll** while pouring changes the flow, from a slow drip (0.25×) to a strong jet (3×); **💧 → Flow** shows the current rate and offers presets. The nozzle's opening widens and brightens with the flow. With the Accessibility permission (System Settings → Privacy & Security → Accessibility), the scroll is consumed so the window under the pointer does not also scroll; without it, that window scrolls too.
 - **💧 → Liquid** sets how the water moves: **Water** is runny and splashy, **Thick** flows slowly, and **Goo** clings and stretches. It applies to the water already on screen.
 - **💧 → Particle size** trades detail for volume. **Fine** gives the most detailed streams and drops; **Coarse** holds the most water. Changing the size clears the water.
 - **💧 → Refract the desktop** bends the desktop seen through the water, like a lens. It needs the Screen Recording permission; see [Refraction](#refraction).
@@ -33,11 +34,12 @@ For continuous pouring from launch:
 ./examples/fluid-hose/run.sh --pour
 ```
 
-The liquid, particle size, and refraction choices are remembered. The defaults are fine water without refraction. They can also be chosen for a single launch:
+The flow, liquid, particle size, and refraction choices are remembered. The defaults are fine water without refraction. They can also be chosen for a single launch:
 
 ```sh
 ./examples/fluid-hose/run.sh --liquid thick --size coarse
 ./examples/fluid-hose/run.sh --refraction
+./examples/fluid-hose/run.sh --flow 2
 ```
 
 The app has no Dock icon or visible window frame. Its menu-bar icon provides the controls.
@@ -86,6 +88,10 @@ The particle size sets the rest spacing: 3, 3.75, or 4.5 points. The kernel supp
 Larger particles and high viscosity made the earlier version look like gel. Runny water uses low viscosity, little cohesion, and more substeps to stay stable without that damping. Particle state never leaves the GPU; the CPU records spawn rows and window positions, and [src/fluid_sim.mm](src/fluid_sim.mm) encodes the steps into the same command buffer as the frame's drawing.
 
 Windows are rounded-rectangle colliders. Each substep places a window partway between its position at the previous frame and its current position, so a dragged window sweeps through the water instead of teleporting. Collision pushes water out along the surface normal. Surfaces water rests on (window tops and the desktop floor) apply friction relative to the surface's own motion, so water on a moving window is carried with it, while water on window sides slides off. Particles trapped by overlapping windows, or by a window reaching past the screen edge, move to the nearest on-screen exit. A window that jumps more than 500 points in one frame, such as when it is minimized or restored, is treated as a teleport and does not fling water.
+
+The flow rate scales the speed at which rows of particles leave the nozzle, so the poured volume scales with it. Foam forms only where fast water is also sparse and broken, so even a 3× jet stays clear.
+
+Option+scroll is read through a [CGEvent tap](https://developer.apple.com/documentation/coregraphics/1454426-cgeventtapcreate) on scroll-wheel events; while Option is held the tap adjusts the flow and drops the event. Creating such a tap requires the Accessibility permission, and the app does not ask for it. Without it, a global `NSEvent` monitor observes the same gesture but cannot stop it from also scrolling the window underneath. The overlay itself ignores the mouse, so it never receives scroll events directly.
 
 Water is retained until you clear it. The capacity is 65,536 particles, which is about 510,000 square points of water with fine particles, or 1.15 million with coarse ones.
 

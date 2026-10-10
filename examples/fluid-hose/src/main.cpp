@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -62,6 +63,7 @@ int main(int argc, char** argv) {
         bool list_displays = false;
         bool window_check = false;
         bool refraction_option = false;
+        std::optional<float> flow_option;
         bool capture_check = false;
         unsigned display_number = 0;
         unsigned duration = 0;
@@ -80,6 +82,13 @@ int main(int argc, char** argv) {
             else if (argument == "--list-displays") list_displays = true;
             else if (argument == "--window-check") window_check = true;
             else if (argument == "--refraction") refraction_option = true;
+            else if (argument == "--flow" && i + 1 < argc) {
+                char* end = nullptr;
+                const float value = std::strtof(argv[++i], &end);
+                if (!end || *end || !(value >= FluidSimulation::min_flow && value <= FluidSimulation::max_flow))
+                    throw std::runtime_error("--flow must be a number from 0.25 to 3");
+                flow_option = value;
+            }
             else if (argument == "--capture-check") capture_check = true;
             else if (argument == "--snapshot" && i + 1 < argc) snapshot = argv[++i];
             else if (argument == "--size" && i + 1 < argc) {
@@ -107,7 +116,7 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("--duration requires a positive integer number of seconds");
             } else if (argument == "--help") {
                 std::puts("Fluid Hose\nUsage: fluid-hose [--pour] [--tilt] [--display NUMBER] [--duration SECONDS]\n"
-                          "                  [--size fine|medium|coarse] [--liquid water|thick|goo] [--refraction]\n"
+                          "                  [--size fine|medium|coarse] [--liquid water|thick|goo] [--refraction] [--flow RATE]\n"
                           "                  "
                           "[--list-displays | --probe | --physics-check | --motion-check | --display-check | --smoke-test | --window-check |\n"
                           " --snapshot FILE.png | --capture-check]\n"
@@ -120,6 +129,7 @@ int main(int argc, char** argv) {
                           "The sensor helper stops and restores its settings when tilt is off or the app exits.\n"
                           "Windows are tracked live as rounded rectangles; moving one pushes the water.\n"
                           "--size and --liquid choose particle size and how runny the liquid is; the droplet menu changes them too.\n"
+                          "--flow sets how fast the nozzle pours, from 0.25 to 3; Option+scroll changes it while running.\n"
                           "--refraction bends the desktop seen through the water; it needs the Screen Recording permission.\n"
                           "--snapshot renders a scripted scene offscreen to a PNG (--duration sets its length).");
                 return 0;
@@ -139,9 +149,10 @@ int main(int argc, char** argv) {
         if (size_option) preferences.fluid.size = *size_option;
         if (liquid_option) preferences.fluid.feel = *liquid_option;
         if (refraction_option) preferences.refraction = true;
+        if (flow_option) preferences.flow = *flow_option;
         if (!snapshot.empty()) {
             require(render_hose_snapshot(shaders.c_str(), snapshot.c_str(), duration ? static_cast<float>(duration) : 8.0f,
-                                         preferences.fluid, refraction_option), "Render fluid snapshot");
+                                         preferences.fluid, refraction_option, preferences.flow), "Render fluid snapshot");
             return 0;
         }
         if (smoke) {
@@ -189,7 +200,7 @@ int main(int argc, char** argv) {
         }
 
         app.renderer = require(create_hose_renderer(canvas, shaders.c_str(), continuous, tilt_enabled,
-                                                    preferences.fluid, preferences.refraction), "Create fluid overlay");
+                                                    preferences.fluid, preferences.refraction, preferences.flow), "Create fluid overlay");
         set_hose_displays(app.renderer, displays, active_display.id);
         if (display_number) save_hose_display(active_display);
         show_hose_window(app.renderer);
@@ -272,12 +283,14 @@ int main(int argc, char** argv) {
                 fresh_tilt ? TiltStatus::active : app.motion.running() ? TiltStatus::waiting : TiltStatus::unavailable);
             const FluidPoint gravity = requested_tilt ? tilt.gravity(motion_time, input.reverse_tilt) : FluidPoint{0, 950};
             if (input.fluid.size != preferences.fluid.size || input.fluid.feel != preferences.fluid.feel ||
-                input.refraction != preferences.refraction) {
+                input.refraction != preferences.refraction || input.flow != preferences.flow) {
                 preferences.fluid = input.fluid;
                 preferences.refraction = input.refraction;
+                preferences.flow = input.flow;
                 simulation.configure(preferences.fluid);
                 save_hose_preferences(preferences);
             }
+            simulation.set_flow_rate(preferences.flow);
             set_hose_refraction(app.renderer, preferences.refraction, active_display);
             if (input.clear) simulation.clear();
             const auto nozzle = place_hose(input.pointer, obstacles, static_cast<float>(canvas.w), static_cast<float>(canvas.h));
@@ -295,6 +308,7 @@ int main(int argc, char** argv) {
             scene.nozzle_x = nozzle.x;
             scene.nozzle_y = nozzle.y;
             scene.show_nozzle = pouring ? 1.0f : 0.0f;
+            scene.flow = preferences.flow;
             scene.time = time;
             bool presented = false;
             require(draw_hose_frame(app.renderer, simulation, scene, presented), "Draw fluid overlay");

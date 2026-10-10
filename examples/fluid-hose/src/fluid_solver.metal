@@ -311,7 +311,8 @@ kernel void finish_step(device FluidParticle* particles [[buffer(0)]], device co
     // Fast water at a thin, broken surface turns white and fades as it settles.
     const float speed = length(v);
     const float density = vorticity_density[i].y;
-    const float splash = saturate((speed - 380.0) / 650.0) * saturate(1.35 - density);
+    // A fast but intact jet stays clear; only broken, sparse water foams.
+    const float splash = saturate((speed - 700.0) / 900.0) * saturate(1.1 - density);
     particle.foam = max(particle.foam * exp(-u.dt * 1.4), splash);
     particle.age += u.dt;
     particle.x = p.x;

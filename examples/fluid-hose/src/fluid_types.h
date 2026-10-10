@@ -60,7 +60,8 @@ struct SceneUniforms {
     float scale;  // drawable pixels per point
     fluid_uint count;
     float has_background;  // 1 when a captured desktop frame is bound for refraction
-    float padding0, padding1;
+    float flow;            // nozzle flow rate, 1 = normal
+    float padding0;
     // The canvas origin inside the captured display, and the display size, in points.
     float background_x, background_y;
     float background_width, background_height;

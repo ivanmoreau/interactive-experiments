@@ -135,6 +135,7 @@ struct FluidSimulation::Impl {
     float support = 6.6f;  // kernel support, also the grid cell size
     int substeps = 4;
     int iterations = 2;
+    float flow = 1.0f;
 
     void apply(FluidSettings next) {
         settings = next;
@@ -270,6 +271,8 @@ void FluidSimulation::clear() {
     s.emit_distance = 0;
 }
 
+void FluidSimulation::set_flow_rate(float flow) { impl_->flow = std::clamp(flow, min_flow, max_flow); }
+float FluidSimulation::flow_rate() const { return impl_->flow; }
 std::uint32_t FluidSimulation::size() const { return impl_->count; }
 float FluidSimulation::width() const { return impl_->width; }
 float FluidSimulation::height() const { return impl_->height; }
@@ -312,13 +315,14 @@ void FluidSimulation::advance(unsigned steps, const std::vector<WindowObstacle>&
         if (can_pour) {
             // Rows leave the nozzle at rest spacing; rows emitted earlier in
             // this step have already travelled part of the way down.
-            s.emit_distance += stream_speed * step_time;
+            const float speed = stream_speed * s.flow;
+            s.emit_distance += speed * step_time;
             while (s.emit_distance >= spacing && s.count + record.spawn.size() + stream_width <= capacity) {
                 s.emit_distance -= spacing;
                 for (int k = 0; k < stream_width; ++k) {
                     const float x = nozzle.x + (k - (stream_width - 1) * 0.5f) * spacing + (s.random() - 0.5f) * 0.6f;
                     const float y = nozzle.y + 4.0f + s.emit_distance;
-                    record.spawn.push_back({x, y, (s.random() - 0.5f) * 12.0f, stream_speed, 0, 0, 0, 0});
+                    record.spawn.push_back({x, y, (s.random() - 0.5f) * 12.0f, speed, 0, 0, 0, 0});
                 }
             }
             s.emit_distance = std::min(s.emit_distance, spacing);

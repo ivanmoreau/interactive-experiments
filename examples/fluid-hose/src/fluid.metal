@@ -162,7 +162,7 @@ fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
         const float foam_amount = sample.g / max(coverage, 1e-3);
         const float speed = sample.b / max(coverage, 1e-3);
         const float grain = value_noise(point * 0.35 + float2(0, scene.time * 6.0));
-        const float foam = saturate(smoothstep(0.08, 0.45, foam_amount) * (0.55 + 0.6 * grain) + smoothstep(0.35, 0.8, speed) * 0.25);
+        const float foam = saturate(smoothstep(0.08, 0.45, foam_amount) * (0.55 + 0.6 * grain) + smoothstep(0.65, 1.0, speed) * 0.15);
         const float3 foam_color = float3(0.93, 0.97, 1.0);
 
         if (scene.has_background > 0.5) {
@@ -212,8 +212,11 @@ fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
         // Brushed metal shading across the barrel, with a glowing opening.
         const float across = local.x / 7.0;
         float3 metal = mix(float3(0.16, 0.20, 0.25), float3(0.70, 0.76, 0.82), pow(1 - abs(across + 0.35), 3.0));
-        const float opening = 1.0 - smoothstep(3.0, 4.5, length(point - float2(scene.nozzle_x, scene.nozzle_y + 1)));
-        metal = mix(metal, float3(0.10, 0.75, 0.98), opening);
+        // The opening widens and glows brighter with the flow rate.
+        const float flow = max(scene.flow, 0.25);
+        const float mouth = 1.8 + 1.6 * sqrt(flow);
+        const float opening = 1.0 - smoothstep(mouth, mouth + 1.5, length(point - float2(scene.nozzle_x, scene.nozzle_y + 1)));
+        metal = mix(metal, mix(float3(0.10, 0.55, 0.80), float3(0.55, 0.95, 1.0), saturate((flow - 0.25) / 2.75)), opening);
         color = metal * nozzle_alpha + color * (1.0 - nozzle_alpha);
         alpha = nozzle_alpha + alpha * (1.0 - nozzle_alpha);
     }
