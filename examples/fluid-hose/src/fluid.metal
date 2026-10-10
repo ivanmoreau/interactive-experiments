@@ -41,6 +41,25 @@ vertex SurfaceOutput surface_vertex(uint id [[vertex_id]]) {
     return {float4(p, 0, 1), float2((p.x + 1) * 0.5, (1 - p.y) * 0.5)};
 }
 
+// Pass 2: a separable Gaussian smooths the field, so the surface follows
+// the water's shape rather than individual rows of particles.
+struct BlurParameters { float2 step; float sigma; float padding; };
+
+fragment float4 blur_fragment(SurfaceOutput in [[stage_in]],
+                              constant BlurParameters& blur [[buffer(0)]],
+                              texture2d<float> source [[texture(0)]]) {
+    constexpr sampler linear(coord::normalized, address::clamp_to_edge, filter::linear);
+    const int reach = min(int(ceil(blur.sigma * 2.5)), 8);
+    float4 sum = 0;
+    float total = 0;
+    for (int i = -reach; i <= reach; ++i) {
+        const float weight = exp(-float(i * i) / (2.0 * blur.sigma * blur.sigma));
+        sum += source.sample(linear, in.uv + blur.step * float(i)) * weight;
+        total += weight;
+    }
+    return sum / total;
+}
+
 namespace {
 float hash(float2 p) {
     p = fract(p * float2(123.34, 456.21));
@@ -68,10 +87,22 @@ float caustics(float2 p, float t) {
     return light;
 }
 
+// Water touching a screen edge continues past it: lookups are clamped inside
+// the edge, so the edge itself is not drawn as a water surface.
+float4 field_at(texture2d<float> field, float2 uv, float lod, float2 inset) {
+    constexpr sampler linear(coord::normalized, address::clamp_to_edge, filter::linear, mip_filter::linear);
+    return field.sample(linear, clamp(uv, inset, 1.0 - inset), level(lod));
+}
+
 // Coverage of a lone particle peaks at 1; the packed fluid sums to about 3.5.
 constant float surface_low = 0.5;
 constant float surface_high = 0.85;
 constant float packed_coverage = 3.5;
+constant float surface_rounding = 1.8;  // coverage over which the surface curves down to the edge
+
+float surface_height(texture2d<float> field, float2 uv, float lod, float2 inset) {
+    return smoothstep(surface_low, surface_rounding, field_at(field, uv, lod, inset).r) * surface_rounding;
+}
 }
 
 fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
@@ -79,7 +110,8 @@ fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
                                  texture2d<float> field [[texture(0)]],
                                  texture2d<float> desktop [[texture(1)]]) {
     constexpr sampler linear(coord::normalized, address::clamp_to_edge, filter::linear, mip_filter::linear);
-    const float4 sample = field.sample(linear, in.uv, level(0));
+    const float2 inset = scene.particle_radius * 1.2 / float2(scene.width, scene.height);
+    const float4 sample = field_at(field, in.uv, 0, inset);
     const float coverage = sample.r;
     float alpha = smoothstep(surface_low, surface_high, coverage);
     float3 color = 0;
@@ -89,20 +121,26 @@ fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
         // Normals from a slightly blurred level keep the surface glassy
         // instead of showing individual particles.
         const float2 texel = 1.0 / float2(field.get_width(), field.get_height());
-        const float2 step = texel * 1.5;
-        const float l = field.sample(linear, in.uv - float2(step.x, 0), level(1)).r;
-        const float r = field.sample(linear, in.uv + float2(step.x, 0), level(1)).r;
-        const float u = field.sample(linear, in.uv - float2(0, step.y), level(1)).r;
-        const float d = field.sample(linear, in.uv + float2(0, step.y), level(1)).r;
+        // Deeper inside the water, normals come from coarser levels, so the
+        // interior refracts like calm water while the surface keeps its detail.
+        const float depth = saturate(field_at(field, in.uv, 3, inset).r / packed_coverage - 0.4);
+        const float normal_level = mix(1.0, 3.5, depth);
+        const float2 step = texel * 1.5 * exp2(normal_level - 1.0);
+        // Normals come from a height that rises only across the surface band,
+        // so highlights sit on the visible edge instead of inside the water.
+        const float l = surface_height(field, in.uv - float2(step.x, 0), normal_level, inset);
+        const float r = surface_height(field, in.uv + float2(step.x, 0), normal_level, inset);
+        const float u = surface_height(field, in.uv - float2(0, step.y), normal_level, inset);
+        const float d = surface_height(field, in.uv + float2(0, step.y), normal_level, inset);
         const float2 gradient = float2(r - l, d - u);
         // Small travelling ripples keep highlights moving on still water.
         const float2 ripple = float2(value_noise(point * 0.11 + float2(scene.time * 0.7, 0)),
                                      value_noise(point * 0.11 + float2(0, scene.time * 0.6) + 17.0)) - 0.5;
-        const float3 normal = normalize(float3(-gradient * 1.4 + ripple * 0.18, 0.6));
+        const float3 normal = normalize(float3(-gradient * 1.4 + ripple * 0.05, 0.6));
 
         // Thickness from coarse mip levels: deep pools absorb more light.
-        const float body = field.sample(linear, in.uv, level(3)).r / packed_coverage;
-        const float deep = saturate(field.sample(linear, in.uv, level(5)).r / packed_coverage);
+        const float body = field_at(field, in.uv, 3, inset).r / packed_coverage;
+        const float deep = saturate(field_at(field, in.uv, 5, inset).r / packed_coverage);
         const float thickness = saturate(body * 0.3 + deep * 0.95);
 
         // Light from the upper left, in screen space with y pointing down.
@@ -133,17 +171,18 @@ fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
             // colour bends slightly differently.
             const float2 to_uv = 1.0 / float2(scene.background_width, scene.background_height);
             const float2 base = (float2(scene.background_x, scene.background_y) + point) * to_uv;
-            const float2 bend = -normal.xy / max(normal.z, 0.25) * (2.0 + 9.0 * thickness) * to_uv;
-            const float3 seen = float3(desktop.sample(linear, base + bend * 0.94, level(0)).r,
+            // Thin water bends little, so edges do not drag in what lies just beyond them.
+            const float2 bend = -normal.xy / max(normal.z, 0.45) * (0.8 + 8.0 * thickness) * to_uv;
+            const float3 seen = float3(desktop.sample(linear, base + bend * 0.97, level(0)).r,
                                        desktop.sample(linear, base + bend, level(0)).g,
-                                       desktop.sample(linear, base + bend * 1.07, level(0)).b);
+                                       desktop.sample(linear, base + bend * 1.03, level(0)).b);
             // Water absorbs red first, so depth tints the view toward cyan and blue.
-            const float3 transmit = exp(-thickness * float3(1.15, 0.4, 0.18));
-            float3 water = seen * transmit + float3(0.05, 0.25, 0.45) * (1.0 - transmit.g) * 0.5;
-            water *= 1.0 + shimmer * 0.18;
+            const float3 transmit = exp(-thickness * float3(0.5, 0.18, 0.08));
+            float3 water = seen * transmit + float3(0.05, 0.25, 0.45) * (1.0 - transmit.g) * 0.3;
+            water *= 1.0 + shimmer * 0.12;
             // At grazing angles and along the edges the surface reflects a bright sky.
             const float3 sky = mix(float3(0.85, 0.94, 1.0), float3(0.45, 0.62, 0.85), saturate(0.5 + 0.5 * normal.y));
-            water = mix(water, sky, saturate(fresnel * 0.5 + edge * (0.25 + 0.35 * top)));
+            water = mix(water, sky, saturate(fresnel * 0.3 + edge * (0.08 + 0.22 * top)));
             water += float3(0.3, 0.6, 0.8) * below_surface * 0.15;
             water = mix(water + specular, foam_color, foam);
             color = saturate(water) * alpha;

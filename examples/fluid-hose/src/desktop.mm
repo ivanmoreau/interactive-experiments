@@ -168,6 +168,9 @@ struct HoseRenderer {
     id<MTLCommandQueue> queue = nil;
     id<MTLRenderPipelineState> splat_pipeline = nil;
     id<MTLRenderPipelineState> surface_pipeline = nil;
+    id<MTLRenderPipelineState> blur_pipeline = nil;
+    id<MTLTexture> blurred = nil;   // horizontal pass
+    id<MTLTexture> smoothed = nil;  // both passes, with a mip chain
     id<MTLTexture> field = nil;
     id<MTLTexture> no_background = nil;
     id<MTLCommandBuffer> last_submission = nil;
@@ -231,6 +234,12 @@ struct HoseRenderer {
         descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         surface_pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
         if (!surface_pipeline) return set_desktop_error("Create fluid surface pipeline: %s", error.localizedDescription.UTF8String);
+        descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+        descriptor.vertexFunction = [library newFunctionWithName:@"surface_vertex"];
+        descriptor.fragmentFunction = [library newFunctionWithName:@"blur_fragment"];
+        descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+        blur_pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+        if (!blur_pipeline) return set_desktop_error("Create fluid blur pipeline: %s", error.localizedDescription.UTF8String);
         MTLTextureDescriptor* placeholder = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                                                               width:1 height:1 mipmapped:NO];
         no_background = [device newTextureWithDescriptor:placeholder];
@@ -246,13 +255,19 @@ struct HoseRenderer {
         const NSUInteger width = std::max<NSUInteger>(1, target.width / reduction);
         const NSUInteger height = std::max<NSUInteger>(1, target.height / reduction);
         if (!field || field.width != width || field.height != height) {
-            MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
-                                                                                               width:width height:height mipmapped:YES];
-            descriptor.mipmapLevelCount = std::min<NSUInteger>(descriptor.mipmapLevelCount, 6);
-            descriptor.storageMode = MTLStorageModePrivate;
-            descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-            field = [device newTextureWithDescriptor:descriptor];
-            if (!field) return set_desktop_error("Cannot allocate the fluid field");
+            auto texture = [&](bool mipmapped) {
+                MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                                                                                   width:width height:height
+                                                                                               mipmapped:mipmapped];
+                descriptor.mipmapLevelCount = std::min<NSUInteger>(descriptor.mipmapLevelCount, 6);
+                descriptor.storageMode = MTLStorageModePrivate;
+                descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                return [device newTextureWithDescriptor:descriptor];
+            };
+            field = texture(false);
+            blurred = texture(false);
+            smoothed = texture(true);
+            if (!field || !blurred || !smoothed) return set_desktop_error("Cannot allocate the fluid field");
         }
 
         MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -269,9 +284,29 @@ struct HoseRenderer {
             [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6 instanceCount:scene.count];
         }
         [encoder endEncoding];
+
+        // Blur by about 60% of a splat radius, in field texels: wide enough to
+        // flatten bumps a few particles across.
+        const float texels_per_point = scene.scale / reduction;
+        const float sigma = std::max(0.5f, scene.particle_radius * 0.6f * texels_per_point);
+        const std::pair<id<MTLTexture>, id<MTLTexture>> passes[2] = {{field, blurred}, {blurred, smoothed}};
+        for (int axis = 0; axis < 2; ++axis) {
+            pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = passes[axis].second;
+            pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            encoder = [commands renderCommandEncoderWithDescriptor:pass];
+            if (!encoder) return set_desktop_error("Cannot begin the fluid blur pass");
+            const float parameters[4] = {axis == 0 ? 1.0f / width : 0.0f, axis == 1 ? 1.0f / height : 0.0f, sigma, 0};
+            [encoder setRenderPipelineState:blur_pipeline];
+            [encoder setFragmentBytes:parameters length:sizeof(parameters) atIndex:0];
+            [encoder setFragmentTexture:passes[axis].first atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [encoder endEncoding];
+        }
         id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
         if (!blit) return set_desktop_error("Cannot build the fluid field mip chain");
-        [blit generateMipmapsForTexture:field];
+        [blit generateMipmapsForTexture:smoothed];
         [blit endEncoding];
 
         pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -283,7 +318,7 @@ struct HoseRenderer {
         if (!encoder) return set_desktop_error("Cannot begin the fluid surface pass");
         [encoder setRenderPipelineState:surface_pipeline];
         [encoder setFragmentBytes:&scene length:sizeof(scene) atIndex:0];
-        [encoder setFragmentTexture:field atIndex:0];
+        [encoder setFragmentTexture:smoothed atIndex:0];
         [encoder setFragmentTexture:background ? background : no_background atIndex:1];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [encoder endEncoding];
