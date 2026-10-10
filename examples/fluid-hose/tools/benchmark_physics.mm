@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
             std::puts("Usage: benchmark-physics.sh [--quick]\n"
                       "GPU solver benchmark: 1440x900 points, one 120 Hz step per command buffer.\n"
                       "Reports GPU execution time per step; excludes CPU encoding, rendering, and window tracking.\n"
-                      "--quick stops at 4,096 particles.");
+                      "--quick stops at 4,096 particles. Uses the default fine particles and water feel.");
             return 0;
         } else {
             std::fprintf(stderr, "Unknown option: %s\n", argv[i]);
@@ -76,7 +76,8 @@ int main(int argc, char** argv) {
         if (quick && count > 4096) break;
         std::fprintf(stderr, "Seeding %u particles...\n", count);
         // Sweep the nozzle across the screen so the water settles as a broad pool.
-        while (fluid.size() < count) {
+        // Rows stop short of capacity when the stream width does not divide it.
+        while (fluid.size() + 16 < count) {
             const float x = 60 + std::fmod(step * 2.7f, width - 120);
             fluid.advance(1, {}, true, {x, 60});
             if (++step % 240 == 0 && !fluid.flush()) return 1;

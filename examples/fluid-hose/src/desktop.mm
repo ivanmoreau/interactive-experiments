@@ -6,6 +6,7 @@
 #import <ImageIO/ImageIO.h>
 #include "desktop.h"
 #include "fluid_sim.h"
+#include "screen_capture.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdarg>
@@ -96,6 +97,11 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 @property(nonatomic) BOOL tiltEnabled;
 @property(nonatomic) BOOL reverseTilt;
 @property(nonatomic) DesktopDisplayID requestedDisplay;
+@property(nonatomic) NSInteger particleSize;
+@property(nonatomic) NSInteger liquidFeel;
+@property(nonatomic) BOOL refraction;
+@property(nonatomic, strong) NSMenu* sizeMenu;
+@property(nonatomic, strong) NSMenu* liquidMenu;
 - (void)togglePour:(NSMenuItem*)sender;
 - (void)togglePause:(NSMenuItem*)sender;
 - (void)clearWater:(NSMenuItem*)sender;
@@ -103,6 +109,9 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 - (void)toggleTilt:(NSMenuItem*)sender;
 - (void)toggleReverseTilt:(NSMenuItem*)sender;
 - (void)selectDisplay:(NSMenuItem*)sender;
+- (void)selectSize:(NSMenuItem*)sender;
+- (void)selectLiquid:(NSMenuItem*)sender;
+- (void)toggleRefraction:(NSMenuItem*)sender;
 @end
 
 @implementation FluidMenuController
@@ -127,6 +136,24 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 - (void)selectDisplay:(NSMenuItem*)sender {
     self.requestedDisplay = [sender.representedObject unsignedIntValue];
 }
+static void check_only(NSMenu* menu, NSInteger tag) {
+    for (NSMenuItem* item in menu.itemArray)
+        if (item.action) item.state = item.tag == tag ? NSControlStateValueOn : NSControlStateValueOff;
+}
+- (void)selectSize:(NSMenuItem*)sender {
+    self.particleSize = sender.tag;
+    check_only(self.sizeMenu, sender.tag);
+}
+- (void)selectLiquid:(NSMenuItem*)sender {
+    self.liquidFeel = sender.tag;
+    check_only(self.liquidMenu, sender.tag);
+}
+- (void)toggleRefraction:(NSMenuItem*)sender {
+    self.refraction = !self.refraction;
+    // The first request shows the macOS Screen Recording prompt.
+    if (self.refraction) ScreenCapture::request_permission();
+    sender.state = self.refraction ? NSControlStateValueOn : NSControlStateValueOff;
+}
 @end
 
 struct HoseRenderer {
@@ -142,7 +169,13 @@ struct HoseRenderer {
     id<MTLRenderPipelineState> splat_pipeline = nil;
     id<MTLRenderPipelineState> surface_pipeline = nil;
     id<MTLTexture> field = nil;
+    id<MTLTexture> no_background = nil;
     id<MTLCommandBuffer> last_submission = nil;
+    ScreenCapture capture;
+    bool refraction = false;
+    DesktopDisplay refraction_display{};
+    CaptureState previous_capture_state = CaptureState::starting;
+    NSMenuItem* refraction_status = nil;
     dispatch_semaphore_t available = dispatch_semaphore_create(3);
     NSStatusItem* status_item = nil;
     FluidMenuController* controls = nil;
@@ -198,12 +231,17 @@ struct HoseRenderer {
         descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         surface_pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
         if (!surface_pipeline) return set_desktop_error("Create fluid surface pipeline: %s", error.localizedDescription.UTF8String);
+        MTLTextureDescriptor* placeholder = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                              width:1 height:1 mipmapped:NO];
+        no_background = [device newTextureWithDescriptor:placeholder];
+        if (!no_background) return set_desktop_error("Cannot allocate the fluid background placeholder");
         return true;
     }
 
     // Splats particles into a fluid field at point resolution, builds its mip
     // chain for smooth thickness lookups, then shades the water surface.
-    bool encode(id<MTLCommandBuffer> commands, id<MTLTexture> target, id<MTLBuffer> particles, SceneUniforms scene) {
+    bool encode(id<MTLCommandBuffer> commands, id<MTLTexture> target, id<MTLBuffer> particles, SceneUniforms scene,
+                id<MTLTexture> background = nil) {
         const NSUInteger reduction = scene.scale >= 1.5f ? 2 : 1;
         const NSUInteger width = std::max<NSUInteger>(1, target.width / reduction);
         const NSUInteger height = std::max<NSUInteger>(1, target.height / reduction);
@@ -246,13 +284,15 @@ struct HoseRenderer {
         [encoder setRenderPipelineState:surface_pipeline];
         [encoder setFragmentBytes:&scene length:sizeof(scene) atIndex:0];
         [encoder setFragmentTexture:field atIndex:0];
+        [encoder setFragmentTexture:background ? background : no_background atIndex:1];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [encoder endEncoding];
         return true;
     }
 };
 
-HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader_file, bool continuous, bool tilt) {
+HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader_file, bool continuous, bool tilt,
+                                   FluidSettings settings, bool refraction) {
     @autoreleasepool {
         auto renderer = std::make_unique<HoseRenderer>();
         if (!renderer->initialize(shader_file)) return nullptr;
@@ -278,6 +318,10 @@ HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader
         if (!renderer->layer) { set_desktop_error("Cannot create the native Metal layer"); return nullptr; }
         renderer->layer.device = renderer->device;
         renderer->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        // Captured desktop frames are sRGB too, so refracted pixels match the desktop around them.
+        CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        renderer->layer.colorspace = srgb;
+        CGColorSpaceRelease(srgb);
         renderer->layer.opaque = NO;
         renderer->layer.framebufferOnly = YES;
         renderer->layer.displaySyncEnabled = YES;
@@ -288,6 +332,9 @@ HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader
         renderer->controls = [[FluidMenuController alloc] init];
         renderer->controls.pouring = continuous;
         renderer->controls.tiltEnabled = tilt;
+        renderer->controls.particleSize = static_cast<NSInteger>(settings.size);
+        renderer->controls.liquidFeel = static_cast<NSInteger>(settings.feel);
+        renderer->controls.refraction = refraction;
         renderer->status_item = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
         renderer->status_item.button.title = @"💧";
         renderer->status_item.button.toolTip = @"Fluid Hose — hold Option to pour";
@@ -311,6 +358,39 @@ HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader
         NSMenuItem* clear = [[NSMenuItem alloc] initWithTitle:@"Clear water" action:@selector(clearWater:) keyEquivalent:@""];
         clear.target = renderer->controls;
         [menu addItem:clear];
+        [menu addItem:NSMenuItem.separatorItem];
+        auto submenu = [&](NSString* title, NSArray<NSString*>* options, SEL action, NSInteger selected, NSString* hint) {
+            NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""];
+            NSMenu* choices = [[NSMenu alloc] initWithTitle:title];
+            for (NSUInteger i = 0; i < options.count; ++i) {
+                NSMenuItem* option = [[NSMenuItem alloc] initWithTitle:options[i] action:action keyEquivalent:@""];
+                option.target = renderer->controls;
+                option.tag = static_cast<NSInteger>(i);
+                option.state = option.tag == selected ? NSControlStateValueOn : NSControlStateValueOff;
+                [choices addItem:option];
+            }
+            if (hint) {
+                [choices addItem:NSMenuItem.separatorItem];
+                NSMenuItem* note = [[NSMenuItem alloc] initWithTitle:hint action:nil keyEquivalent:@""];
+                note.enabled = NO;
+                [choices addItem:note];
+            }
+            item.submenu = choices;
+            [menu addItem:item];
+            return choices;
+        };
+        renderer->controls.liquidMenu = submenu(@"Liquid", @[@"Water", @"Thick", @"Goo"], @selector(selectLiquid:),
+                                                renderer->controls.liquidFeel, nil);
+        renderer->controls.sizeMenu = submenu(@"Particle size", @[@"Fine — most detail", @"Medium", @"Coarse — most water"],
+                                              @selector(selectSize:), renderer->controls.particleSize,
+                                              @"Changing the size clears the water");
+        NSMenuItem* refract = [[NSMenuItem alloc] initWithTitle:@"Refract the desktop" action:@selector(toggleRefraction:) keyEquivalent:@""];
+        refract.target = renderer->controls;
+        refract.state = refraction ? NSControlStateValueOn : NSControlStateValueOff;
+        [menu addItem:refract];
+        renderer->refraction_status = [[NSMenuItem alloc] initWithTitle:@"Refraction: off" action:nil keyEquivalent:@""];
+        renderer->refraction_status.enabled = NO;
+        [menu addItem:renderer->refraction_status];
         [menu addItem:NSMenuItem.separatorItem];
         NSMenuItem* tilt_item = [[NSMenuItem alloc] initWithTitle:@"Use Mac tilt" action:@selector(toggleTilt:) keyEquivalent:@""];
         tilt_item.target = renderer->controls;
@@ -473,7 +553,10 @@ DesktopInput poll_desktop_input(HoseRenderer* renderer, const DesktopRect& canva
                            static_cast<bool>(renderer->controls.paused), static_cast<bool>(renderer->controls.clearRequested),
                            static_cast<bool>(renderer->controls.quitRequested),
                            static_cast<bool>(renderer->controls.tiltEnabled), static_cast<bool>(renderer->controls.reverseTilt),
-                           renderer->controls.requestedDisplay};
+                           renderer->controls.requestedDisplay,
+                           {static_cast<ParticleSize>(renderer->controls.particleSize),
+                            static_cast<LiquidFeel>(renderer->controls.liquidFeel)},
+                           static_cast<bool>(renderer->controls.refraction)};
         renderer->controls.clearRequested = NO;
         renderer->controls.requestedDisplay = 0;
         return input;
@@ -489,6 +572,50 @@ void set_hose_tilt_status(HoseRenderer* renderer, TiltStatus status) {
             case TiltStatus::waiting: renderer->tilt_status.title = @"Tilt: waiting for motion"; break;
             case TiltStatus::active: renderer->tilt_status.title = @"Tilt: active"; break;
             case TiltStatus::unavailable: renderer->tilt_status.title = @"Tilt: unavailable — gravity down"; break;
+        }
+    }
+}
+
+bool run_capture_check() {
+    @autoreleasepool {
+        if (!CGPreflightScreenCaptureAccess())
+            return set_desktop_error("Screen Recording permission is not granted to this process or its terminal");
+        ScreenCapture capture;
+        capture.start(CGMainDisplayID(), 1.0);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!capture.latest_frame() && capture.state() != CaptureState::failed && capture.state() != CaptureState::denied &&
+               std::chrono::steady_clock::now() < deadline)
+            [NSRunLoop.mainRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        HoseCaptureFrame* frame = capture.latest_frame();
+        capture.stop();
+        if (!frame) return set_desktop_error("No desktop frame arrived from ScreenCaptureKit");
+        std::printf("PASS: ScreenCaptureKit delivered a %lu × %lu desktop frame as a Metal texture.\n",
+                    static_cast<unsigned long>(frame.texture.width), static_cast<unsigned long>(frame.texture.height));
+        return true;
+    }
+}
+
+void set_hose_refraction(HoseRenderer* renderer, bool enabled, const DesktopDisplay& display) {
+    const bool restart = enabled && (!renderer->refraction || renderer->refraction_display.id != display.id ||
+                                     !same_rect(renderer->refraction_display.bounds, display.bounds));
+    renderer->refraction_display = display;
+    renderer->refraction = enabled;
+    if (!enabled && renderer->capture.state() != CaptureState::off) renderer->capture.stop();
+    if (restart) {
+        NSScreen* screen = renderer->window.screen;
+        renderer->capture.start(display.id, screen ? screen.backingScaleFactor : 2.0);
+    }
+    const CaptureState state = renderer->capture.state();
+    if (state == renderer->previous_capture_state) return;
+    renderer->previous_capture_state = state;
+    @autoreleasepool {
+        switch (state) {
+            case CaptureState::off: renderer->refraction_status.title = @"Refraction: off"; break;
+            case CaptureState::starting: renderer->refraction_status.title = @"Refraction: starting"; break;
+            case CaptureState::active: renderer->refraction_status.title = @"Refraction: active"; break;
+            case CaptureState::denied:
+                renderer->refraction_status.title = @"Refraction: allow Screen Recording in System Settings, then relaunch"; break;
+            case CaptureState::failed: renderer->refraction_status.title = @"Refraction: capture unavailable"; break;
         }
     }
 }
@@ -528,6 +655,28 @@ std::string saved_hose_display() {
         NSUserDefaults* preferences = [[NSUserDefaults alloc] initWithSuiteName:@"local.interactive-experiences.fluid-hose"];
         NSString* uuid = [preferences stringForKey:@"SelectedDisplayUUID"];
         return uuid.UTF8String ? uuid.UTF8String : "";
+    }
+}
+
+FluidPreferences saved_hose_preferences() {
+    @autoreleasepool {
+        NSUserDefaults* preferences = [[NSUserDefaults alloc] initWithSuiteName:@"local.interactive-experiences.fluid-hose"];
+        FluidPreferences saved;
+        if ([preferences objectForKey:@"ParticleSize"])
+            saved.fluid.size = static_cast<ParticleSize>(std::clamp<NSInteger>([preferences integerForKey:@"ParticleSize"], 0, 2));
+        if ([preferences objectForKey:@"LiquidFeel"])
+            saved.fluid.feel = static_cast<LiquidFeel>(std::clamp<NSInteger>([preferences integerForKey:@"LiquidFeel"], 0, 2));
+        saved.refraction = [preferences boolForKey:@"Refraction"];
+        return saved;
+    }
+}
+
+void save_hose_preferences(const FluidPreferences& saved) {
+    @autoreleasepool {
+        NSUserDefaults* preferences = [[NSUserDefaults alloc] initWithSuiteName:@"local.interactive-experiences.fluid-hose"];
+        [preferences setInteger:static_cast<NSInteger>(saved.fluid.size) forKey:@"ParticleSize"];
+        [preferences setInteger:static_cast<NSInteger>(saved.fluid.feel) forKey:@"LiquidFeel"];
+        [preferences setBool:saved.refraction forKey:@"Refraction"];
     }
 }
 
@@ -576,15 +725,29 @@ bool draw_hose_frame(HoseRenderer* renderer, FluidSimulation& simulation, SceneU
             return set_desktop_error("Cannot allocate fluid commands");
         }
         scene.count = simulation.size();
-        scene.particle_radius = FluidSimulation::splat_radius;
+        scene.particle_radius = simulation.splat_radius();
         scene.scale = static_cast<float>(drawable.texture.width) / std::max(scene.width, 1.0f);
+        HoseCaptureFrame* background = renderer->refraction ? renderer->capture.latest_frame() : nil;
+        if (background) {
+            const auto& display = renderer->refraction_display;
+            scene.has_background = 1;
+            scene.background_x = static_cast<float>(display.canvas.x - display.bounds.x);
+            scene.background_y = static_cast<float>(display.canvas.y - display.bounds.y);
+            scene.background_width = static_cast<float>(display.bounds.w);
+            scene.background_height = static_cast<float>(display.bounds.h);
+        }
         if (!simulation.encode(commands) ||
-            !renderer->encode(commands, drawable.texture, simulation.particle_buffer(), scene)) {
+            !renderer->encode(commands, drawable.texture, simulation.particle_buffer(), scene, background.texture)) {
             dispatch_semaphore_signal(renderer->available);
             return false;
         }
         dispatch_semaphore_t completion = renderer->available;
-        [commands addCompletedHandler:^(id<MTLCommandBuffer> finished) { (void)finished; dispatch_semaphore_signal(completion); }];
+        // The block keeps the captured frame alive until the GPU has sampled it.
+        [commands addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+            (void)finished;
+            (void)background;
+            dispatch_semaphore_signal(completion);
+        }];
         // CAMetalDisplayLink supplies this drawable. Submit before presenting it.
         [commands commit];
         [drawable present];
@@ -617,7 +780,7 @@ bool smoke_test_hose_renderer(const char* shader_file) {
         SceneUniforms scene{};
         scene.width = 64;
         scene.height = 64;
-        scene.particle_radius = FluidSimulation::splat_radius;
+        scene.particle_radius = 9;  // matches the blob's 4.5-point spacing
         scene.scale = 1;
         scene.count = static_cast<fluid_uint>(particles.size());
         id<MTLCommandBuffer> commands = [renderer.queue commandBuffer];
@@ -644,7 +807,7 @@ bool run_hose_window_checks(const char* shader_file) {
         std::vector<DesktopDisplay> displays;
         if (!read_desktop_displays(displays)) return false;
         std::unique_ptr<HoseRenderer, decltype(&destroy_hose_renderer)> renderer(
-            create_hose_renderer(displays.front().canvas, shader_file, false), destroy_hose_renderer);
+            create_hose_renderer(displays.front().canvas, shader_file, false, false, {}, false), destroy_hose_renderer);
         if (!renderer) return false;
         show_hose_window(renderer.get());
         for (std::size_t index = 0; index < displays.size(); ++index) {
@@ -725,31 +888,40 @@ void paint_desktop(std::vector<unsigned char>& rgba, int width, int height, floa
         for (int x = 0; x < width; ++x) {
             const float u = x / static_cast<float>(width), v = y / static_cast<float>(height);
             unsigned char* pixel = rgba.data() + (y * width + x) * 4;
-            pixel[0] = static_cast<unsigned char>(60 + 90 * u);
-            pixel[1] = static_cast<unsigned char>(70 + 50 * v);
-            pixel[2] = static_cast<unsigned char>(120 + 60 * (1 - v));
-            pixel[3] = 255;
             const float px = x / scale, py = y / scale;
+            // Fine grid lines and soft circles give refraction something to bend.
+            const bool grid = std::fmod(px, 40.0f) < 1.0f || std::fmod(py, 40.0f) < 1.0f;
+            const float ring = std::abs(std::hypot(std::fmod(px, 160.0f) - 80, std::fmod(py, 160.0f) - 80) - 34);
+            const float light = (grid ? 28.0f : 0.0f) + (ring < 2.0f ? 40.0f : 0.0f);
+            pixel[0] = static_cast<unsigned char>(std::min(255.0f, 60 + 90 * u + light));
+            pixel[1] = static_cast<unsigned char>(std::min(255.0f, 70 + 50 * v + light));
+            pixel[2] = static_cast<unsigned char>(std::min(255.0f, 120 + 60 * (1 - v) + light));
+            pixel[3] = 255;
             for (const auto& w : windows) {
                 const float hx = w.width * 0.5f, hy = w.height * 0.5f, r = 10;
                 const float qx = std::abs(px - w.x - hx) - (hx - r), qy = std::abs(py - w.y - hy) - (hy - r);
                 const float d = std::hypot(std::max(qx, 0.0f), std::max(qy, 0.0f)) + std::min(std::max(qx, qy), 0.0f) - r;
                 if (d > 0) continue;
                 const bool title = py - w.y < 28;
-                pixel[0] = pixel[1] = pixel[2] = title ? 214 : 246;
+                // Rows of dark bars stand in for text.
+                const float line = std::fmod(py - w.y - 40, 18.0f);
+                const bool text = !title && py - w.y > 40 && line < 7 && px - w.x > 16 && px < w.x + w.width - 40 &&
+                                  std::fmod(px - w.x + std::floor((py - w.y) / 18) * 23, 70.0f) < 52;
+                pixel[0] = pixel[1] = pixel[2] = title ? 214 : text ? 90 : 246;
             }
         }
     }
 }
 }
 
-bool render_hose_snapshot(const char* shader_file, const char* output_file, float seconds) {
+bool render_hose_snapshot(const char* shader_file, const char* output_file, float seconds, const FluidSettings& settings,
+                          bool refraction) {
     @autoreleasepool {
         constexpr float width = 960, height = 600, scale = 2;
         HoseRenderer renderer;
         if (!renderer.initialize(shader_file)) return false;
         FluidSimulation simulation;
-        if (!simulation.initialize(shader_file, width, height)) return false;
+        if (!simulation.initialize(shader_file, width, height, settings)) return false;
         // A shelf window catches the stream; a second window slides into the
         // pool after a few seconds and pushes the water back.
         const int steps = static_cast<int>(seconds / FluidSimulation::step_time);
@@ -769,6 +941,17 @@ bool render_hose_snapshot(const char* shader_file, const char* output_file, floa
             if (i % 120 == 119 && !simulation.flush()) return false;
         }
         id<MTLTexture> texture = offscreen_target(renderer.device, width * scale, height * scale);
+        const int w = static_cast<int>(texture.width), h = static_cast<int>(texture.height);
+        std::vector<unsigned char> overlay(w * h * 4), image(w * h * 4);
+        paint_desktop(image, w, h, scale, windows);
+        // With refraction, the painted desktop stands in for a captured frame.
+        id<MTLTexture> background = nil;
+        if (refraction) {
+            MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                               width:w height:h mipmapped:NO];
+            background = [renderer.device newTextureWithDescriptor:descriptor];
+            [background replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:image.data() bytesPerRow:w * 4];
+        }
         id<MTLCommandBuffer> commands = [renderer.queue commandBuffer];
         SceneUniforms scene{};
         scene.width = width;
@@ -777,20 +960,20 @@ bool render_hose_snapshot(const char* shader_file, const char* output_file, floa
         scene.nozzle_y = nozzle.y;
         scene.show_nozzle = 1;
         scene.time = seconds;
-        scene.particle_radius = FluidSimulation::splat_radius;
+        scene.particle_radius = simulation.splat_radius();
         scene.scale = scale;
         scene.count = simulation.size();
+        scene.has_background = background ? 1 : 0;
+        scene.background_width = width;
+        scene.background_height = height;
         if (!texture || !commands || !simulation.encode(commands) ||
-            !renderer.encode(commands, texture, simulation.particle_buffer(), scene)) return false;
+            !renderer.encode(commands, texture, simulation.particle_buffer(), scene, background)) return false;
         [commands commit];
         [commands waitUntilCompleted];
         if (commands.status == MTLCommandBufferStatusError)
             return set_desktop_error("Snapshot rendering failed: %s", commands.error.localizedDescription.UTF8String);
 
-        const int w = static_cast<int>(texture.width), h = static_cast<int>(texture.height);
-        std::vector<unsigned char> overlay(w * h * 4), image(w * h * 4);
         [texture getBytes:overlay.data() bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
-        paint_desktop(image, w, h, scale, windows);
         for (int i = 0; i < w * h; ++i) {
             // Premultiplied BGRA over the opaque RGBA desktop.
             const float alpha = overlay[i * 4 + 3] / 255.0f;

@@ -76,7 +76,8 @@ constant float packed_coverage = 3.5;
 
 fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
                                  constant SceneUniforms& scene [[buffer(0)]],
-                                 texture2d<float> field [[texture(0)]]) {
+                                 texture2d<float> field [[texture(0)]],
+                                 texture2d<float> desktop [[texture(1)]]) {
     constexpr sampler linear(coord::normalized, address::clamp_to_edge, filter::linear, mip_filter::linear);
     const float4 sample = field.sample(linear, in.uv, level(0));
     const float coverage = sample.r;
@@ -103,43 +104,64 @@ fragment float4 surface_fragment(SurfaceOutput in [[stage_in]],
         const float body = field.sample(linear, in.uv, level(3)).r / packed_coverage;
         const float deep = saturate(field.sample(linear, in.uv, level(5)).r / packed_coverage);
         const float thickness = saturate(body * 0.3 + deep * 0.95);
-        const float3 shallow_color = float3(0.42, 0.82, 1.0);
-        const float3 deep_color = float3(0.01, 0.13, 0.42);
-        const float3 absorption = exp(-thickness * float3(3.2, 1.5, 0.7));
-        float3 water = mix(deep_color, shallow_color, absorption);
 
         // Light from the upper left, in screen space with y pointing down.
         const float3 view = float3(0, 0, 1);
         const float3 key = normalize(float3(-0.45, -0.75, 0.55));
         const float3 half_vector = normalize(key + view);
-        const float specular = pow(saturate(dot(normal, half_vector)), 70.0) * 1.4 +
-                               pow(saturate(dot(normal, half_vector)), 12.0) * 0.18;
+        const float specular = pow(saturate(dot(normal, half_vector)), 90.0) * 1.5 +
+                               pow(saturate(dot(normal, half_vector)), 14.0) * 0.12;
         const float fresnel = pow(1.0 - saturate(normal.z), 3.0);
+        const float shimmer = caustics(point * 0.03, scene.time * 1.1) * saturate(thickness * 1.5);
 
-        // Caustic ripples inside the body drift slowly with time.
-        const float shimmer = caustics(point * 0.03, scene.time * 1.1) * saturate(thickness * 1.5) * 0.2;
-        water += float3(0.55, 0.85, 1.0) * shimmer;
-
-        // A bright meniscus traces every edge; the top of each pool is brightest.
-        const float edge = alpha * (1 - smoothstep(surface_high, surface_high + 0.9, coverage));
+        // A thin meniscus traces every edge; the top of each pool is brightest.
+        const float edge = alpha * (1 - smoothstep(surface_high, surface_high + 0.5, coverage));
         const float2 direction = gradient / max(length(gradient), 1e-4);
         const float top = saturate(direction.y);
-        water += float3(0.75, 0.92, 1.0) * edge * (0.35 + 0.65 * top);
-        // Light entering through the top surface glows just beneath it.
         const float below_surface = smoothstep(surface_high + 2.5, surface_high, coverage) * top;
-        water += float3(0.25, 0.6, 0.85) * below_surface * 0.35;
-        water += float3(0.6, 0.85, 1.0) * fresnel * 0.5;
 
         // Fast, aerated water and lingering splash foam turn white.
         const float foam_amount = sample.g / max(coverage, 1e-3);
         const float speed = sample.b / max(coverage, 1e-3);
         const float grain = value_noise(point * 0.35 + float2(0, scene.time * 6.0));
         const float foam = saturate(smoothstep(0.08, 0.45, foam_amount) * (0.55 + 0.6 * grain) + smoothstep(0.35, 0.8, speed) * 0.25);
-        water = mix(water, float3(0.93, 0.97, 1.0), foam);
+        const float3 foam_color = float3(0.93, 0.97, 1.0);
 
-        // Thin water is clear, deep water and foam are more opaque.
-        alpha *= saturate(mix(0.38, 0.92, thickness) + edge * 0.3 + foam * 0.5 + specular * 0.5);
-        color = saturate(water + specular) * alpha;
+        if (scene.has_background > 0.5) {
+            // Refraction: the surface acts as a lens over the captured desktop.
+            // Tilted surfaces and deeper water bend the view further, and each
+            // colour bends slightly differently.
+            const float2 to_uv = 1.0 / float2(scene.background_width, scene.background_height);
+            const float2 base = (float2(scene.background_x, scene.background_y) + point) * to_uv;
+            const float2 bend = -normal.xy / max(normal.z, 0.25) * (2.0 + 9.0 * thickness) * to_uv;
+            const float3 seen = float3(desktop.sample(linear, base + bend * 0.94, level(0)).r,
+                                       desktop.sample(linear, base + bend, level(0)).g,
+                                       desktop.sample(linear, base + bend * 1.07, level(0)).b);
+            // Water absorbs red first, so depth tints the view toward cyan and blue.
+            const float3 transmit = exp(-thickness * float3(1.15, 0.4, 0.18));
+            float3 water = seen * transmit + float3(0.05, 0.25, 0.45) * (1.0 - transmit.g) * 0.5;
+            water *= 1.0 + shimmer * 0.18;
+            // At grazing angles and along the edges the surface reflects a bright sky.
+            const float3 sky = mix(float3(0.85, 0.94, 1.0), float3(0.45, 0.62, 0.85), saturate(0.5 + 0.5 * normal.y));
+            water = mix(water, sky, saturate(fresnel * 0.5 + edge * (0.25 + 0.35 * top)));
+            water += float3(0.3, 0.6, 0.8) * below_surface * 0.15;
+            water = mix(water + specular, foam_color, foam);
+            color = saturate(water) * alpha;
+        } else {
+            // Without a desktop image, tint and light the water, and let the
+            // real desktop show through thin water.
+            const float3 shallow_color = float3(0.42, 0.82, 1.0);
+            const float3 deep_color = float3(0.01, 0.13, 0.42);
+            const float3 absorption = exp(-thickness * float3(3.2, 1.5, 0.7));
+            float3 water = mix(deep_color, shallow_color, absorption);
+            water += float3(0.55, 0.85, 1.0) * shimmer * 0.2;
+            water += float3(0.75, 0.92, 1.0) * edge * (0.35 + 0.65 * top);
+            water += float3(0.25, 0.6, 0.85) * below_surface * 0.35;
+            water += float3(0.6, 0.85, 1.0) * fresnel * 0.5;
+            water = mix(water, foam_color, foam);
+            alpha *= saturate(mix(0.28, 0.85, thickness) + edge * 0.35 + foam * 0.5 + specular * 0.6);
+            color = saturate(water + specular) * alpha;
+        }
     }
 
     if (scene.show_nozzle > 0.5) {

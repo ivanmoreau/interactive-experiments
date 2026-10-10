@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -60,9 +61,13 @@ int main(int argc, char** argv) {
         bool display_check = false;
         bool list_displays = false;
         bool window_check = false;
+        bool refraction_option = false;
+        bool capture_check = false;
         unsigned display_number = 0;
         unsigned duration = 0;
         std::string snapshot;
+        std::optional<ParticleSize> size_option;
+        std::optional<LiquidFeel> liquid_option;
         for (int i = 1; i < argc; ++i) {
             const std::string argument = argv[i];
             if (argument == "--physics-check") physics_check = true;
@@ -74,7 +79,22 @@ int main(int argc, char** argv) {
             else if (argument == "--display-check") display_check = true;
             else if (argument == "--list-displays") list_displays = true;
             else if (argument == "--window-check") window_check = true;
+            else if (argument == "--refraction") refraction_option = true;
+            else if (argument == "--capture-check") capture_check = true;
             else if (argument == "--snapshot" && i + 1 < argc) snapshot = argv[++i];
+            else if (argument == "--size" && i + 1 < argc) {
+                const std::string value = argv[++i];
+                if (value == "fine") size_option = ParticleSize::fine;
+                else if (value == "medium") size_option = ParticleSize::medium;
+                else if (value == "coarse") size_option = ParticleSize::coarse;
+                else throw std::runtime_error("--size must be fine, medium, or coarse");
+            } else if (argument == "--liquid" && i + 1 < argc) {
+                const std::string value = argv[++i];
+                if (value == "water") liquid_option = LiquidFeel::water;
+                else if (value == "thick") liquid_option = LiquidFeel::thick;
+                else if (value == "goo") liquid_option = LiquidFeel::goo;
+                else throw std::runtime_error("--liquid must be water, thick, or goo");
+            }
             else if (argument == "--display" && i + 1 < argc) {
                 const char* value = argv[++i];
                 const auto result = std::from_chars(value, value + std::strlen(value), display_number);
@@ -86,9 +106,11 @@ int main(int argc, char** argv) {
                 if (result.ec != std::errc{} || *result.ptr != '\0' || duration == 0)
                     throw std::runtime_error("--duration requires a positive integer number of seconds");
             } else if (argument == "--help") {
-                std::puts("Fluid Hose\nUsage: fluid-hose [--pour] [--tilt] [--display NUMBER] [--duration SECONDS] "
+                std::puts("Fluid Hose\nUsage: fluid-hose [--pour] [--tilt] [--display NUMBER] [--duration SECONDS]\n"
+                          "                  [--size fine|medium|coarse] [--liquid water|thick|goo] [--refraction]\n"
+                          "                  "
                           "[--list-displays | --probe | --physics-check | --motion-check | --display-check | --smoke-test | --window-check |\n"
-                          " --snapshot FILE.png]\n"
+                          " --snapshot FILE.png | --capture-check]\n"
                           "Hold Option to pour at the mouse pointer. Release Option to stop.\n"
                           "The overlay lets clicks pass through: arrange windows normally.\n"
                           "Use the droplet menu in the menu bar to pour continuously, pause, clear, or quit.\n"
@@ -97,6 +119,8 @@ int main(int argc, char** argv) {
                           "--tilt lets Mac motion change gravity; toggle Use Mac tilt in the droplet menu.\n"
                           "The sensor helper stops and restores its settings when tilt is off or the app exits.\n"
                           "Windows are tracked live as rounded rectangles; moving one pushes the water.\n"
+                          "--size and --liquid choose particle size and how runny the liquid is; the droplet menu changes them too.\n"
+                          "--refraction bends the desktop seen through the water; it needs the Screen Recording permission.\n"
                           "--snapshot renders a scripted scene offscreen to a PNG (--duration sets its length).");
                 return 0;
             } else throw std::runtime_error("Unknown or incomplete option: " + argument);
@@ -110,9 +134,14 @@ int main(int argc, char** argv) {
             require(run_physics_checks(shaders.c_str()), "Check fluid physics");
             return 0;
         }
+        // Command-line choices override the saved menu choices for this launch.
+        FluidPreferences preferences = smoke || physics_check ? FluidPreferences{} : saved_hose_preferences();
+        if (size_option) preferences.fluid.size = *size_option;
+        if (liquid_option) preferences.fluid.feel = *liquid_option;
+        if (refraction_option) preferences.refraction = true;
         if (!snapshot.empty()) {
-            require(render_hose_snapshot(shaders.c_str(), snapshot.c_str(), duration ? static_cast<float>(duration) : 8.0f),
-                    "Render fluid snapshot");
+            require(render_hose_snapshot(shaders.c_str(), snapshot.c_str(), duration ? static_cast<float>(duration) : 8.0f,
+                                         preferences.fluid, refraction_option), "Render fluid snapshot");
             return 0;
         }
         if (smoke) {
@@ -121,6 +150,10 @@ int main(int argc, char** argv) {
         }
 
         require(initialize_hose_desktop(), "Initialize AppKit");
+        if (capture_check) {
+            require(run_capture_check(), "Check desktop capture");
+            return 0;
+        }
         if (window_check) {
             require(run_hose_window_checks(shaders.c_str()), "Check native desktop windows");
             return 0;
@@ -155,7 +188,8 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        app.renderer = require(create_hose_renderer(canvas, shaders.c_str(), continuous, tilt_enabled), "Create fluid overlay");
+        app.renderer = require(create_hose_renderer(canvas, shaders.c_str(), continuous, tilt_enabled,
+                                                    preferences.fluid, preferences.refraction), "Create fluid overlay");
         set_hose_displays(app.renderer, displays, active_display.id);
         if (display_number) save_hose_display(active_display);
         show_hose_window(app.renderer);
@@ -165,7 +199,8 @@ int main(int argc, char** argv) {
         std::signal(SIGTERM, stop);
 
         FluidSimulation simulation;
-        require(simulation.initialize(shaders.c_str(), static_cast<float>(canvas.w), static_cast<float>(canvas.h)),
+        require(simulation.initialize(shaders.c_str(), static_cast<float>(canvas.w), static_cast<float>(canvas.h),
+                                      preferences.fluid),
                 "Create fluid simulation");
         TiltGravity tilt;
         bool requested_tilt = false;
@@ -236,6 +271,14 @@ int main(int argc, char** argv) {
             set_hose_tilt_status(app.renderer, !requested_tilt ? TiltStatus::off :
                 fresh_tilt ? TiltStatus::active : app.motion.running() ? TiltStatus::waiting : TiltStatus::unavailable);
             const FluidPoint gravity = requested_tilt ? tilt.gravity(motion_time, input.reverse_tilt) : FluidPoint{0, 950};
+            if (input.fluid.size != preferences.fluid.size || input.fluid.feel != preferences.fluid.feel ||
+                input.refraction != preferences.refraction) {
+                preferences.fluid = input.fluid;
+                preferences.refraction = input.refraction;
+                simulation.configure(preferences.fluid);
+                save_hose_preferences(preferences);
+            }
+            set_hose_refraction(app.renderer, preferences.refraction, active_display);
             if (input.clear) simulation.clear();
             const auto nozzle = place_hose(input.pointer, obstacles, static_cast<float>(canvas.w), static_cast<float>(canvas.h));
             const bool in_canvas = nozzle.x > 0 && nozzle.y > 0 && nozzle.x < canvas.w && nozzle.y < canvas.h;

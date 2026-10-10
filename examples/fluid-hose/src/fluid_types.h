@@ -59,12 +59,16 @@ struct SceneUniforms {
     float particle_radius;
     float scale;  // drawable pixels per point
     fluid_uint count;
-    float padding0, padding1, padding2;
+    float has_background;  // 1 when a captured desktop frame is bound for refraction
+    float padding0, padding1;
+    // The canvas origin inside the captured display, and the display size, in points.
+    float background_x, background_y;
+    float background_width, background_height;
 };
 
 #ifndef __METAL_VERSION__
 static_assert(sizeof(WindowObstacle) == 48, "Window layout must match Metal");
 static_assert(sizeof(FluidParticle) == 32, "Particle layout must match Metal");
 static_assert(sizeof(SolverUniforms) == 96,"Solver layout must match Metal");
-static_assert(sizeof(SceneUniforms) == 48, "Scene layout must match Metal");
+static_assert(sizeof(SceneUniforms) == 64, "Scene layout must match Metal");
 #endif

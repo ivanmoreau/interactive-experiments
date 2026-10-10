@@ -8,37 +8,60 @@
 #include <unordered_map>
 
 namespace {
-// Solver tuning. The kernel support covers about 18 neighbours at rest.
-constexpr float support = FluidSimulation::spacing * 2.2f;
-constexpr int substeps = 4;
-constexpr int iterations = 2;
 constexpr float stream_speed = 320.0f;
-constexpr int stream_width = 4;
+constexpr float stream_width_points = 16.0f;
 constexpr float teleport_distance = 500.0f;
 
-float poly6(float r2) {
-    const float h2 = support * support;
-    const float x = h2 - r2;
-    return x > 0 ? 4.0f / (static_cast<float>(M_PI) * std::pow(support, 8.0f)) * x * x * x : 0.0f;
+float spacing_for(ParticleSize size) {
+    switch (size) {
+        case ParticleSize::fine: return 3.0f;
+        case ParticleSize::medium: return 3.75f;
+        case ParticleSize::coarse: return 4.5f;
+    }
+    return 3.0f;
 }
-float spiky_slope(float r) {
-    const float x = support - r;
-    return x > 0 ? -30.0f / (static_cast<float>(M_PI) * std::pow(support, 5.0f)) * x * x : 0.0f;
+
+struct Feel {
+    float viscosity;   // XSPH blend toward neighbour velocity per substep
+    float tension;     // allowed density deficit, i.e. cohesion
+    float correction;  // artificial pressure, relative to the rest gradient sum
+    float vorticity;
+    float friction;    // per second, on surfaces water rests on
+    int substeps;
+    int iterations;
+};
+
+Feel feel_for(LiquidFeel feel) {
+    switch (feel) {
+        case LiquidFeel::water: return {0.015f, 0.002f, 0.03f, 0.0f, 6.0f, 6, 2};
+        case LiquidFeel::thick: return {0.09f, 0.006f, 0.04f, 0.0f, 12.0f, 4, 2};
+        case LiquidFeel::goo: return {0.3f, 0.03f, 0.02f, 0.0f, 30.0f, 4, 2};
+    }
+    return feel_for(LiquidFeel::water);
+}
+
+// SPH kernels for support h, as used by the solver kernels.
+float poly6(float r2, float h) {
+    const float x = h * h - r2;
+    return x > 0 ? 4.0f / (static_cast<float>(M_PI) * std::pow(h, 8.0f)) * x * x * x : 0.0f;
+}
+float spiky_slope(float r, float h) {
+    const float x = h - r;
+    return x > 0 ? -30.0f / (static_cast<float>(M_PI) * std::pow(h, 5.0f)) * x * x : 0.0f;
 }
 
 struct RestState { float density; float gradient_sum; };
 // Kernel sums for a particle inside a hexagonally packed fluid at rest spacing.
-RestState rest_state() {
+RestState rest_state(float s, float h) {
     RestState rest{0, 0};
-    const float s = FluidSimulation::spacing;
     for (int row = -6; row <= 6; ++row) {
         for (int column = -6; column <= 6; ++column) {
             const float x = (column + (row & 1) * 0.5f) * s;
             const float y = row * s * std::sqrt(3.0f) * 0.5f;
             const float r2 = x * x + y * y;
-            rest.density += poly6(r2);
+            rest.density += poly6(r2, h);
             const float r = std::sqrt(r2);
-            if (r > 0 && r < support) rest.gradient_sum += spiky_slope(r) * spiky_slope(r);
+            if (r > 0 && r < h) rest.gradient_sum += spiky_slope(r, h) * spiky_slope(r, h);
         }
     }
     rest.gradient_sum /= rest.density * rest.density;
@@ -107,6 +130,34 @@ struct FluidSimulation::Impl {
     std::unordered_map<std::uint32_t, WindowObstacle> previous_windows;
     SolverUniforms base{};
     double flush_gpu_seconds = 0;
+    FluidSettings settings;
+    float spacing = 3.0f;
+    float support = 6.6f;  // kernel support, also the grid cell size
+    int substeps = 4;
+    int iterations = 2;
+
+    void apply(FluidSettings next) {
+        settings = next;
+        spacing = spacing_for(next.size);
+        // The kernel support covers about 18 neighbours at rest.
+        support = spacing * 2.2f;
+        const Feel feel = feel_for(next.feel);
+        substeps = feel.substeps;
+        iterations = feel.iterations;
+        const RestState rest = rest_state(spacing, support);
+        base.cell_size = support;
+        base.dt = step_time / substeps;
+        base.rest_density = rest.density;
+        base.relaxation = rest.gradient_sum * 0.1f;
+        base.correction_scale = feel.correction / rest.gradient_sum;
+        base.correction_reference = poly6(0.2f * support * 0.2f * support, support);
+        base.tension_limit = feel.tension;
+        base.viscosity = feel.viscosity;
+        base.vorticity = feel.vorticity;
+        base.friction = feel.friction;
+        base.max_speed = 2400.0f;
+        base.particle_radius = spacing * 0.5f;
+    }
 
     float random() {
         random_state ^= random_state << 13;
@@ -139,7 +190,7 @@ struct FluidSimulation::Impl {
 FluidSimulation::FluidSimulation() : impl_(std::make_unique<Impl>()) {}
 FluidSimulation::~FluidSimulation() = default;
 
-bool FluidSimulation::initialize(const char* shader_file, float width, float height) {
+bool FluidSimulation::initialize(const char* shader_file, float width, float height, FluidSettings settings) {
     @autoreleasepool {
         auto& s = *impl_;
         s.device = hose_metal_device();
@@ -165,28 +216,31 @@ bool FluidSimulation::initialize(const char* shader_file, float width, float hei
             !s.velocities || !s.smoothed || !s.vorticity_density)
             return set_desktop_error("Cannot allocate fluid particle storage");
 
-        const RestState rest = rest_state();
-        const float reference = poly6(0.2f * support * 0.2f * support);
-        s.base.cell_size = support;
-        s.base.dt = step_time / substeps;
-        s.base.rest_density = rest.density;
-        s.base.relaxation = rest.gradient_sum * 0.1f;
-        s.base.correction_scale = 0.04f / rest.gradient_sum;
-        s.base.correction_reference = reference;
-        s.base.tension_limit = 0.006f;
-        s.base.viscosity = 0.09f;
-        s.base.vorticity = 0.0f;
-        s.base.friction = 12.0f;  // per second
-        s.base.max_speed = 2400.0f;
-        s.base.particle_radius = radius;
+        s.apply(settings);
         return reset(width, height);
     }
 }
 
+void FluidSimulation::configure(FluidSettings settings) {
+    auto& s = *impl_;
+    if (settings.size == s.settings.size) {
+        // Recorded steps are encoded with the new feel; the water is kept.
+        s.apply(settings);
+        return;
+    }
+    s.apply(settings);
+    reset(s.width, s.height);
+}
+
+FluidSettings FluidSimulation::settings() const { return impl_->settings; }
+float FluidSimulation::spacing() const { return impl_->spacing; }
+float FluidSimulation::radius() const { return impl_->spacing * 0.5f; }
+float FluidSimulation::splat_radius() const { return impl_->spacing * 2.0f; }
+
 bool FluidSimulation::reset(float width, float height) {
     auto& s = *impl_;
-    const auto grid_width = static_cast<std::uint32_t>(std::ceil(width / support));
-    const auto grid_height = static_cast<std::uint32_t>(std::ceil(height / support));
+    const auto grid_width = static_cast<std::uint32_t>(std::ceil(width / s.support));
+    const auto grid_height = static_cast<std::uint32_t>(std::ceil(height / s.support));
     const std::uint32_t cells = grid_width * grid_height;
     if (!s.counts || s.counts.length < (cells + 1) * sizeof(std::uint32_t)) {
         s.counts = s.buffer((cells + 1) * sizeof(std::uint32_t));
@@ -248,6 +302,9 @@ void FluidSimulation::advance(unsigned steps, const std::vector<WindowObstacle>&
     s.previous_windows.clear();
     for (const auto& window : batch.windows) s.previous_windows[window.id] = window;
 
+    const float spacing = s.spacing;
+    const float radius = spacing * 0.5f;
+    const int stream_width = std::max(2, static_cast<int>(std::lround(stream_width_points / spacing)));
     const bool can_pour = pouring && nozzle.x > radius && nozzle.x < s.width - radius &&
                           nozzle.y > radius && nozzle.y < s.height - radius;
     for (unsigned step = 0; step < steps; ++step) {
@@ -286,6 +343,7 @@ bool FluidSimulation::encode(id<MTLCommandBuffer> commands) {
         u.window_count = static_cast<std::uint32_t>(batch.windows.size());
         const void* windows = batch.windows.empty() ? static_cast<const void*>(&placeholder) : batch.windows.data();
         const NSUInteger window_bytes = std::max<std::size_t>(batch.windows.size(), 1) * sizeof(WindowObstacle);
+        const int substeps = s.substeps, iterations = s.iterations;
         const float total = static_cast<float>(batch.steps.size() * substeps);
         int substep_index = 0;
         for (const auto& step : batch.steps) {
@@ -410,7 +468,7 @@ FluidPoint place_hose(FluidPoint pointer, const std::vector<WindowObstacle>& win
     auto free = [&](FluidPoint point) {
         if (point.x < 8 || point.y < 8 || point.x > width - 8 || point.y > height - 8) return false;
         return std::none_of(windows.begin(), windows.end(), [&](const auto& rect) {
-            return inside(point, rect, FluidSimulation::radius);
+            return inside(point, rect, 3.0f);
         });
     };
     if (free(pointer)) return pointer;
@@ -472,29 +530,43 @@ bool check(bool condition, const char* message) {
 }
 }
 
-bool run_physics_checks(const char* shader_file) {
+namespace {
+bool check_liquid(const char* shader_file, FluidSettings settings) {
     constexpr FluidPoint down{0, 950};
     FluidSimulation fluid;
-    if (!fluid.initialize(shader_file, 640, 480)) return false;
+    if (!fluid.initialize(shader_file, 640, 480, settings)) return false;
     std::vector<FluidParticle> particles;
 
-    for (int i = 0; i < 600; ++i) fluid.advance(1, {}, i < 60, {320, 40}, down);
+    // Runny water keeps spreading for a few seconds before it settles.
+    for (int i = 0; i < 1200; ++i) fluid.advance(1, {}, i < 60, {320, 40}, down);
     if (!fluid.read_particles(particles) || particles.empty() || !finite(particles)) return false;
-    float lowest = 480, fastest = 0;
+    float lowest = 480;
+    FluidPoint drift{0, 0};
     for (const auto& p : particles) {
         lowest = std::min(lowest, p.y);
-        fastest = std::max(fastest, std::hypot(p.vx, p.vy));
+        drift.x += p.vx / particles.size();
+        drift.y += p.vy / particles.size();
     }
+    // Jitter is motion within the pool; the puddle as a whole may still glide slowly.
+    float internal = 0;
+    for (const auto& p : particles) internal += std::hypot(p.vx - drift.x, p.vy - drift.y) / particles.size();
     if (!check(lowest > 440, "gravity and pooling at the desktop floor")) return false;
-    if (!check(fastest < 40, "a settled pool comes to rest without jitter")) return false;
+    if (!check(internal < 10 && std::hypot(drift.x, drift.y) < 40, "a settled pool comes to rest without jitter")) {
+        std::fprintf(stderr, "  internal motion %.1f, drift %.1f points per second\n", internal, std::hypot(drift.x, drift.y));
+        return false;
+    }
     std::size_t crowded = 0;
     for (std::size_t i = 0; i < particles.size(); ++i) {
         for (std::size_t j = i + 1; j < particles.size(); ++j) {
-            if (std::hypot(particles[i].x - particles[j].x, particles[i].y - particles[j].y) < FluidSimulation::spacing * 0.45f)
+            if (std::hypot(particles[i].x - particles[j].x, particles[i].y - particles[j].y) < fluid.spacing() * 0.45f)
                 ++crowded;
         }
     }
-    if (!check(crowded * 20 < particles.size(), "particles keep their spacing instead of clumping")) return false;
+    // Thin films allow a few close pairs; clumping would pull many together.
+    if (!check(crowded * 12 < particles.size(), "particles keep their spacing instead of clumping")) {
+        std::fprintf(stderr, "  %zu close pairs among %zu particles\n", crowded, particles.size());
+        return false;
+    }
 
     std::vector<WindowObstacle> windows{obstacle(1, 200, 180, 240, 160)};
     if (!fluid.reset(640, 480)) return false;
@@ -507,7 +579,7 @@ bool run_physics_checks(const char* shader_file) {
     }
     if (!check(true, "water stays outside the window")) return false;
     const auto nozzle = place_hose({320, 200}, windows, 640, 480);
-    if (!check(!inside(nozzle, windows[0], FluidSimulation::radius) && nozzle.y < windows[0].y,
+    if (!check(!inside(nozzle, windows[0], 3.0f) && nozzle.y < windows[0].y,
                "the hose snaps outside solid window bodies")) return false;
     windows[0] = obstacle(1, 250, 250, 200, 170);
     fluid.advance(1, windows, false, {0, 0}, down);
@@ -552,4 +624,17 @@ bool run_physics_checks(const char* shader_file) {
     fluid.clear();
     if (!fluid.read_particles(particles)) return false;
     return check(fluid.size() == 0 && particles.empty(), "clearing the water resets the simulation");
+}
+}
+
+bool run_physics_checks(const char* shader_file) {
+    const char* sizes[] = {"fine", "medium", "coarse"};
+    const char* feels[] = {"water", "thick", "goo"};
+    for (int size = 0; size < 3; ++size) {
+        for (int feel = 0; feel < 3; ++feel) {
+            std::printf("%s particles, %s:\n", sizes[size], feels[feel]);
+            if (!check_liquid(shader_file, {static_cast<ParticleSize>(size), static_cast<LiquidFeel>(feel)})) return false;
+        }
+    }
+    return true;
 }

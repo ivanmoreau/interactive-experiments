@@ -36,7 +36,7 @@ printf 'Building fluid application...\n'
 xcrun clang++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -mmacosx-version-min=14.0 \
     "$PROJECT_DIR/tools/probe_motion.cpp" -framework CoreFoundation -framework IOKit \
     -o "$BUILD_DIR/probe-motion"
-for source in desktop fluid_sim window_tracker; do
+for source in desktop fluid_sim window_tracker screen_capture; do
     xcrun clang++ -std=c++17 -O2 -g -fobjc-arc -Wall -Wextra -Wpedantic -Werror \
         -mmacosx-version-min=14.0 \
         -c "$PROJECT_DIR/src/$source.mm" -o "$BUILD_DIR/$source.o"
@@ -44,8 +44,9 @@ done
 xcrun clang++ -std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror \
     -mmacosx-version-min=14.0 \
     "$PROJECT_DIR/src/main.cpp" "$PROJECT_DIR/src/motion.cpp" "$PROJECT_DIR/src/displays.cpp" \
-    "$BUILD_DIR/desktop.o" "$BUILD_DIR/fluid_sim.o" "$BUILD_DIR/window_tracker.o" \
+    "$BUILD_DIR/desktop.o" "$BUILD_DIR/fluid_sim.o" "$BUILD_DIR/window_tracker.o" "$BUILD_DIR/screen_capture.o" \
     -framework AppKit -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics -framework ImageIO \
+    -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo \
     -o "$BUILD_DIR/fluid-hose"
 
 cp "$BUILD_DIR/fluid-hose" "$APP_DIR/Contents/MacOS/fluid-hose"

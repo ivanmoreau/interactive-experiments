@@ -1,5 +1,6 @@
 #pragma once
 #include "displays.h"
+#include "fluid_sim.h"
 #include "fluid_types.h"
 #include <string>
 #include <functional>
@@ -15,13 +16,20 @@ struct DesktopInput {
     bool tilt;
     bool reverse_tilt;
     DesktopDisplayID display;
+    FluidSettings fluid;
+    bool refraction;
+};
+struct FluidPreferences {
+    FluidSettings fluid;
+    bool refraction = false;
 };
 enum class TiltStatus { off, waiting, active, unavailable };
 
 const char* desktop_error();
 bool set_desktop_error(const char* format, ...);
 bool initialize_hose_desktop();
-HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader_file, bool continuous, bool tilt = false);
+HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader_file, bool continuous, bool tilt,
+                                   FluidSettings settings, bool refraction);
 void destroy_hose_renderer(HoseRenderer* renderer);
 void show_hose_window(HoseRenderer* renderer);
 void move_hose_window(HoseRenderer* renderer, const DesktopRect& canvas);
@@ -34,11 +42,17 @@ void set_hose_tilt_status(HoseRenderer* renderer, TiltStatus status);
 bool read_desktop_displays(std::vector<DesktopDisplay>& output);
 std::string saved_hose_display();
 void save_hose_display(const DesktopDisplay& display);
+FluidPreferences saved_hose_preferences();
+void save_hose_preferences(const FluidPreferences& preferences);
+// Starts, moves, or stops desktop capture for refraction and updates its menu status.
+void set_hose_refraction(HoseRenderer* renderer, bool enabled, const DesktopDisplay& display);
 void set_hose_displays(HoseRenderer* renderer, const std::vector<DesktopDisplay>& displays, DesktopDisplayID selected);
-class FluidSimulation;
 // Encodes the simulation's pending steps, then draws the water, in one command buffer.
 bool draw_hose_frame(HoseRenderer* renderer, FluidSimulation& simulation, SceneUniforms scene, bool& presented);
 // Renders a scripted scene offscreen over a synthetic desktop and writes a PNG.
-bool render_hose_snapshot(const char* shader_file, const char* output_file, float seconds);
+bool render_hose_snapshot(const char* shader_file, const char* output_file, float seconds, const FluidSettings& settings,
+                          bool refraction);
 bool smoke_test_hose_renderer(const char* shader_file);
 bool run_hose_window_checks(const char* shader_file);
+// Briefly captures the main display to confirm refraction can receive frames. Saves nothing.
+bool run_capture_check();

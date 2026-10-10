@@ -21,6 +21,9 @@ Or open `build/Fluid Hose.app` from this example folder in Finder.
 - When the pointer is over a solid window body, the nozzle snaps to the nearest available edge.
 - Use the **💧 menu-bar icon** to pour continuously, pause, clear the water, or quit.
 - Choose a monitor through **💧 → Display**. Names, sizes, and a checkmark identify the active display. Your choice is remembered for the next launch.
+- **💧 → Liquid** sets how the water moves: **Water** is runny and splashy, **Thick** flows slowly, and **Goo** clings and stretches. It applies to the water already on screen.
+- **💧 → Particle size** trades detail for volume. **Fine** gives the most detailed streams and drops; **Coarse** holds the most water. Changing the size clears the water.
+- **💧 → Refract the desktop** bends the desktop seen through the water, like a lens. It needs the Screen Recording permission; see [Refraction](#refraction).
 - **Use Mac tilt** changes gravity using laptop motion; **Reverse tilt left/right** flips the horizontal direction if needed.
 - **Ctrl+C** also quits when launched from Terminal.
 
@@ -28,6 +31,13 @@ For continuous pouring from launch:
 
 ```sh
 ./examples/fluid-hose/run.sh --pour
+```
+
+The liquid, particle size, and refraction choices are remembered. The defaults are fine water without refraction. They can also be chosen for a single launch:
+
+```sh
+./examples/fluid-hose/run.sh --liquid thick --size coarse
+./examples/fluid-hose/run.sh --refraction
 ```
 
 The app has no Dock icon or visible window frame. Its menu-bar icon provides the controls.
@@ -63,15 +73,33 @@ SkyLight is a private framework, so every symbol is resolved with `dlopen`/`dlsy
 
 ### Fluid simulation
 
-The solver ([src/fluid_solver.metal](src/fluid_solver.metal)) implements [position-based fluids](https://mmacklin.com/pbf_sig_preprint.pdf) in two dimensions. Each 120 Hz step runs four substeps. Each substep predicts positions under gravity, sorts particles into a grid of kernel-sized cells with a counting sort, and then runs two Jacobi iterations of the density constraint, with a small artificial-pressure term that prevents clumping. A slight negative-pressure allowance gives the water enough cohesion to form streams and drops. XSPH viscosity damps splashes. Particle state never leaves the GPU; the CPU records spawn rows and window positions, and [src/fluid_sim.mm](src/fluid_sim.mm) encodes the steps into the same command buffer as the frame's drawing.
+The solver ([src/fluid_solver.metal](src/fluid_solver.metal)) implements [position-based fluids](https://mmacklin.com/pbf_sig_preprint.pdf) in two dimensions. Each 120 Hz step runs several substeps. Each substep predicts positions under gravity, sorts particles into a grid of kernel-sized cells with a counting sort, and then runs two Jacobi iterations of the density constraint, with a small artificial-pressure term that prevents clumping. A slight negative-pressure allowance gives the water cohesion to form streams and drops, and XSPH viscosity damps motion between neighbours.
+
+The particle size sets the rest spacing: 3, 3.75, or 4.5 points. The kernel support, neighbour grid, and rest density are derived from it, and the stream stays about 16 points wide at any size. The liquid presets set viscosity, cohesion, surface friction, and substeps:
+
+| Liquid | XSPH viscosity | Cohesion (density deficit) | Friction | Substeps |
+| --- | ---: | ---: | ---: | ---: |
+| Water | 0.015 | 0.2% | 6 per second | 6 |
+| Thick | 0.09 | 0.6% | 12 per second | 4 |
+| Goo | 0.3 | 3% | 30 per second | 4 |
+
+Larger particles and high viscosity made the earlier version look like gel. Runny water uses low viscosity, little cohesion, and more substeps to stay stable without that damping. Particle state never leaves the GPU; the CPU records spawn rows and window positions, and [src/fluid_sim.mm](src/fluid_sim.mm) encodes the steps into the same command buffer as the frame's drawing.
 
 Windows are rounded-rectangle colliders. Each substep places a window partway between its position at the previous frame and its current position, so a dragged window sweeps through the water instead of teleporting. Collision pushes water out along the surface normal. Surfaces water rests on (window tops and the desktop floor) apply friction relative to the surface's own motion, so water on a moving window is carried with it, while water on window sides slides off. Particles trapped by overlapping windows, or by a window reaching past the screen edge, move to the nearest on-screen exit. A window that jumps more than 500 points in one frame, such as when it is minimized or restored, is treated as a teleport and does not fling water.
 
-Water is retained until you clear it. The capacity is 65,536 particles.
+Water is retained until you clear it. The capacity is 65,536 particles, which is about 510,000 square points of water with fine particles, or 1.15 million with coarse ones.
 
 ### Rendering
 
-Native Metal renders in two passes ([src/fluid.metal](src/fluid.metal)). Particle splats add coverage, foam, and speed into a floating-point field at point resolution, and a blit builds its mip chain. The surface pass then thresholds the field into a smooth surface, takes normals from a slightly blurred mip level, and estimates thickness from coarse levels. Thicker water absorbs more red and green light, so thin streams are pale and clear while deep pools turn a dark, more opaque blue. The surface also gets a specular highlight, a Fresnel rim, a bright meniscus along every edge that is strongest at the top of a pool, a faint glow under the surface, moving caustics inside deeper water, travelling ripples on the highlights, and white foam where fast water is thin and broken. The output uses premultiplied alpha. The desktop behind the overlay is not captured, so the water cannot refract it.
+Native Metal renders in two passes ([src/fluid.metal](src/fluid.metal)). Particle splats add coverage, foam, and speed into a floating-point field at point resolution, and a blit builds its mip chain. The surface pass then thresholds the field into a smooth surface, takes normals from a slightly blurred mip level, and estimates thickness from coarse levels. Thicker water absorbs more red and green light, so thin streams are pale and clear while deep pools turn a dark, more opaque blue. The surface also gets a specular highlight, a Fresnel rim, a bright meniscus along every edge that is strongest at the top of a pool, a faint glow under the surface, moving caustics inside deeper water, travelling ripples on the highlights, and white foam where fast water is thin and broken. The output uses premultiplied alpha.
+
+### Refraction
+
+With **Refract the desktop** on, [src/screen_capture.mm](src/screen_capture.mm) streams the selected display through [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) at its native resolution and up to 60 frames per second, excluding this app's own windows. Frames arrive as IOSurface-backed Metal textures through a `CVMetalTextureCache`; each frame stays alive until the GPU commands that sample it complete. The surface shader treats the water as a lens: it offsets its desktop lookup along the surface normal, more where the surface tilts and the water is deeper, and offsets red, green, and blue by slightly different amounts. Depth absorbs red light first, so pools tint toward cyan while the desktop stays visible through them. The surface also reflects a bright sky at grazing angles. Inside the water the overlay is opaque, because it draws the refracted desktop itself; the edges blend with the real desktop. Both the capture and the overlay use sRGB, so refracted pixels match their surroundings.
+
+Capture requires the Screen Recording permission. The first time refraction is turned on, macOS asks for it; after granting it in System Settings → Privacy & Security → Screen & System Audio Recording, relaunch the app. The menu status shows whether refraction is active or waiting for permission. Launched from Terminal, the permission belongs to the terminal app instead. The app bundle is signed ad hoc, so macOS may ask again after a rebuild. Captured frames are used only for drawing; they are not saved or sent anywhere.
+
+The refracted image lags the real desktop by about one or two frames, which shows when content scrolls behind the water. Capture runs whenever refraction is on. Without refraction, the shader tints and lights the water and lets the real desktop show through thinner water.
 
 The native view directly owns its [CAMetalLayer](https://developer.apple.com/documentation/quartzcore/cametallayer). [CAMetalDisplayLink](https://developer.apple.com/documentation/quartzcore/cametaldisplaylink) drives rendering on the AppKit main run loop, including while menus are open. Signals, menu quit, and the duration limit are also checked by a small timer so shutdown works when no drawable is available. AppKit termination returns through C++ cleanup, which stops the motion helper.
 
@@ -90,21 +118,26 @@ This is a 2D toy on **one selected display at a time**. Windows are solid rounde
 ./examples/fluid-hose/run.sh --probe
 ./examples/fluid-hose/run.sh --smoke-test
 ./examples/fluid-hose/run.sh --snapshot water.png
+./examples/fluid-hose/run.sh --snapshot refraction.png --refraction --duration 30
+./examples/fluid-hose/run.sh --capture-check
 ./examples/fluid-hose/run.sh --window-check
 "./examples/fluid-hose/build/Fluid Hose.app/Contents/MacOS/fluid-hose" --window-check
 ```
 
-- `--physics-check` runs the GPU solver without a window. It checks gravity and pooling, that a settled pool comes to rest, particle spacing, collision with rounded windows, hose placement, displacement by moving and overlapping windows, that a dragged window pushes water along, rotated tilt gravity, and clearing. It needs a Metal device but no desktop session.
+- `--physics-check` runs the GPU solver without a window, once for each particle size and liquid. It checks gravity and pooling, that a settled pool comes to rest without internal jitter, particle spacing, collision with rounded windows, hose placement, displacement by moving and overlapping windows, that a dragged window pushes water along, rotated tilt gravity, and clearing. It needs a Metal device but no desktop session.
 - `--motion-check` checks gravity projection, stale/invalid data, and helper transport/shutdown using synthetic data without opening sensors. Fluid response to rotated gravity is part of `--physics-check`.
 - `--display-check` checks saved selection, disconnect fallback, reconnect with changed native IDs, and conversion between AppKit and Quartz coordinates without requiring graphics access.
 - Interactive display switching requires a normal desktop session; `--list-displays` enumerates the screens without creating an overlay.
 - `--probe` prints desktop bounds, the window tracking mode, and each window collider with its corner radius, without launching the overlay.
-- `--snapshot FILE.png` simulates a scripted scene offscreen (a stream pouring onto one window while a second window slides into the pool) and writes it over a synthetic desktop. `--duration` sets the simulated seconds; the default is 8. It is useful for tuning the solver and shaders without a live desktop.
+- `--snapshot FILE.png` simulates a scripted scene offscreen (a stream pouring onto one window while a second window slides into the pool) and writes it over a synthetic desktop. `--duration` sets the simulated seconds; the default is 8. `--size` and `--liquid` select the preset; `--refraction` uses the synthetic desktop, which has grid lines, rings, and text-like rows, as the refracted image. It is useful for tuning the solver and shaders without a live desktop.
+- `--capture-check` captures the main display briefly and reports the size of the first frame received; it saves nothing. It requires the Screen Recording permission.
 - `--smoke-test` checks that splats merge into a translucent, premultiplied water surface on transparent background pixels without creating a window.
 - `--window-check` briefly shows a native overlay on each connected display. It checks actual WindowServer bounds, Metal drawable dimensions and frame delivery, display switching, menu actions, and transparent, click-through, non-focusing window settings. It requires a live desktop, does not save a display preference, and does not open sensors. Physical monitor disconnection and manual mouse interaction remain interactive checks.
 - `--duration 10` runs the overlay for ten seconds and exits.
 
 On October 9, 2026, after the GPU solver and window tracking were added, the hose was built with only the Command Line Tools (runtime shader compilation) on an Apple M3 Pro running macOS 14.3. `--physics-check`, `--display-check`, `--motion-check`, the helper self-test and lifetime check, `--smoke-test`, code signing, and bundled-dependency checks passed. `--probe` reported live WindowServer tracking, and a pouring launch with `--duration` exited cleanly. SkyLight move notifications were confirmed to arrive for every move of another process's window. `--window-check` crashes inside `CAMetalDisplayLink` on this macOS 14.3 machine; the commit before these changes crashes the same way, so the crash is not caused by them. Visual results were checked with `--snapshot`. Live window dragging, rendering on a Retina display, and the macOS 26 corner-radius path still need checking interactively.
+
+After the liquid presets, particle sizes, and refraction were added, the same machine passed `--physics-check` across all nine size and liquid combinations in ten consecutive runs, plus `--smoke-test`, `--display-check`, `--motion-check`, code signing, and bundled-dependency checks. A launch with saved preferences exited cleanly. Refraction was checked with `--snapshot --refraction`. `--capture-check` could not run there because that process lacked the Screen Recording permission, so live capture and refraction still need checking on a desktop where the permission is granted.
 
 ## Motion sensor probe
 
@@ -145,13 +178,15 @@ The lifecycle check force-kills a test owner and verifies the mock reader stops 
 
 ## Performance — October 9, 2026
 
-GPU time per 120 Hz step on an Apple M3 Pro, measured with Metal command-buffer timestamps. The benchmark uses a 1440 × 900 point canvas, seeds water by sweeping the nozzle across it, lets it settle, then times 240 steps, each in its own command buffer. CPU encoding, rendering, and window tracking are excluded.
+GPU time per 120 Hz step on an Apple M3 Pro with the default fine water (six substeps), measured with Metal command-buffer timestamps. The benchmark uses a 1440 × 900 point canvas, seeds water by sweeping the nozzle across it, lets it settle, then times 240 steps, each in its own command buffer. CPU encoding, rendering, desktop capture, and window tracking are excluded.
 
 | Particles | No windows median | 1 window median | 12 windows median | 12 windows p95 | Budget used (12 windows) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4,096 | 0.34 ms | 0.35 ms | 0.38 ms | 0.40 ms | 4.7% |
-| 16,384 | 0.63 ms | 0.69 ms | 0.80 ms | 0.83 ms | 9.6% |
-| 65,536 | 1.88 ms | 1.90 ms | 2.56 ms | 2.88 ms | 31.3% |
+| 4,080 | 0.75 ms | 0.75 ms | 0.80 ms | 0.82 ms | 9.5% |
+| 16,370 | 1.14 ms | 1.16 ms | 1.31 ms | 1.34 ms | 15.7% |
+| 65,520 | 3.01 ms | 3.05 ms | 3.46 ms | 3.51 ms | 41.4% |
+
+Thick and goo use four substeps, so they cost about two thirds as much. A trial capacity of 131,072 fine particles took 7.0 ms per step with 12 windows, 84% of the budget before rendering, so the capacity stays at 65,536.
 
 The previous CPU solver needed about 10 ms per step for 8,000 particles on an M1 Pro, which exceeded the 8.33 ms step budget. Its benchmarks and the neighbor-cache comparison tool remain in the Git history (commit `58eba65`). Rendering cost is not yet measured; the splat pass runs at point resolution, so a 2× Retina display shades a quarter of its pixels there.
 
@@ -166,10 +201,11 @@ Raw results: [benchmarks/2026-10-09-gpu-solver.csv](benchmarks/2026-10-09-gpu-so
 ## Code
 
 - [src/main.cpp](src/main.cpp): command-line options and the fixed-step frame loop.
-- [src/fluid_sim.mm](src/fluid_sim.mm): solver setup and tuning, step recording and encoding, hose placement, and physics checks.
+- [src/fluid_sim.mm](src/fluid_sim.mm): particle sizes and liquid presets, step recording and encoding, hose placement, and physics checks.
 - [src/fluid_solver.metal](src/fluid_solver.metal): position-based fluid compute kernels and rounded-window collision.
 - [src/window_tracker.mm](src/window_tracker.mm): live window tracking through SkyLight notifications, with a polling fallback.
-- [src/desktop.mm](src/desktop.mm): AppKit application lifecycle and display link, native overlay window, display metadata, Option-key state, menu-bar controls, Metal rendering, and offscreen snapshots.
+- [src/desktop.mm](src/desktop.mm): AppKit application lifecycle and display link, native overlay window, display metadata, Option-key state, menu-bar controls and saved preferences, Metal rendering, and offscreen snapshots.
+- [src/screen_capture.mm](src/screen_capture.mm): ScreenCaptureKit desktop capture for refraction.
 - [src/fluid.metal](src/fluid.metal): particle splats, water surface shading, and the nozzle.
 - [src/fluid_types.h](src/fluid_types.h): shared CPU/GPU data layouts.
 - [tools/probe_motion.cpp](tools/probe_motion.cpp): SPU motion sensor activation and live sample diagnostics.

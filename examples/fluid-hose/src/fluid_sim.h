@@ -15,14 +15,20 @@ id<MTLCommandQueue> hose_metal_queue();
 id<MTLLibrary> hose_shader_library(const char* path);
 #endif
 
+// Particle size trades detail for how much water the capacity holds.
+enum class ParticleSize : int { fine, medium, coarse };
+// How the liquid moves: runny water, a thicker liquid, or slow goo.
+enum class LiquidFeel : int { water, thick, goo };
+struct FluidSettings {
+    ParticleSize size = ParticleSize::fine;
+    LiquidFeel feel = LiquidFeel::water;
+};
+
 // GPU position-based fluid. Steps are recorded on the CPU and encoded into the
 // next command buffer; particle state stays on the GPU.
 class FluidSimulation {
 public:
     static constexpr std::uint32_t capacity = 65536;
-    static constexpr float spacing = 4.5f;  // rest distance between particle centres, in points
-    static constexpr float radius = spacing * 0.5f;
-    static constexpr float splat_radius = spacing * 2.0f;  // rendered footprint of one particle
     static constexpr float step_time = 1.0f / 120.0f;
     static constexpr std::size_t max_windows = 64;
 
@@ -31,7 +37,13 @@ public:
     FluidSimulation(const FluidSimulation&) = delete;
     FluidSimulation& operator=(const FluidSimulation&) = delete;
 
-    bool initialize(const char* shader_file, float width, float height);
+    bool initialize(const char* shader_file, float width, float height, FluidSettings settings = {});
+    // Changing the particle size removes all water; the feel applies to the existing water.
+    void configure(FluidSettings settings);
+    FluidSettings settings() const;
+    float spacing() const;       // rest distance between particle centres, in points
+    float radius() const;        // collision radius
+    float splat_radius() const;  // rendered footprint of one particle
     // Resizes the canvas and removes all water.
     bool reset(float width, float height);
     void clear();
