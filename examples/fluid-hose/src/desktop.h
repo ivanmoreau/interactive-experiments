@@ -26,6 +26,7 @@ struct DesktopInput {
     bool remove_fish;
     unsigned feed;       // pinches of food requested from the menu
     bool sprinkling;     // Control is held: food falls from the pointer
+    bool show_brain;     // the fish brain window is wanted
 };
 struct FluidPreferences {
     FluidSettings fluid;
@@ -49,6 +50,8 @@ const char* hose_device_name(const HoseRenderer* renderer);
 DesktopInput poll_desktop_input(HoseRenderer* renderer, const DesktopRect& canvas);
 void set_hose_tilt_status(HoseRenderer* renderer, TiltStatus status);
 void set_hose_fish_status(HoseRenderer* renderer, const FishStatus& status);
+// Ticks or unticks Show fish brain, for when its window is closed directly.
+void set_hose_brain_shown(HoseRenderer* renderer, bool shown);
 bool read_desktop_displays(std::vector<DesktopDisplay>& output);
 std::string saved_hose_display();
 void save_hose_display(const DesktopDisplay& display);

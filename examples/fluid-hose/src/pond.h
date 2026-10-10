@@ -61,6 +61,8 @@ public:
     // Multiplies how fast fish get hungry and run out of air (for checks).
     void set_metabolism(float hunger, float breath = 1);
     FishStatus fish_status() const;
+    // A fish's brain, for watching it think; null past the last fish.
+    const class FishBrain* fish_brain(std::size_t index) const;
     std::vector<FishVitals> fish_vitals() const;
 
     // Sets the windows' positions for this frame; steps move them there

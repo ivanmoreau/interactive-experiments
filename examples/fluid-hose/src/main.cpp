@@ -3,6 +3,8 @@
 #include "motion.h"
 #include "window_tracker.h"
 #include "pond.h"
+#include "brain_view.h"
+#include "fish_brain.h"
 #include <random>
 #include <mach-o/dyld.h>
 #include <algorithm>
@@ -70,6 +72,8 @@ int main(int argc, char** argv) {
         bool duck_check = false;
         unsigned initial_fish = 0;
         bool fish_check = false;
+        std::string brain_snapshot;
+        bool show_brain = false;
         bool capture_check = false;
         unsigned display_number = 0;
         unsigned duration = 0;
@@ -90,6 +94,8 @@ int main(int argc, char** argv) {
             else if (argument == "--refraction") refraction_option = true;
             else if (argument == "--duck-check") duck_check = true;
             else if (argument == "--fish-check") fish_check = true;
+            else if (argument == "--brain-snapshot" && i + 1 < argc) brain_snapshot = argv[++i];
+            else if (argument == "--brain") show_brain = true;
             else if (argument == "--fish" && i + 1 < argc) {
                 const char* value = argv[++i];
                 const auto result = std::from_chars(value, value + std::strlen(value), initial_fish);
@@ -136,10 +142,10 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("--duration requires a positive integer number of seconds");
             } else if (argument == "--help") {
                 std::puts("Fluid Hose\nUsage: fluid-hose [--pour] [--tilt] [--display NUMBER] [--duration SECONDS]\n"
-                          "                  [--size fine|medium|coarse] [--liquid water|thick|goo] [--refraction] [--flow RATE] [--ducks N] [--fish N]\n"
+                          "                  [--size fine|medium|coarse] [--liquid water|thick|goo] [--refraction] [--flow RATE] [--ducks N] [--fish N] [--brain]\n"
                           "                  "
                           "[--list-displays | --probe | --physics-check | --motion-check | --display-check | --smoke-test | --window-check |\n"
-                          " --snapshot FILE.png | --capture-check | --duck-check | --fish-check]\n"
+                          " --snapshot FILE.png | --brain-snapshot FILE.png | --capture-check | --duck-check | --fish-check]\n"
                           "Hold Option to pour at the mouse pointer. Release Option to stop.\n"
                           "The overlay lets clicks pass through: arrange windows normally.\n"
                           "Use the droplet menu in the menu bar to pour continuously, pause, clear, or quit.\n"
@@ -152,6 +158,8 @@ int main(int argc, char** argv) {
                           "--ducks drops rubber ducks at launch; the droplet menu adds and removes them too.\n"
                           "--fish drops fish at launch. They need water to breathe and food to live:\n"
                           "hold Control to sprinkle food at the pointer, or use Feed the fish in the droplet menu.\n"
+                          "Show fish brain in the droplet menu (or --brain) opens a window of a fish's neurons firing.\n"
+                          "--brain-snapshot draws that window for a hungry fish that sees food and is startled.\n"
                           "--flow sets how fast the nozzle pours, from 0.25 to 3; Option+scroll changes it while running.\n"
                           "--refraction bends the desktop seen through the water; it needs the Screen Recording permission.\n"
                           "--snapshot renders a scripted scene offscreen to a PNG (--duration sets its length).");
@@ -169,6 +177,24 @@ int main(int argc, char** argv) {
         }
         if (duck_check) {
             require(run_duck_checks(shaders.c_str()), "Check rubber ducks");
+            return 0;
+        }
+        if (!brain_snapshot.empty()) {
+            require(initialize_hose_desktop(), "Initialize AppKit");
+            // A hungry fish watching food above it, startled at the end.
+            FishBrain brain(7);
+            FishSenses senses;
+            senses.hunger = 0.7f;
+            senses.prey[11] = 0.8f;
+            senses.prey[12] = 0.4f;
+            FishBout bout;
+            for (int i = 0; i < 240; ++i) brain.advance(senses, 1.0f / 120, bout);
+            senses.looming[1] = senses.looming[2] = 1.0f;
+            for (int i = 0; i < 4; ++i) brain.advance(senses, 1.0f / 120, bout);
+            require(BrainWindow::snapshot(brain, "Fish 1 of 1", "hungry · hunting food above · startled from below", brain_snapshot.c_str()),
+                    "Draw the fish brain");
+            std::printf("Brain snapshot: %zu neurons, %zu synapses -> %s\n", brain.neuron_count(), brain.synapse_count(),
+                        brain_snapshot.c_str());
             return 0;
         }
         if (fish_check) {
@@ -234,6 +260,7 @@ int main(int argc, char** argv) {
         app.renderer = require(create_hose_renderer(canvas, shaders.c_str(), continuous, tilt_enabled,
                                                     preferences.fluid, preferences.refraction, preferences.flow), "Create fluid overlay");
         set_hose_displays(app.renderer, displays, active_display.id);
+        if (show_brain) set_hose_brain_shown(app.renderer, true);
         if (display_number) save_hose_display(active_display);
         show_hose_window(app.renderer);
         std::printf("Backend: AppKit + native Metal\nDevice: %s\nHold Option to pour; use the droplet menu to clear or quit.\n",
@@ -266,6 +293,10 @@ int main(int argc, char** argv) {
         for (unsigned i = 0; i < initial_ducks; ++i) pond.add_duck(drop_point());
         for (unsigned i = 0; i < initial_fish; ++i) pond.add_fish(drop_point());
         float sprinkle_wait = 0;
+        BrainWindow brain_window;
+        bool brain_shown = false;
+        std::size_t watched_fish = 0;
+        float brain_wait = 0;
         std::vector<BodySample> body_water;
         TiltGravity tilt;
         bool requested_tilt = false;
@@ -362,6 +393,36 @@ int main(int argc, char** argv) {
             }
             pond.set_pointer(input.pointer);
             set_hose_fish_status(app.renderer, pond.fish_status());
+            // The brain window follows the menu, and unticks it when closed.
+            if (input.show_brain != brain_shown) {
+                brain_shown = input.show_brain;
+                if (brain_shown) brain_window.show();
+                else brain_window.hide();
+            } else if (brain_shown && !brain_window.visible()) {
+                brain_shown = false;
+                set_hose_brain_shown(app.renderer, false);
+            }
+            brain_wait -= delta;
+            if (brain_shown) {
+                watched_fish += brain_window.take_clicks();
+                if (brain_wait <= 0) {
+                    brain_wait = 1.0f / 30;
+                    const auto vitals = pond.fish_vitals();
+                    if (vitals.empty()) brain_window.update_empty("No fish yet. Add one from the droplet menu.");
+                    else {
+                        watched_fish %= vitals.size();
+                        const auto& fish = vitals[watched_fish];
+                        char status[160];
+                        std::snprintf(status, sizeof(status), "%s · energy %.0f%% · air %.0f%% · %u flakes eaten%s",
+                                      !fish.alive ? "dead" : !fish.in_water ? "out of water!" :
+                                      fish.hunting > 0.3f ? "hunting" : "exploring",
+                                      fish.energy * 100, fish.oxygen * 100, fish.meals,
+                                      fish.escapes ? (" · " + std::to_string(fish.escapes) + " escapes").c_str() : "");
+                        brain_window.update(*pond.fish_brain(watched_fish),
+                                            "Fish " + std::to_string(watched_fish + 1) + " of " + std::to_string(vitals.size()), status);
+                    }
+                }
+            }
             const auto nozzle = place_hose(input.pointer, obstacles, static_cast<float>(canvas.w), static_cast<float>(canvas.h));
             const bool in_canvas = nozzle.x > 0 && nozzle.y > 0 && nozzle.x < canvas.w && nozzle.y < canvas.h;
             const bool pouring = input.pouring && in_canvas && !input.paused;

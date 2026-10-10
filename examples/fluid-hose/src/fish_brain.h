@@ -58,6 +58,23 @@ public:
     struct Rate { const char* name; float hertz; };
     std::vector<Rate> rates() const;  // each population's recent firing rate
 
+    // For drawing the brain: each population's place on a side view of a
+    // larval zebrafish brain (0 to 1, snout to the left, top up), the kind of
+    // circuit it belongs to, its neurons, and its recent firing rate.
+    enum class Circuit { sense, decide, move, drive };
+    struct Area {
+        const char* name;
+        const char* label;  // short, for the diagram
+        std::size_t first, size;
+        float x, y;
+        Circuit circuit;
+        bool topographic;  // neurons ordered by the direction they respond to
+        float hertz;
+    };
+    std::vector<Area> layout() const;
+    // Each neuron's recent spikes, decaying over about 0.1 s.
+    const std::vector<float>& activity() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

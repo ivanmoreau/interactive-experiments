@@ -100,6 +100,42 @@ const Population populations[population_count] = {
     {"strike", 6, 0.2f, 0.2f, 0, 1},
 };
 
+// Where each population sits on the brain diagram, a short label, and what
+// it does.
+struct Place { float x, y; const char* label; FishBrain::Circuit circuit; bool topographic; };
+using C = FishBrain::Circuit;
+const Place places[population_count] = {
+    {0.10f, 0.56f, "retina", C::sense, true},
+    {0.40f, 0.24f, "tectum", C::sense, true},
+    {0.40f, 0.38f, "tectal inhib.", C::sense, false},
+    {0.25f, 0.38f, "strike zone", C::sense, false},
+    {0.58f, 0.18f, "looming", C::sense, true},
+    {0.93f, 0.16f, "lateral line", C::sense, false},
+    {0.64f, 0.47f, "Mauthner (back)", C::move, false},
+    {0.64f, 0.58f, "Mauthner (belly)", C::move, false},
+    {0.74f, 0.66f, "escape inhib.", C::move, false},
+    {0.22f, 0.84f, "hunger", C::drive, false},
+    {0.34f, 0.87f, "satiety", C::drive, false},
+    {0.27f, 0.54f, "hunting", C::decide, false},
+    {0.39f, 0.54f, "vergence", C::move, false},
+    {0.72f, 0.40f, "turning L", C::decide, false},
+    {0.82f, 0.40f, "turning R", C::decide, false},
+    {0.72f, 0.21f, "inhib. L", C::decide, false},
+    {0.82f, 0.21f, "inhib. R", C::decide, false},
+    {0.51f, 0.34f, "tilt up", C::sense, false},
+    {0.58f, 0.34f, "tilt down", C::sense, false},
+    {0.50f, 0.48f, "blocked up", C::sense, false},
+    {0.50f, 0.59f, "blocked down", C::sense, false},
+    {0.50f, 0.70f, "blocked ahead", C::sense, false},
+    {0.94f, 0.80f, "hypoxia", C::drive, false},
+    {0.85f, 0.52f, "steer up", C::move, false},
+    {0.85f, 0.67f, "steer down", C::move, false},
+    {0.95f, 0.56f, "reverse", C::move, false},
+    {0.63f, 0.78f, "swim speed", C::move, false},
+    {0.94f, 0.32f, "bout generator", C::move, false},
+    {0.38f, 0.70f, "strike", C::move, false},
+};
+
 struct Synapse { std::uint16_t target; float weight; };
 }
 
@@ -375,6 +411,17 @@ std::vector<FishBrain::Rate> FishBrain::rates() const {
     for (int p = 0; p < population_count; ++p) result.push_back({populations[p].name, impl_->rate[p]});
     return result;
 }
+
+std::vector<FishBrain::Area> FishBrain::layout() const {
+    std::vector<Area> result;
+    for (int p = 0; p < population_count; ++p)
+        result.push_back({populations[p].name, places[p].label, static_cast<std::size_t>(impl_->first[p]),
+                          static_cast<std::size_t>(populations[p].size),
+                          places[p].x, places[p].y, places[p].circuit, places[p].topographic, impl_->rate[p]});
+    return result;
+}
+
+const std::vector<float>& FishBrain::activity() const { return impl_->trace; }
 
 bool FishBrain::advance(const FishSenses& senses, float dt, FishBout& bout) {
     auto& s = *impl_;

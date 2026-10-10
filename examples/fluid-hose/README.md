@@ -23,7 +23,7 @@ Or open `build/Fluid Hose.app` from this example folder in Finder.
 - Choose a monitor through **💧 → Display**. Names, sizes, and a checkmark identify the active display. Your choice is remembered for the next launch.
 - **Option+scroll** while pouring changes the flow, from a slow drip (0.25×) to a strong jet (3×); **💧 → Flow** shows the current rate and offers presets. The nozzle's opening widens and brightens with the flow. With the Accessibility permission (System Settings → Privacy & Security → Accessibility), the scroll is consumed so the window under the pointer does not also scroll; without it, that window scrolls too.
 - **💧 → Add rubber duck 🦆** drops a duck from a random point along the top of the screen; **Remove ducks** takes them all away. Clearing the water leaves the ducks. Up to 32 ducks fit.
-- **💧 → Add fish 🐟** drops a fish the same way, so pour some water first. **Hold Control** to sprinkle food from the pointer, or use **💧 → Feed the fish** to drop a pinch above one. A status line under **Remove fish** says how they are doing: happy, hungry, starving, out of water, or dead. See [Fish](#fish). Up to 8 fish fit.
+- **💧 → Add fish 🐟** drops a fish the same way, so pour some water first. **Hold Control** to sprinkle food from the pointer, or use **💧 → Feed the fish** to drop a pinch above one. A status line under **Remove fish** says how they are doing: happy, hungry, starving, out of water, or dead. **Show fish brain** opens a window of a fish's neurons firing; click it to watch the next fish. See [Fish](#fish). Up to 8 fish fit.
 - **💧 → Liquid** sets how the water moves: **Water** is runny and splashy, **Thick** flows slowly, and **Goo** clings and stretches. It applies to the water already on screen.
 - **💧 → Particle size** trades detail for volume. **Fine** gives the most detailed streams and drops; **Coarse** holds the most water. Changing the size clears the water.
 - **💧 → Refract the desktop** bends the desktop seen through the water, like a lens. It needs the Screen Recording permission; see [Refraction](#refraction).
@@ -43,7 +43,7 @@ The flow, liquid, particle size, and refraction choices are remembered. The defa
 ./examples/fluid-hose/run.sh --refraction
 ./examples/fluid-hose/run.sh --flow 2
 ./examples/fluid-hose/run.sh --ducks 5
-./examples/fluid-hose/run.sh --fish 3
+./examples/fluid-hose/run.sh --fish 3 --brain
 ```
 
 The app has no Dock icon or visible window frame. Its menu-bar icon provides the controls.
@@ -139,6 +139,10 @@ Food flakes are small Jolt bodies that pass through ducks and fish but rest on w
 
 Fish start moderately hungry, and nothing is saved between launches: each launch starts a new pond.
 
+**Show fish brain** (or `--brain`) opens a floating window, drawn by [src/brain_view.mm](src/brain_view.mm), with every neuron of one fish as a dot on a side view of a larval zebrafish brain, snout to the left. Each population sits roughly where its counterpart does in a real larva: retina in the eye, the tectum's dome over the midbrain, hunger and satiety in the hypothalamus below, and the Mauthner cells, turning region, and swim commands in the hindbrain. Direction-mapped populations (retina, tectum, looming) are laid out in order around an arc, so the part facing the food or the threat lights up. Dots glow with each neuron's spikes over the last tenth of a second and are coloured by role: senses, decisions, movement, and hunger and breath. The header gives the fish's state, energy, air, meals, and escapes; clicking moves to the next fish. `--brain-snapshot FILE.png` draws the window offscreen for a hungry fish watching food that is then startled.
+
+![The fish brain window](docs/fish-brain.png)
+
 ### Rendering
 
 Native Metal renders in two passes ([src/fluid.metal](src/fluid.metal)). Particle splats add coverage, foam, and speed into a floating-point field at point resolution. A separable Gaussian blur, with a sigma of 60% of a splat radius, then smooths the field so the surface follows the water's shape instead of bumps a few particles wide, and a blit builds its mip chain. The surface pass thresholds the smoothed field and estimates thickness from coarse levels. Normals come from a height that rises only across the surface band, so highlights sit on the visible edge rather than on a second line inside the water; deeper inside they come from coarser levels, so the interior refracts like calm water. Field lookups are clamped a little inside the screen edges, so water resting against the floor or a side wall continues past the edge instead of drawing a bright false surface there. Thicker water absorbs more red and green light, so thin streams are pale and clear while deep pools turn a dark, more opaque blue. The surface also gets a specular highlight, a Fresnel rim, a bright meniscus along every edge that is strongest at the top of a pool, a faint glow under the surface, moving caustics inside deeper water, travelling ripples on the highlights, and white foam where fast water is thin and broken. The output uses premultiplied alpha.
@@ -181,6 +185,7 @@ This is a 2D toy on **one selected display at a time**. Windows are solid rounde
 - `--display-check` checks saved selection, disconnect fallback, reconnect with changed native IDs, and conversion between AppKit and Quartz coordinates without requiring graphics access.
 - Interactive display switching requires a normal desktop session; `--list-displays` enumerates the screens without creating an overlay.
 - `--probe` prints desktop bounds, the window tracking mode, and each window collider with its corner radius, without launching the overlay.
+- `--brain-snapshot FILE.png` draws the fish brain window offscreen, without a desktop session; it only needs AppKit.
 - `--snapshot FILE.png` simulates a scripted scene offscreen (a stream pouring onto one window while a second window slides into the pool) and writes it over a synthetic desktop. `--ducks` and `--fish` add ducks and fish; fish are fed during the last few seconds. `--duration` sets the simulated seconds; the default is 8. `--size` and `--liquid` select the preset; `--refraction` uses the synthetic desktop, which has grid lines, rings, and text-like rows, as the refracted image. It is useful for tuning the solver and shaders without a live desktop.
 - `--duck-check` couples Jolt and the GPU fluid headlessly. It checks that a dry duck lands on and rests on a window, that dragging the window carries the duck, that a duck dropped into a pool floats at the surface and stays level, and that it falls to the floor when the water is cleared.
 - `--fish-check` first checks the brain alone, for six wiring seeds: that an idle fish swims in regular bouts and turns around every so often, levels out when tilted, hunts food it sees, turns its eyes in while hunting, turns around for food behind it, strikes at food in front of its mouth, ignores food when full, escapes a looming threat within 0.15 s by turning away (including one from straight behind), stops escaping from a threat repeated from one direction but still escapes one from a new direction or after a rest, and thrashes when suffocating. It then couples brain, Jolt, and the GPU fluid in a pool: the fish swims around, stays in the water and roughly level, finds and eats sprinkled flakes, darts away from a rushing pointer, starves when its metabolism is sped up, floats up when dead, and flops about and suffocates when stranded on a dry floor.
@@ -265,7 +270,8 @@ Raw results: [benchmarks/2026-10-09-gpu-solver.csv](benchmarks/2026-10-09-gpu-so
 - [src/desktop.mm](src/desktop.mm): AppKit application lifecycle and display link, native overlay window, display metadata, Option-key state, menu-bar controls and saved preferences, Metal rendering, and offscreen snapshots.
 - [src/screen_capture.mm](src/screen_capture.mm): ScreenCaptureKit desktop capture for refraction.
 - [src/pond.cpp](src/pond.cpp): the Jolt Physics pond: rubber ducks, fish bodies, senses, bouts, eating, breathing, food flakes, window and wall bodies, buoyancy and drag, and the duck and fish checks.
-- [src/fish_brain.cpp](src/fish_brain.cpp): the fish's spiking brain, its motor readout, and the brain checks.
+- [src/fish_brain.cpp](src/fish_brain.cpp): the fish's spiking brain, its motor readout, its diagram layout, and the brain checks.
+- [src/brain_view.mm](src/brain_view.mm): the floating fish brain window and its offscreen snapshot.
 - [tools/build-jolt.sh](tools/build-jolt.sh): builds the pinned Jolt Physics submodule into a cached static library.
 - [src/fluid.metal](src/fluid.metal): particle splats, field smoothing, duck, fish, and food drawing, water surface shading, and the nozzle.
 - [src/fluid_types.h](src/fluid_types.h): shared CPU/GPU data layouts.

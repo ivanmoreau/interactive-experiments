@@ -703,6 +703,10 @@ FishStatus Pond::fish_status() const {
     return status;
 }
 
+const FishBrain* Pond::fish_brain(std::size_t index) const {
+    return index < impl_->fish.size() ? &impl_->fish[index].brain : nullptr;
+}
+
 std::vector<FishVitals> Pond::fish_vitals() const {
     std::vector<FishVitals> result;
     for (const auto& f : impl_->fish)

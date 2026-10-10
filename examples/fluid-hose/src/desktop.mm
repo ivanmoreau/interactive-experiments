@@ -107,6 +107,8 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 @property(nonatomic) NSInteger fishRequests;
 @property(nonatomic) NSInteger feedRequests;
 @property(nonatomic) BOOL removeFishRequested;
+@property(nonatomic) BOOL showBrain;
+@property(nonatomic, strong) NSMenuItem* brainItem;
 @property(nonatomic, strong) NSMenuItem* flowItem;
 @property(nonatomic, strong) NSMenu* flowMenu;
 @property(nonatomic) CFMachPortRef scrollTap;
@@ -128,6 +130,7 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 - (void)addFish:(NSMenuItem*)sender;
 - (void)feedFish:(NSMenuItem*)sender;
 - (void)removeFish:(NSMenuItem*)sender;
+- (void)toggleBrain:(NSMenuItem*)sender;
 - (void)adjustFlowByScroll:(double)points;
 - (void)updateFlowMenu;
 @end
@@ -172,6 +175,10 @@ static const double flow_presets[] = {0.25, 0.5, 1.0, 1.5, 2.0, 3.0};
 - (void)addFish:(NSMenuItem*)sender { (void)sender; self.fishRequests += 1; }
 - (void)feedFish:(NSMenuItem*)sender { (void)sender; self.feedRequests += 1; }
 - (void)removeFish:(NSMenuItem*)sender { (void)sender; self.removeFishRequested = YES; }
+- (void)toggleBrain:(NSMenuItem*)sender {
+    self.showBrain = !self.showBrain;
+    sender.state = self.showBrain ? NSControlStateValueOn : NSControlStateValueOff;
+}
 - (void)selectFlow:(NSMenuItem*)sender {
     self.flowRate = flow_presets[sender.tag];
     [self updateFlowMenu];
@@ -551,6 +558,10 @@ HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader
         NSMenuItem* no_fish = [[NSMenuItem alloc] initWithTitle:@"Remove fish" action:@selector(removeFish:) keyEquivalent:@""];
         no_fish.target = renderer->controls;
         [menu addItem:no_fish];
+        NSMenuItem* brain = [[NSMenuItem alloc] initWithTitle:@"Show fish brain" action:@selector(toggleBrain:) keyEquivalent:@""];
+        brain.target = renderer->controls;
+        renderer->controls.brainItem = brain;
+        [menu addItem:brain];
         renderer->fish_status = [[NSMenuItem alloc] initWithTitle:@"No fish" action:nil keyEquivalent:@""];
         renderer->fish_status.enabled = NO;
         [menu addItem:renderer->fish_status];
@@ -767,7 +778,8 @@ DesktopInput poll_desktop_input(HoseRenderer* renderer, const DesktopRect& canva
                            static_cast<bool>(renderer->controls.removeDucksRequested),
                            static_cast<unsigned>(renderer->controls.fishRequests),
                            static_cast<bool>(renderer->controls.removeFishRequested),
-                           static_cast<unsigned>(renderer->controls.feedRequests), control};
+                           static_cast<unsigned>(renderer->controls.feedRequests), control,
+                           static_cast<bool>(renderer->controls.showBrain)};
         renderer->controls.duckRequests = 0;
         renderer->controls.fishRequests = 0;
         renderer->controls.feedRequests = 0;
@@ -777,6 +789,11 @@ DesktopInput poll_desktop_input(HoseRenderer* renderer, const DesktopRect& canva
         renderer->controls.requestedDisplay = 0;
         return input;
     }
+}
+
+void set_hose_brain_shown(HoseRenderer* renderer, bool shown) {
+    renderer->controls.showBrain = shown;
+    renderer->controls.brainItem.state = shown ? NSControlStateValueOn : NSControlStateValueOff;
 }
 
 void set_hose_fish_status(HoseRenderer* renderer, const FishStatus& status) {
