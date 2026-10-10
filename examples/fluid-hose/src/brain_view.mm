@@ -53,11 +53,13 @@ NSColor* circuit_color(FishBrain::Circuit circuit, CGFloat alpha) {
     return false;
 }
 
-// The diagram fills a 2:1 box below the header, snout to the left, leaving a
-// strip at the bottom for the measured hindbrain when there is one.
+// The diagram fills a 2:1 box below the header, snout to the left, leaving
+// strips at the bottom for the spinal cord and the measured hindbrain.
+- (CGFloat)spinalStrip { return self.bounds.size.height * 0.1; }
 - (NSRect)diagram {
     const NSRect bounds = NSInsetRect(self.bounds, 16, 12);
-    const CGFloat header = 40, legend = 22, strip = [self hasMeasured] ? bounds.size.height * 0.3 : 0;
+    const CGFloat header = 40, legend = 22;
+    const CGFloat strip = ([self hasMeasured] ? bounds.size.height * 0.27 : 0) + [self spinalStrip];
     CGFloat width = bounds.size.width, height = bounds.size.height - header - legend - strip;
     if (width > height * 2) width = height * 2;
     else height = width / 2;
@@ -109,11 +111,50 @@ NSColor* circuit_color(FishBrain::Circuit circuit, CGFloat alpha) {
                                   NSForegroundColorAttributeName: [NSColor colorWithWhite:0.6 alpha:1]};
 
     std::vector<Dot> dots;
+    // A strip of compact grids, one per population, sized by neuron count.
+    auto grids = [&](const std::vector<const FishBrain::Area*>& row, CGFloat left, CGFloat right, CGFloat y, CGFloat height) {
+        if (row.empty()) return;
+        const CGFloat gap = unit * 1.5;
+        std::vector<CGFloat> widths;
+        CGFloat sum = 0;
+        std::size_t total = 0;
+        for (const auto* area : row) total += area->size;
+        const CGFloat usable = right - left - gap * (row.size() - 1);
+        for (const auto* area : row) {
+            NSString* label = [NSString stringWithUTF8String:area->label];
+            widths.push_back(std::max(usable * area->size / total, [label sizeWithAttributes:label_style].width + unit));
+            sum += widths.back();
+        }
+        CGFloat x = left;
+        for (std::size_t k = 0; k < row.size(); ++k) {
+            const auto* area = row[k];
+            const CGFloat width = widths[k] * usable / sum;
+            CGFloat cell = std::sqrt(width * height / area->size);
+            std::size_t columns = 1;
+            for (; cell > 1.5; cell *= 0.95) {
+                columns = std::max<std::size_t>(1, static_cast<std::size_t>(width / cell));
+                if ((area->size + columns - 1) / columns * cell <= height) break;
+            }
+            for (std::size_t i = 0; i < area->size; ++i)
+                dots.push_back({x + (i % columns + 0.5) * cell, y + (i / columns + 0.5) * cell, cell * 0.32, area->first + i,
+                                area->circuit, true});
+            [[NSString stringWithUTF8String:area->label] drawAtPoint:NSMakePoint(x, y + height + unit * 0.1) withAttributes:label_style];
+            x += width + gap;
+        }
+    };
+    NSDictionary* heading = @{NSFontAttributeName: [NSFont systemFontOfSize:std::max<CGFloat>(9, unit * 1.2)],
+                              NSForegroundColorAttributeName: [NSColor colorWithWhite:0.75 alpha:1]};
+    {
+        std::vector<const FishBrain::Area*> spinal;
+        for (const auto& area : _areas)
+            if (area.spinal && area.size) spinal.push_back(&area);
+        const CGFloat top = NSMaxY(box) + unit * 2;
+        [@"Spinal cord: the swim rhythm" drawAtPoint:NSMakePoint(16, top - unit * 1.6) withAttributes:heading];
+        grids(spinal, 16, NSMaxX(self.bounds) - 16, top + unit * 0.8, [self spinalStrip] - unit * 4.2);
+    }
     // The measured hindbrain: one row per side, a grid per cell type.
     if ([self hasMeasured]) {
-        const CGFloat top = NSMaxY(box) + unit * 2, bottom = NSMaxY(self.bounds) - 34;
-        NSDictionary* heading = @{NSFontAttributeName: [NSFont systemFontOfSize:std::max<CGFloat>(9, unit * 1.2)],
-                                  NSForegroundColorAttributeName: [NSColor colorWithWhite:0.75 alpha:1]};
+        const CGFloat top = NSMaxY(box) + [self spinalStrip] + unit * 2, bottom = NSMaxY(self.bounds) - 34;
         [@"Measured hindbrain wiring, one copy per side" drawAtPoint:NSMakePoint(16, top - unit * 1.6) withAttributes:heading];
         std::vector<const FishBrain::Area*> left, right;
         for (const auto& area : _areas) {
@@ -161,7 +202,7 @@ NSColor* circuit_color(FishBrain::Circuit circuit, CGFloat alpha) {
         }
     }
     for (const auto& area : _areas) {
-        if (area.measured) continue;
+        if (area.measured || area.spinal) continue;
         const CGFloat cx = box.origin.x + area.x * box.size.width, cy = box.origin.y + area.y * box.size.height;
         const CGFloat radius = unit * (area.size == 1 ? 1.3 : 0.55);
         if (area.topographic) {

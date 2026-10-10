@@ -23,6 +23,14 @@ constexpr float habituation_recovery = 60.0f;  // seconds
 constexpr float measured_gain = 0.2f;
 constexpr float measured_tonic = 0.2f;
 constexpr int commissural_size = 8;
+// Spike-frequency adaptation that ends each half-beat of the swim rhythm.
+constexpr float rhythm_adaptation = 0.3f;
+constexpr float rhythm_adaptation_time = 0.03f;  // seconds
+constexpr float fast_rate_time = 0.010f;
+constexpr float spinal_membrane = 0.005f;  // seconds
+constexpr float drive_adaptation = 0.1f;
+constexpr float drive_adaptation_time = 0.15f;
+constexpr float spinal_depression = 0.25f;  // smoothing for reading the tail's beat
 // Real larval integrators leak back toward the centre over seconds; a slow
 // adaptation does the same here, so a new turning streak can move the gaze.
 constexpr float integrator_leak = 0.002f;  // tectal vector strength that counts as seeing prey
@@ -60,6 +68,16 @@ enum Pop {
     swim_speed,         // nucleus of the medial longitudinal fasciculus
     bout_generator,     // hindbrain burst generator that times bouts
     strike,
+    // Spinal cord: a half-centre swim rhythm per side. Rhythm neurons excite
+    // their own side and, through crossed inhibition, silence the other, so
+    // the sides take turns and the tail beats.
+    descending_drive,   // sustains the spinal rhythm for the length of a bout
+    spinal_rhythm_left,
+    spinal_rhythm_right,
+    spinal_inhibition_left,
+    spinal_inhibition_right,
+    motor_left,
+    motor_right,
     // The eye-position circuit, built from the measured hindbrain wiring
     // when it is available (empty otherwise), one copy per side.
     integrator_left,    // the oculomotor velocity-to-position integrator
@@ -90,6 +108,7 @@ struct Population {
     // strength each spike uses up, and how long it takes to come back.
     float depression = 0;
     float recovery_time = 1;
+    float membrane = membrane_time;  // fast spinal neurons use a shorter one
 };
 
 const Population populations[population_count] = {
@@ -125,6 +144,13 @@ const Population populations[population_count] = {
     {"swim speed", 12, 0.6f, 0.3f, 0, 1},
     {"bout generator", 10, 0.95f, 0.35f, 0.08f, 1.0f},
     {"strike", 6, 0.2f, 0.2f, 0, 1},
+    {"descending drive", 10, 0.1f, 0.2f, drive_adaptation, drive_adaptation_time},
+    {"spinal rhythm (left)", 12, 0.2f, 0.2f, rhythm_adaptation, rhythm_adaptation_time, 0, 1, spinal_membrane},
+    {"spinal rhythm (right)", 12, 0.2f, 0.2f, rhythm_adaptation, rhythm_adaptation_time, 0, 1, spinal_membrane},
+    {"spinal inhibition (left)", 6, 0.1f, 0.15f, 0, 1, spinal_depression, 0.06f, spinal_membrane},
+    {"spinal inhibition (right)", 6, 0.1f, 0.15f, 0, 1, spinal_depression, 0.06f, spinal_membrane},
+    {"motor neurons (left)", 12, 0.1f, 0.15f, 0, 1, 0, 1, spinal_membrane},
+    {"motor neurons (right)", 12, 0.1f, 0.15f, 0, 1, 0, 1, spinal_membrane},
     // Sizes come from the connectome.
     {"integrator (left)", 0, measured_tonic, 0.25f, integrator_leak, 8.0f},
     {"integrator (right)", 0, measured_tonic, 0.25f, integrator_leak, 8.0f},
@@ -187,6 +213,14 @@ const Place places[population_count] = {
     {0.63f, 0.78f, "swim speed", C::move, false},
     {0.94f, 0.32f, "bout generator", C::move, false},
     {0.38f, 0.70f, "strike", C::move, false},
+    // The spinal cord is drawn in its own strip.
+    {-1, 0, "descending drive", C::move, false},
+    {-1, 0, "rhythm L", C::move, false},
+    {-1, 0, "rhythm R", C::move, false},
+    {-1, 0, "crossed inhib. L", C::move, false},
+    {-1, 0, "crossed inhib. R", C::move, false},
+    {-1, 0, "motor L", C::move, false},
+    {-1, 0, "motor R", C::move, false},
     // The measured populations are drawn in their own strip, by side.
     {0, 0, "integrator", C::decide, false},
     {0, 0, "integrator", C::decide, false},
@@ -200,8 +234,8 @@ const Place places[population_count] = {
     {0, 0, "axial", C::move, false},
     {0, 0, "spinal", C::move, false},
     {0, 0, "spinal", C::move, false},
-    {0.78f, 0.78f, "commissural L", C::decide, false},
-    {0.88f, 0.78f, "commissural R", C::decide, false},
+    {0.70f, 0.84f, "commissural L", C::decide, false},
+    {0.84f, 0.84f, "commissural R", C::decide, false},
 };
 
 struct Synapse { std::uint16_t target; float weight; };
@@ -220,6 +254,7 @@ struct FishBrain::Impl {
     std::vector<Synapse> synapses;
     std::vector<std::uint16_t> spiked;
     float rate[population_count] = {};
+    float fast_rate[population_count] = {};
     float decay_adaptation[population_count] = {};
     std::uint32_t random_state;
     float since_bout = 1, since_escape = 1, since_strike = 1;
@@ -365,7 +400,7 @@ struct FishBrain::Impl {
         wire(steer_dorsal, steer_ventral, 1.0f, -0.12f);
         wire(steer_ventral, steer_dorsal, 1.0f, -0.12f);
         wire(blocked_ahead, reverse, 1.0f, 0.6f);
-        wire(tectum, reverse, 0.8f, 1.6f, [&](int t, int) { return std::abs(prey_angle(t)) > 1.9f ? 1.0f : 0.0f; });
+        wire(tectum, reverse, 0.8f, 2.1f, [&](int t, int) { return std::abs(prey_angle(t)) > 1.9f ? 1.0f : 0.0f; });
         wire(hunt_command, reverse, 0.2f, 0.2f);
 
         // Bout timing and vigour.
@@ -380,6 +415,30 @@ struct FishBrain::Impl {
         wire(hypoxia, swim_speed, 0.5f, 0.6f);
         wire(hunt_command, swim_speed, 0.3f, -0.5f);  // stalking is slow
         wire(satiety, swim_speed, 0.3f, -0.3f);
+
+        // The spinal swim rhythm, driven during bouts by the bout generator and
+        // the swim-speed cells. A Mauthner spike curls the body into a C away
+        // from the threat at once. In the side view the left motor neurons
+        // bend the tail toward the belly and the right ones toward the back.
+        for (const bool left : {true, false}) {
+            const Pop rhythm = left ? spinal_rhythm_left : spinal_rhythm_right;
+            const Pop crossed = left ? spinal_inhibition_left : spinal_inhibition_right;
+            const Pop motor = left ? motor_left : motor_right;
+            const Pop other_rhythm = left ? spinal_rhythm_right : spinal_rhythm_left;
+            const Pop other_motor = left ? motor_right : motor_left;
+            wire(descending_drive, rhythm, 0.6f, 1.5f);
+            wire(swim_speed, rhythm, 0.3f, 0.3f);
+            wire(rhythm, rhythm, 0.5f, 0.05f);
+            wire(rhythm, crossed, 0.8f, 0.8f);
+            wire(crossed, other_rhythm, 0.8f, -0.5f);
+            wire(crossed, other_motor, 0.8f, -1.0f);
+            wire(rhythm, motor, 0.8f, 0.8f);
+        }
+        wire(bout_generator, descending_drive, 0.6f, 1.5f);
+        wire(strike, descending_drive, 1.0f, 2.0f);  // a strike is a short, hard bout
+        wire(descending_drive, descending_drive, 0.6f, 0.5f);
+        wire(mauthner_dorsal, motor_left, 1.0f, 6.0f);
+        wire(mauthner_ventral, motor_right, 1.0f, 6.0f);
 
         if (hindbrain) {
             // The measured wiring, copied onto each side: synapse counts become
@@ -440,8 +499,6 @@ struct FishBrain::Impl {
 
     void step() {
         const int count = static_cast<int>(voltage.size());
-        const float leak = tick / membrane_time;
-        const float jitter = std::sqrt(2 * leak);
         spiked.clear();
         for (int i = 0; i < count; ++i) {
             const Population& p = populations[owner[i]];
@@ -449,6 +506,7 @@ struct FishBrain::Impl {
                 --refractory[i];
                 continue;
             }
+            const float leak = tick / p.membrane, jitter = std::sqrt(2 * leak);
             const float current = input[i] + excitation[i] + inhibition[i] - adaptation[i];
             voltage[i] += leak * (current - voltage[i]) + p.noise * jitter * gaussian();
             if (voltage[i] >= 1.0f) {
@@ -483,6 +541,9 @@ struct FishBrain::Impl {
             const Population& p = populations[owner[i]];
             if (p.depression > 0) strength[i] += (1 - strength[i]) * tick / p.recovery_time;
         }
+        const float fast_keep = std::exp(-tick / fast_rate_time);
+        for (int p = 0; p < population_count; ++p)
+            fast_rate[p] = fast_rate[p] * fast_keep + (size_of[p] ? counts[p] / static_cast<float>(size_of[p]) / fast_rate_time : 0.0f);
         const float keep = std::exp(-tick / rate_time);
         for (int p = 0; p < population_count; ++p)
             rate[p] = rate[p] * keep + (size_of[p] ? counts[p] / static_cast<float>(size_of[p]) / rate_time : 0.0f);
@@ -545,7 +606,7 @@ std::vector<FishBrain::Area> FishBrain::layout() const {
                           static_cast<std::size_t>(impl_->size_of[p]),
                           places[p].x, places[p].y, places[p].circuit, places[p].topographic,
                           p >= integrator_left && p <= reticulospinal_right && p != commissural_left && p != commissural_right,
-                          impl_->rate[p]});
+                          places[p].x < 0, impl_->rate[p]});
     return result;
 }
 
@@ -560,6 +621,14 @@ float FishBrain::eye_position() const {
 }
 
 bool FishBrain::measured_hindbrain() const { return impl_->hindbrain != nullptr; }
+
+float FishBrain::tail() const {
+    return std::clamp((impl_->fast_rate[motor_left] - impl_->fast_rate[motor_right]) / 120.0f, -1.0f, 1.0f);
+}
+
+float FishBrain::beat() const {
+    return std::clamp((impl_->fast_rate[motor_left] + impl_->fast_rate[motor_right]) / 120.0f, 0.0f, 2.0f);
+}
 
 std::shared_ptr<const HindbrainConnectome> HindbrainConnectome::load(const std::string& path) {
     std::ifstream file(path);
@@ -865,9 +934,10 @@ bool run_hindbrain_checks(std::shared_ptr<const HindbrainConnectome> hindbrain) 
     const std::size_t cells = hindbrain->kinds.size();
     std::printf("  hindbrain connectome: %zu cells, %zu connections\n", cells, hindbrain->synapses.size());
 
-    // Persistence: with the turning region silenced, a 0.1 s push into one
-    // integrator. The measured wiring keeps it firing afterwards; the same
-    // cells wired at random, with the same synapse counts, fall silent.
+    // Persistence: with the turning region silenced, both integrators are held
+    // quiet (noise alone can ignite one), then one gets a 0.1 s push. The
+    // measured wiring keeps it firing afterwards; the same cells wired at
+    // random, with the same synapse counts, fall silent.
     auto held = [&](bool shuffle, std::uint32_t seed) {
         FishBrain brain(seed, hindbrain, shuffle);
         auto& s = *brain.impl_;
@@ -878,6 +948,8 @@ bool run_hindbrain_checks(std::shared_ptr<const HindbrainConnectome> hindbrain) 
             s.set_inputs(calm);
             for (const Pop p : {turning_left, turning_right, turning_inhibition_left, turning_inhibition_right})
                 for (int i = s.first[p]; i < s.first[p + 1]; ++i) s.input[i] = -2;
+            if (t < 1000)
+                for (int i = s.first[integrator_left]; i < s.first[integrator_right + 1]; ++i) s.input[i] = -2;
             if (t >= 1000 && t < 1100)
                 for (int i = s.first[integrator_left]; i < s.first[integrator_left + 1]; ++i) s.input[i] += 1.5f;
             s.step();
@@ -920,4 +992,74 @@ bool run_hindbrain_checks(std::shared_ptr<const HindbrainConnectome> hindbrain) 
                 100.0f * both / steps, agree, decided);
     if (!check(both * 10 < steps, "one side's integrator holds at a time")) return false;
     return check(decided > 100 && agree * 10 > decided * 7, "the gaze follows the turning region's streaks");
+}
+
+// The spinal swim rhythm: under steady drive the two sides take turns, and
+// faster with more drive; in bouts the tail beats back and forth; and a
+// Mauthner spike bends it at once.
+bool run_spinal_checks(std::uint32_t seed) {
+    auto steady = [&](float drive, float& beat_hz, float& regularity) {
+        FishBrain brain(seed);
+        auto& s = *brain.impl_;
+        FishSenses calm;
+        // A half-beat counts when the tail swings fully from one side to the other.
+        int side = 0, swings = 0;
+        constexpr int steps = 3000;
+        for (int t = 0; t < steps; ++t) {
+            s.set_inputs(calm);
+            for (const Pop p : {spinal_rhythm_left, spinal_rhythm_right})
+                for (int i = s.first[p]; i < s.first[p + 1]; ++i) s.input[i] += drive;
+            s.step();
+            const float tail = brain.tail();
+            const int now = tail > 0.4f ? 1 : tail < -0.4f ? -1 : 0;
+            if (now && now != side) {
+                if (side) ++swings;
+                side = now;
+            }
+        }
+        beat_hz = swings / 2.0f / (steps * tick);
+        (void)regularity;
+    };
+    float slow = 0, fast = 0, unused = 0;
+    steady(1.0f, slow, unused);
+    steady(1.6f, fast, unused);
+    std::printf("  spinal rhythm: %.1f Hz beat at low drive, %.1f Hz at high drive\n", slow, fast);
+    if (!check(slow > 2 && fast > slow, "the spinal sides take turns, faster with more drive")) return false;
+
+    // Bouts beat the tail back and forth.
+    FishBrain brain(seed);
+    FishSenses calm;
+    calm.hunger = 0.3f;
+    int bouts = 0, flips = 0;
+    float previous = 0;
+    for (int t = 0; t < 20000; ++t) {
+        FishBout bout;
+        if (brain.advance(calm, tick, bout)) ++bouts;
+        const float tail = brain.tail();
+        if (std::abs(tail) < 0.25f) continue;
+        if (previous != 0 && (tail > 0) != (previous > 0)) ++flips;
+        previous = tail;
+    }
+    std::printf("  bouts: %d in 20 s, %.1f tail reversals each\n", bouts, static_cast<float>(flips) / std::max(bouts, 1));
+    if (!check(bouts > 5 && flips >= bouts * 2, "each bout beats the tail back and forth")) return false;
+
+    // A Mauthner spike bends the tail within a few milliseconds.
+    FishBrain startled(seed + 8);
+    FishSenses threat = calm;
+    for (int t = 0; t < 2000; ++t) {
+        FishBout bout;
+        startled.advance(calm, tick, bout);
+    }
+    threat.looming[1] = threat.looming[2] = 1.0f;  // below the fish
+    float bend = 0;
+    int latency = -1;
+    for (int t = 0; t < 200 && latency < 0; ++t) {
+        FishBout bout;
+        startled.advance(threat, tick, bout);
+        bend = startled.tail();
+        if (std::abs(bend) > 0.6f) latency = t;
+    }
+    std::printf("  escape: tail bent %+.2f after %d ms\n", bend, latency);
+    // Away from a threat below means toward the back: negative.
+    return check(latency >= 0 && latency < 80 && bend < 0, "a Mauthner spike bends the tail away from the threat at once");
 }

@@ -72,6 +72,11 @@ public:
     // the abducens neurons. Zero without a hindbrain connectome.
     float eye_position() const;
     bool measured_hindbrain() const;
+    // The spinal motor neurons right now: which way they bend the tail (-1
+    // right to 1 left; drawn as toward the back and toward the belly in the
+    // side view), and how hard both sides are working, 0 and up.
+    float tail() const;
+    float beat() const;
     std::size_t neuron_count() const;
     std::size_t synapse_count() const;
 
@@ -90,6 +95,7 @@ public:
         Circuit circuit;
         bool topographic;  // neurons ordered by the direction they respond to
         bool measured;     // wired from the connectome rather than by hand
+        bool spinal;       // in the spinal cord, drawn apart from the brain
         float hertz;
     };
     std::vector<Area> layout() const;
@@ -100,9 +106,11 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     friend bool run_hindbrain_checks(std::shared_ptr<const HindbrainConnectome> hindbrain);
+    friend bool run_spinal_checks(std::uint32_t seed);
 };
 
 bool run_brain_checks(std::uint32_t seed = 7);
+bool run_spinal_checks(std::uint32_t seed = 7);
 // Checks the eye-position circuit built from the measured hindbrain wiring
 // against the same circuit wired at random.
 bool run_hindbrain_checks(std::shared_ptr<const HindbrainConnectome> hindbrain);

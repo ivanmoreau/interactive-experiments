@@ -51,7 +51,9 @@ constexpr float digestion_seconds = 150;
 constexpr float meal_energy = 0.05f;   // per flake
 constexpr float meal_fullness = 0.12f;
 constexpr float sight_distance = 420;
-constexpr float flip_turn = 1.75f;     // turns beyond this (about 100°) flip the fish around
+constexpr float flip_turn = 1.75f;
+constexpr float typical_beat = 0.15f;  // a bout's motor activity added up over time, typically
+constexpr float swim_window = 0.35f;   // seconds of tail beats each bout drives     // turns beyond this (about 100°) flip the fish around
 
 // Flakes float until they soak up water, then sink, then dissolve.
 constexpr float food_soak_seconds = 25;
@@ -205,6 +207,8 @@ struct Pond::Impl {
         float foreshorten = 1;
         BoutKind bout_kind = BoutKind::swim;
         float bout_left = 0, bout_length = 0, turn_rate = 0, thrust = 0;
+        float swim_left = 0;   // how long the bout's tail beats still push the fish
+        float push_left = 0;   // how much more beat the bout's push may use
         float since_strike = 10;
         float tail_phase = 0, tail_amplitude = 0, bend = 0;
     };
@@ -386,7 +390,11 @@ struct Pond::Impl {
         f.bout_kind = bout.kind;
         f.bout_length = f.bout_left = length;
         f.turn_rate = turn / (0.6f * length);
-        f.thrust = bout.speed * strength / length;
+        // The tail beats come from the spinal neurons; each push is scaled so
+        // a typical bout's beats add up to the bout's speed.
+        f.thrust = bout.speed * strength / typical_beat;
+        f.swim_left = swim_window;
+        f.push_left = typical_beat;
         f.tail_amplitude = std::clamp(bout.speed / 220.0f, 0.35f, 1.3f);
         if (bout.kind == BoutKind::strike) f.since_strike = 0;
         if (bout.kind == BoutKind::escape) ++f.escapes;
@@ -442,11 +450,18 @@ struct Pond::Impl {
             interface.SetAngularVelocity(f.id, interface.GetAngularVelocity(f.id) * std::exp(-fish_turn_damping * f.submerged * dt));
         }
         const bool turning = f.bout_left > 0.4f * f.bout_length;
-        if (f.bout_left > 0 && f.in_water) {
+        if (f.bout_left > 0 && f.in_water && turning) {
             // A turn toward the back is anticlockwise on screen when upright.
-            if (turning) interface.SetAngularVelocity(f.id, Vec3(0, 0, f.upright * f.turn_rate));
-            interface.AddForce(f.id, to_world_vector(now.ahead * (f.mass * f.thrust)));
+            interface.SetAngularVelocity(f.id, Vec3(0, 0, f.upright * f.turn_rate));
         }
+        if (f.swim_left > 0 && f.in_water && f.alive) {
+            // Each beat pushes; a bout pushes no more than a typical bout's
+            // beats would, so strong beats push sooner rather than further.
+            const float beat = std::min(f.brain.beat() * dt, f.push_left);
+            f.push_left -= beat;
+            interface.AddForce(f.id, to_world_vector(now.ahead * (f.mass * f.thrust * beat / dt)));
+        }
+        f.swim_left = std::max(0.0f, f.swim_left - dt);
         if (f.alive && f.in_water && !turning) {
             // Righting reflex: fins ease the fish back toward level, and pull
             // hard once it is steeply pitched. Hunting fish tip toward prey.
@@ -460,14 +475,16 @@ struct Pond::Impl {
         }
         f.bout_left = std::max(0.0f, f.bout_left - dt);
 
-        // Tail: fast beats during a bout, a lazy wave while gliding, curled
-        // into the turn at the start of one.
-        const bool beating = f.bout_left > 0 || (!f.in_water && f.tail_amplitude > 0.3f);
-        f.tail_phase += dt * 2 * pi * (beating ? 14.0f : 2.5f);
+        // Tail: bent by the spinal motor neurons, curled into the turn at the
+        // start of a bout, with a lazy wave while gliding and thrashing when
+        // stranded.
+        const bool flopping = !f.in_water && f.tail_amplitude > 0.3f;
+        f.tail_phase += dt * 2 * pi * (flopping ? 14.0f : 2.5f);
         const float idle = f.alive ? (f.in_water ? 0.12f : 0.05f) : 0.0f;
         f.tail_amplitude = idle + (f.tail_amplitude - idle) * std::exp(-4.0f * dt);
         const float curl = turning ? -std::clamp(f.turn_rate * 0.25f, -4.0f, 4.0f) : 0.0f;
-        f.bend = f.bend + (f.tail_amplitude * 4.5f * std::sin(f.tail_phase) + curl - f.bend) * std::min(1.0f, dt * 30);
+        const float neural = f.alive ? 6.0f * f.brain.tail() : 0.0f;
+        f.bend = f.bend + (f.tail_amplitude * 4.5f * std::sin(f.tail_phase) + neural + curl - f.bend) * std::min(1.0f, dt * 40);
     }
 
     void eat(Fish& f) {
@@ -844,10 +861,14 @@ float fill_pool(FluidSimulation& fluid, Pond& pond, float width, float height, i
     run(fluid, pond, 240, {});
     std::vector<FluidParticle> particles;
     if (!fluid.read_particles(particles)) return height;
-    float surface = height;
+    // The surface is near the top of the water; stray splash drops above it
+    // are ignored.
+    std::vector<float> heights;
     for (const auto& p : particles)
-        if (p.x > width * 0.2f && p.x < width * 0.8f) surface = std::min(surface, p.y);
-    return surface;
+        if (p.x > width * 0.2f && p.x < width * 0.8f) heights.push_back(p.y);
+    if (heights.empty()) return height;
+    std::sort(heights.begin(), heights.end());
+    return heights[heights.size() / 100];
 }
 }
 
@@ -903,7 +924,7 @@ bool run_fish_checks(const char* shader_file, std::shared_ptr<const HindbrainCon
     // Every fish's brain is wired from its own seed, so check several.
     for (const std::uint32_t seed : {7u, 101u, 2024u, 4242u, 31337u, 99991u}) {
         std::printf("Brain seed %u\n", seed);
-        if (!run_brain_checks(seed)) return false;
+        if (!run_brain_checks(seed) || !run_spinal_checks(seed)) return false;
     }
     if (hindbrain) {
         std::printf("Measured hindbrain\n");
