@@ -33,13 +33,14 @@ else
 fi
 
 "$PROJECT_DIR/tools/build-jolt.sh"
+"$PROJECT_DIR/tools/fetch-connectome.sh"
 JOLT_DIR="$PROJECT_DIR/third_party/JoltPhysics"
 
 printf 'Building fluid application...\n'
 xcrun clang++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -mmacosx-version-min=14.0 \
     "$PROJECT_DIR/tools/probe_motion.cpp" -framework CoreFoundation -framework IOKit \
     -o "$BUILD_DIR/probe-motion"
-for source in desktop fluid_sim window_tracker screen_capture; do
+for source in desktop fluid_sim window_tracker screen_capture brain_view; do
     xcrun clang++ -std=c++17 -O2 -g -fobjc-arc -Wall -Wextra -Wpedantic -Werror \
         -mmacosx-version-min=14.0 \
         -c "$PROJECT_DIR/src/$source.mm" -o "$BUILD_DIR/$source.o"
@@ -47,8 +48,8 @@ done
 xcrun clang++ -std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror \
     -mmacosx-version-min=14.0 \
     -isystem "$JOLT_DIR" \
-    "$PROJECT_DIR/src/main.cpp" "$PROJECT_DIR/src/motion.cpp" "$PROJECT_DIR/src/displays.cpp" "$PROJECT_DIR/src/duck_world.cpp" \
-    "$BUILD_DIR/desktop.o" "$BUILD_DIR/fluid_sim.o" "$BUILD_DIR/window_tracker.o" "$BUILD_DIR/screen_capture.o" \
+    "$PROJECT_DIR/src/main.cpp" "$PROJECT_DIR/src/motion.cpp" "$PROJECT_DIR/src/displays.cpp" "$PROJECT_DIR/src/pond.cpp" "$PROJECT_DIR/src/fish_brain.cpp" \
+    "$BUILD_DIR/desktop.o" "$BUILD_DIR/fluid_sim.o" "$BUILD_DIR/window_tracker.o" "$BUILD_DIR/screen_capture.o" "$BUILD_DIR/brain_view.o" \
     -framework AppKit -framework Foundation -framework Metal -framework QuartzCore -framework CoreGraphics -framework ImageIO \
     -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo \
     "$PROJECT_DIR/build/jolt/libJolt.a" \
@@ -60,5 +61,10 @@ codesign --force --sign - "$APP_DIR/Contents/MacOS/probe-motion"
 cp "$SHADERS" "$APP_DIR/Contents/Resources/"
 cp "$PROJECT_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$JOLT_DIR/LICENSE" "$APP_DIR/Contents/Resources/JoltPhysics-LICENSE.txt"
+# The measured hindbrain wiring, when it could be downloaded; see tools/fetch-connectome.sh.
+rm -f "$APP_DIR/Contents/Resources/hindbrain.txt"
+if [[ -f "$BUILD_DIR/connectome/hindbrain.txt" ]]; then
+    cp "$BUILD_DIR/connectome/hindbrain.txt" "$APP_DIR/Contents/Resources/hindbrain.txt"
+fi
 codesign --force --sign - "$APP_DIR"
 printf 'Built %s\n' "$APP_DIR"

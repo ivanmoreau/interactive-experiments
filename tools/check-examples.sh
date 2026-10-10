@@ -7,6 +7,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 "$REPO_DIR/examples/floating-triangle/build/hello-sdl-gpu" --help >/dev/null
 "$REPO_DIR/examples/fluid-hose/build/fluid-hose" --physics-check
 "$REPO_DIR/examples/fluid-hose/build/fluid-hose" --duck-check
+"$REPO_DIR/examples/fluid-hose/build/fluid-hose" --fish-check
 "$REPO_DIR/examples/fluid-hose/build/fluid-hose" --display-check
 "$REPO_DIR/examples/fluid-hose/build/fluid-hose" --motion-check
 "$REPO_DIR/examples/fluid-hose/build/probe-motion" --self-test
