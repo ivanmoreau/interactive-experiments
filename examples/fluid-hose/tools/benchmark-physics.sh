@@ -3,8 +3,13 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
-mkdir -p "$BUILD_DIR"
-xcrun clang++ -std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror \
-    -mmacosx-version-min=14.0 "$PROJECT_DIR/tools/benchmark_physics.cpp" \
-    "$PROJECT_DIR/src/fluid_sim.cpp" -o "$BUILD_DIR/benchmark-physics"
+# Uses the app's compiled objects and shaders.
+"$PROJECT_DIR/build.sh" >/dev/null
+xcrun clang++ -std=c++17 -O2 -g -fobjc-arc -Wall -Wextra -Wpedantic -Werror \
+    -mmacosx-version-min=14.0 "$PROJECT_DIR/tools/benchmark_physics.mm" \
+    "$BUILD_DIR/fluid_sim.o" "$BUILD_DIR/desktop.o" "$BUILD_DIR/screen_capture.o" \
+    -isystem "$PROJECT_DIR/third_party/JoltPhysics" "$PROJECT_DIR/src/duck_world.cpp" "$BUILD_DIR/jolt/libJolt.a" "$PROJECT_DIR/src/displays.cpp" \
+    -framework AppKit -framework Metal -framework QuartzCore -framework CoreGraphics -framework ImageIO \
+    -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo \
+    -o "$BUILD_DIR/benchmark-physics"
 exec "$BUILD_DIR/benchmark-physics" "$@"

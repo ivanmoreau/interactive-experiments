@@ -16,8 +16,13 @@ for tool in xcrun install_name_tool codesign; do
         exit 1
     fi
 done
+# --runtime-shaders accepts a build without Xcode's offline Metal compiler;
+# the app then compiles its bundled shader source when it launches.
+RUNTIME_SHADERS=0
+[[ "${1:-}" == --runtime-shaders ]] && RUNTIME_SHADERS=1
 for tool in clang++ metal metallib; do
-    if ! xcrun --sdk macosx --find "$tool" >/dev/null; then
+    if ! xcrun --sdk macosx --find "$tool" >/dev/null 2>&1; then
+        if [[ "$tool" != clang++ && "$RUNTIME_SHADERS" == 1 ]]; then continue; fi
         printf 'Xcode tool %s is unavailable. Select full Xcode with xcode-select.\n' "$tool" >&2
         exit 1
     fi

@@ -1,8 +1,8 @@
 # Fluid Hose
 
-A desktop fluid toy for macOS. Hold **Option** to pour blue water from a nozzle controlled by the mouse. Water lands on window tops, spills around their sides, and pools at the bottom of the usable desktop, above the Dock.
+A desktop fluid toy for macOS. Hold **Option** to pour water from a nozzle controlled by the mouse. Water lands on window tops, drips off their edges, and pools at the bottom of the usable desktop, above the Dock. Drag a window through the water and it sloshes; water resting on a window rides along with it. Drop in rubber ducks: they bob on the water, drift with the current, ride on windows, and get batted around when you drag a window into them.
 
-The overlay uses **AppKit + native Metal**, with C++ physics. It is transparent and lets mouse clicks pass through, so you can move and resize the real windows normally while the simulation runs.
+The overlay uses **AppKit + native Metal**. The fluid is a position-based fluid solver running in Metal compute shaders, and windows are tracked live through WindowServer notifications. The overlay is transparent and lets mouse clicks pass through, so you can move and resize the real windows normally while the simulation runs.
 
 ## Run
 
@@ -13,7 +13,7 @@ From the workspace root:
 ./examples/fluid-hose/run.sh
 ```
 
-Building requires macOS 14 or newer and full Xcode with its C++ and Metal tools. This example links only macOS system frameworks and requires no SDL SDK or third-party runtime library. The shared [devenv environment](../../README.md) provides the repository's development and checking tools; it is optional for building and running the hose itself.
+Building requires macOS 14 or newer and Apple's C++ compiler. With full Xcode the build compiles the shaders into `fluid.metallib`; with only the Command Line Tools it bundles the shader source instead, and Metal compiles it when the app launches. Rubber ducks use [Jolt Physics](https://github.com/jrouwe/JoltPhysics) v5.6.0 (MIT), pinned as a Git submodule in `third_party/JoltPhysics`. The build fetches the submodule if needed and compiles Jolt once into a cached static library (about 15 seconds); the app bundles Jolt's license as `JoltPhysics-LICENSE.txt`. Otherwise the app links only macOS system frameworks and requires no SDL SDK or third-party runtime library. The shared [devenv environment](../../README.md) provides the repository's development and checking tools; it is optional for building and running the hose itself.
 
 Or open `build/Fluid Hose.app` from this example folder in Finder.
 
@@ -21,6 +21,11 @@ Or open `build/Fluid Hose.app` from this example folder in Finder.
 - When the pointer is over a solid window body, the nozzle snaps to the nearest available edge.
 - Use the **💧 menu-bar icon** to pour continuously, pause, clear the water, or quit.
 - Choose a monitor through **💧 → Display**. Names, sizes, and a checkmark identify the active display. Your choice is remembered for the next launch.
+- **Option+scroll** while pouring changes the flow, from a slow drip (0.25×) to a strong jet (3×); **💧 → Flow** shows the current rate and offers presets. The nozzle's opening widens and brightens with the flow. With the Accessibility permission (System Settings → Privacy & Security → Accessibility), the scroll is consumed so the window under the pointer does not also scroll; without it, that window scrolls too.
+- **💧 → Add rubber duck 🦆** drops a duck from a random point along the top of the screen; **Remove ducks** takes them all away. Clearing the water leaves the ducks. Up to 32 ducks fit.
+- **💧 → Liquid** sets how the water moves: **Water** is runny and splashy, **Thick** flows slowly, and **Goo** clings and stretches. It applies to the water already on screen.
+- **💧 → Particle size** trades detail for volume. **Fine** gives the most detailed streams and drops; **Coarse** holds the most water. Changing the size clears the water.
+- **💧 → Refract the desktop** bends the desktop seen through the water, like a lens. It needs the Screen Recording permission; see [Refraction](#refraction).
 - **Use Mac tilt** changes gravity using laptop motion; **Reverse tilt left/right** flips the horizontal direction if needed.
 - **Ctrl+C** also quits when launched from Terminal.
 
@@ -28,6 +33,15 @@ For continuous pouring from launch:
 
 ```sh
 ./examples/fluid-hose/run.sh --pour
+```
+
+The flow, liquid, particle size, and refraction choices are remembered. The defaults are fine water without refraction. They can also be chosen for a single launch:
+
+```sh
+./examples/fluid-hose/run.sh --liquid thick --size coarse
+./examples/fluid-hose/run.sh --refraction
+./examples/fluid-hose/run.sh --flow 2
+./examples/fluid-hose/run.sh --ducks 5
 ```
 
 The app has no Dock icon or visible window frame. Its menu-bar icon provides the controls.
@@ -55,22 +69,65 @@ Tilt is off by default. Its menu status shows whether fresh motion is available.
 
 AppKit owns the borderless, non-focusing overlay window and the application event loop. [NSScreen](https://developer.apple.com/documentation/appkit/nsscreen) provides connected displays and their usable frames, excluding the menu bar and Dock. AppKit's bottom-left screen coordinates are converted into the top-left desktop coordinates used by Quartz and the physics. Display notifications and a periodic refresh handle monitor changes; the view updates its Metal drawable size when its backing scale changes.
 
-The native bridge reads normal on-screen windows using [Quartz Window Services](https://developer.apple.com/documentation/coregraphics/cgwindowlistcopywindowinfo%28_%3A_%3A%29?language=_5). Their bounding rectangles become collision obstacles in the selected display's desktop coordinate system. Window bounds refresh eight times per second; the app does not capture window contents or read window titles.
+### Window tracking
 
-The C++ simulation applies gravity and particle density constraints, using a spatial grid for neighboring particles. Each relaxation iteration caches a particle's neighbors and distances for its pressure pass, with scratch memory reused across steps. Water is retained until you clear it, so it accumulates instead of disappearing. The current capacity is 8,000 particles.
+[src/window_tracker.mm](src/window_tracker.mm) follows the approach of [JankyBorders](https://github.com/FelixKratz/JankyBorders), which draws borders that track windows in real time. JankyBorders is GPL-3.0; it served only as a reference for which WindowServer calls to use, and no code was copied. The app subscribes to the private SkyLight notifications for window move (806) and resize (807), and for windows being created, destroyed, hidden, reordered, or changing level or space. Move and resize events arrive on the main thread as the window moves, and only that window's bounds are re-read with `SLSGetWindowBounds`. Structural events trigger a full read of the window list through [Quartz Window Services](https://developer.apple.com/documentation/coregraphics/cgwindowlistcopywindowinfo%28_%3A_%3A%29?language=_5), which also runs once per second as a safety net. On macOS 26 and later, `SLSWindowIteratorGetCornerRadii` supplies each window's real corner radius; earlier versions use the standard 10-point radius.
 
-Native Metal renders in two passes: particle splats add into a density texture, then a surface shader merges and shades that field into water. Water opacity is capped at 78% after merging, with a softer edge transition, so the desktop shows through drops and settled pools. The final output uses premultiplied alpha. Three particle buffers allow GPU work to overlap safely with CPU updates.
+SkyLight is a private framework, so every symbol is resolved with `dlopen`/`dlsym`. If any required symbol is missing, the tracker falls back to reading the window list eight times per second, as earlier versions did. `--probe` reports which mode is active. The app does not capture window contents or read window titles.
 
-The native view directly owns its [CAMetalLayer](https://developer.apple.com/documentation/quartzcore/cametallayer). [CAMetalDisplayLink](https://developer.apple.com/documentation/quartzcore/cametaldisplaylink) drives rendering on the AppKit main run loop, including while menus are open. Physics retains its fixed 120 Hz timestep. Signals, menu quit, and the duration limit are also checked by a small timer so shutdown works when no drawable is available. AppKit termination returns through C++ cleanup, which stops the motion helper.
+### Fluid simulation
 
-The native window's [ignoresMouseEvents](https://developer.apple.com/documentation/appkit/nswindow/ignoresmouseevents) property keeps it click-through. The window, view, and Metal layer are non-opaque. This replaces the SDL input-shape workaround used by the earlier version.
+The solver ([src/fluid_solver.metal](src/fluid_solver.metal)) implements [position-based fluids](https://mmacklin.com/pbf_sig_preprint.pdf) in two dimensions. Each 120 Hz step runs several substeps. Each substep predicts positions under gravity, sorts particles into a grid of kernel-sized cells with a counting sort, and then runs two Jacobi iterations of the density constraint, with a small artificial-pressure term that prevents clumping. A slight negative-pressure allowance gives the water cohesion to form streams and drops, and XSPH viscosity damps motion between neighbours.
+
+The particle size sets the rest spacing: 3, 3.75, or 4.5 points. The kernel support, neighbour grid, and rest density are derived from it, and the stream stays about 16 points wide at any size. The liquid presets set viscosity, cohesion, surface friction, and substeps:
+
+| Liquid | XSPH viscosity | Cohesion (density deficit) | Friction | Substeps |
+| --- | ---: | ---: | ---: | ---: |
+| Water | 0.015 | 0.2% | 6 per second | 6 |
+| Thick | 0.09 | 0.6% | 12 per second | 4 |
+| Goo | 0.3 | 3% | 30 per second | 4 |
+
+Larger particles and high viscosity made the earlier version look like gel. Runny water uses low viscosity, little cohesion, and more substeps to stay stable without that damping. Particle state never leaves the GPU; the CPU records spawn rows and window positions, and [src/fluid_sim.mm](src/fluid_sim.mm) encodes the steps into the same command buffer as the frame's drawing.
+
+Windows are rounded-rectangle colliders. Each substep places a window partway between its position at the previous frame and its current position, so a dragged window sweeps through the water instead of teleporting. Collision pushes water out along the surface normal. Surfaces water rests on (window tops and the desktop floor) apply friction relative to the surface's own motion, so water on a moving window is carried with it, while water on window sides slides off. Particles trapped by overlapping windows, or by a window reaching past the screen edge, move to the nearest on-screen exit. A window that jumps more than 500 points in one frame, such as when it is minimized or restored, is treated as a teleport and does not fling water.
+
+The flow rate scales the speed at which rows of particles leave the nozzle, so the poured volume scales with it. Foam forms only where fast water is also sparse and broken, so even a 3× jet stays clear.
+
+Option+scroll is read through a [CGEvent tap](https://developer.apple.com/documentation/coregraphics/1454426-cgeventtapcreate) on scroll-wheel events; while Option is held the tap adjusts the flow and drops the event. Creating such a tap requires the Accessibility permission, and the app does not ask for it. Without it, a global `NSEvent` monitor observes the same gesture but cannot stop it from also scrolling the window underneath. The overlay itself ignores the mouse, so it never receives scroll events directly.
+
+Water is retained until you clear it. The capacity is 65,536 particles, which is about 510,000 square points of water with fine particles, or 1.15 million with coarse ones.
+
+### Rubber ducks
+
+[src/duck_world.cpp](src/duck_world.cpp) simulates ducks with [Jolt Physics](https://github.com/jrouwe/JoltPhysics), a rigid-body engine. Ducks are dynamic bodies locked to the screen plane with Jolt's `Plane2D` degrees of freedom: they move in x and y and rotate about the axis facing you. Each duck is a compound of three extruded convex hulls (body, head, and beak) built from the same silhouette the shaders use, scaled 90–115% and facing left or right. Like a weighted bath toy, its centre of mass sits under the middle of its body, so it floats level and rights itself. Rubber friction (0.9) and some bounce (restitution 0.35) apply. Windows are kinematic boxes with rounded edges that move to the tracker's positions each step, interpolated across the frame like the water's colliders, so a dragged window carries or bats ducks with real momentum. The screen edges are static walls. Jolt runs at the same 120 Hz fixed step in points converted to metres (100 points per metre, so 950 points/s² gravity is about Earth gravity), with a single-threaded job system; 32 ducks need no more.
+
+Jolt does not simulate fluids, so the two simulations are coupled every step:
+
+- **Water → duck.** After each frame's last substep, a GPU kernel finds the particles inside each duck's outline and returns their count, centroid, and average velocity. The next steps apply buoyancy (the displaced water's weight, using the duck's 30-point thickness and water's density) at that centroid against gravity, including tilt gravity, plus drag toward the water's velocity, and damp spin in proportion to how submerged the duck is. Ducks are 28% as dense as water, so they float with about a quarter of their outline under the surface. The measurement lags the ducks by one frame.
+- **Duck → water.** Particles inside a duck's outline blend toward the velocity of the duck's surface at that point, so falling ducks splash and moving ducks stir the water. Water is not pushed out of ducks: in this side view it passes in front of and behind them, like water around a toy in a tank.
+
+Ducks are drawn procedurally into their own layer: a soft-shaded plastic body and tail, a wing crescent, an orange beak, and a glossy eye, mostly yellow, sometimes pink or mint, and rarely gold. The surface pass draws that layer under the water. Where water covers a duck, the duck is tinted by the water's depth and bent along with the desktop by refraction, so the waterline reads naturally.
+
+### Rendering
+
+Native Metal renders in two passes ([src/fluid.metal](src/fluid.metal)). Particle splats add coverage, foam, and speed into a floating-point field at point resolution. A separable Gaussian blur, with a sigma of 60% of a splat radius, then smooths the field so the surface follows the water's shape instead of bumps a few particles wide, and a blit builds its mip chain. The surface pass thresholds the smoothed field and estimates thickness from coarse levels. Normals come from a height that rises only across the surface band, so highlights sit on the visible edge rather than on a second line inside the water; deeper inside they come from coarser levels, so the interior refracts like calm water. Field lookups are clamped a little inside the screen edges, so water resting against the floor or a side wall continues past the edge instead of drawing a bright false surface there. Thicker water absorbs more red and green light, so thin streams are pale and clear while deep pools turn a dark, more opaque blue. The surface also gets a specular highlight, a Fresnel rim, a bright meniscus along every edge that is strongest at the top of a pool, a faint glow under the surface, moving caustics inside deeper water, travelling ripples on the highlights, and white foam where fast water is thin and broken. The output uses premultiplied alpha.
+
+### Refraction
+
+With **Refract the desktop** on, [src/screen_capture.mm](src/screen_capture.mm) streams the selected display through [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) at its native resolution and up to 60 frames per second, excluding this app's own windows. Frames arrive as IOSurface-backed Metal textures through a `CVMetalTextureCache`; each frame stays alive until the GPU commands that sample it complete. The surface shader treats the water as a lens: it offsets its desktop lookup along the surface normal, more where the surface tilts and the water is deeper, and offsets red, green, and blue by slightly different amounts. Depth absorbs red light first, so deep pools tint slightly toward cyan while the desktop stays clearly visible through them. Thin water bends the view only a little, so edges do not pull in content from just beyond them. The surface also reflects a bright sky at grazing angles. Inside the water the overlay is opaque, because it draws the refracted desktop itself; the edges blend with the real desktop. Both the capture and the overlay use sRGB, so refracted pixels match their surroundings.
+
+Capture requires the Screen Recording permission. The first time refraction is turned on, macOS asks for it; after granting it in System Settings → Privacy & Security → Screen & System Audio Recording, relaunch the app. The menu status shows whether refraction is active or waiting for permission. Launched from Terminal, the permission belongs to the terminal app instead. The app bundle is signed ad hoc, so macOS may ask again after a rebuild. Captured frames are used only for drawing; they are not saved or sent anywhere.
+
+The refracted image lags the real desktop by about one or two frames, which shows when content scrolls behind the water. Capture runs whenever refraction is on. Without refraction, the shader tints and lights the water and lets the real desktop show through thinner water.
+
+The native view directly owns its [CAMetalLayer](https://developer.apple.com/documentation/quartzcore/cametallayer). [CAMetalDisplayLink](https://developer.apple.com/documentation/quartzcore/cametaldisplaylink) drives rendering on the AppKit main run loop, including while menus are open. Signals, menu quit, and the duration limit are also checked by a small timer so shutdown works when no drawable is available. AppKit termination returns through C++ cleanup, which stops the motion helper.
+
+The native window's [ignoresMouseEvents](https://developer.apple.com/documentation/appkit/nswindow/ignoresmouseevents) property keeps it click-through. The window, view, and Metal layer are non-opaque.
 
 After rebuilding, quit any running copy through the **💧 menu → Quit Fluid Hose** or **Ctrl+C**, then relaunch. An already running process continues using its original code.
-
 ## Scope
 
-This is a 2D prototype on **one selected display at a time**. Windows are solid, axis-aligned bounding rectangles; rounded corners, shadows, pop-up menus, and nonstandard shapes are not modeled. A window that covers the entire canvas is omitted because it would leave no space for the simulation. The desktop floor is the usable screen edge above the Dock.
-
+This is a 2D toy on **one selected display at a time**. Windows are solid rounded rectangles; shadows, pop-up menus, and nonstandard shapes are not modeled. A window that covers the entire canvas is omitted because it would leave no space for the simulation. At most 64 windows on the selected display are colliders. The desktop floor is the usable screen edge above the Dock.
 ## Build and checks
 
 ```sh
@@ -79,22 +136,31 @@ This is a 2D prototype on **one selected display at a time**. Windows are solid,
 ./examples/fluid-hose/run.sh --display-check
 ./examples/fluid-hose/run.sh --probe
 ./examples/fluid-hose/run.sh --smoke-test
+./examples/fluid-hose/run.sh --snapshot water.png
+./examples/fluid-hose/run.sh --snapshot refraction.png --refraction --duration 30
+./examples/fluid-hose/run.sh --capture-check
+./examples/fluid-hose/run.sh --duck-check
 ./examples/fluid-hose/run.sh --window-check
 "./examples/fluid-hose/build/Fluid Hose.app/Contents/MacOS/fluid-hose" --window-check
 ```
 
-- `--physics-check` requires no graphics access and checks gravity, pooling, collision, hose placement, displacement by moving and overlapping windows, and clearing.
-- `--motion-check` checks gravity projection, stale/invalid data, fluid moving toward side walls and the ceiling, and helper transport/shutdown using synthetic data without opening sensors.
+- `--physics-check` runs the GPU solver without a window, once for each particle size and liquid. It checks gravity and pooling, that a settled pool comes to rest without internal jitter, particle spacing, collision with rounded windows, hose placement, displacement by moving and overlapping windows, that a dragged window pushes water along, rotated tilt gravity, and clearing. It needs a Metal device but no desktop session.
+- `--motion-check` checks gravity projection, stale/invalid data, and helper transport/shutdown using synthetic data without opening sensors. Fluid response to rotated gravity is part of `--physics-check`.
 - `--display-check` checks saved selection, disconnect fallback, reconnect with changed native IDs, and conversion between AppKit and Quartz coordinates without requiring graphics access.
 - Interactive display switching requires a normal desktop session; `--list-displays` enumerates the screens without creating an overlay.
-- `--probe` prints desktop bounds and the window collision rectangles without launching the overlay.
-- `--smoke-test` checks Metal density accumulation, a translucent merged fluid surface, and transparent background pixels without creating a window.
+- `--probe` prints desktop bounds, the window tracking mode, and each window collider with its corner radius, without launching the overlay.
+- `--snapshot FILE.png` simulates a scripted scene offscreen (a stream pouring onto one window while a second window slides into the pool) and writes it over a synthetic desktop. `--duration` sets the simulated seconds; the default is 8. `--size` and `--liquid` select the preset; `--refraction` uses the synthetic desktop, which has grid lines, rings, and text-like rows, as the refracted image. It is useful for tuning the solver and shaders without a live desktop.
+- `--duck-check` couples Jolt and the GPU fluid headlessly. It checks that a dry duck lands on and rests on a window, that dragging the window carries the duck, that a duck dropped into a pool floats at the surface and stays level, and that it falls to the floor when the water is cleared.
+- `--capture-check` captures the main display briefly and reports the size of the first frame received; it saves nothing. It requires the Screen Recording permission.
+- `--smoke-test` checks that splats merge into a translucent, premultiplied water surface on transparent background pixels without creating a window.
 - `--window-check` briefly shows a native overlay on each connected display. It checks actual WindowServer bounds, Metal drawable dimensions and frame delivery, display switching, menu actions, and transparent, click-through, non-focusing window settings. It requires a live desktop, does not save a display preference, and does not open sensors. Physical monitor disconnection and manual mouse interaction remain interactive checks.
 - `--duration 10` runs the overlay for ten seconds and exits.
 
-Requires macOS 14 or newer and full Xcode's C++ and Metal tools to rebuild. The root devenv shell supplies helper tools for the shared checks; the hose build does not read `SDL3_ROOT` or `SDL3_LIBRARY`.
+On October 9, 2026, after the GPU solver and window tracking were added, the hose was built with only the Command Line Tools (runtime shader compilation) on an Apple M3 Pro running macOS 14.3. `--physics-check`, `--display-check`, `--motion-check`, the helper self-test and lifetime check, `--smoke-test`, code signing, and bundled-dependency checks passed. `--probe` reported live WindowServer tracking, and a pouring launch with `--duration` exited cleanly. SkyLight move notifications were confirmed to arrive for every move of another process's window. `--window-check` crashes inside `CAMetalDisplayLink` on this macOS 14.3 machine; the commit before these changes crashes the same way, so the crash is not caused by them. Visual results were checked with `--snapshot`. Live window dragging, rendering on a Retina display, and the macOS 26 corner-radius path still need checking interactively.
 
-On October 9, 2026, `devenv test` rebuilt both examples and passed the physics, display selection, helper, signing, and bundled-dependency checks after the AppKit migration. The hose also built outside devenv with the SDL environment variables removed. Native Metal pixel readback passed for both the CLI executable and packaged app. Both executables' `--window-check` moved the overlay across the built-in Retina display and two LG UltraFine monitors, verified actual window bounds and 2× drawable dimensions, rendered frames, and dispatched Display and Quit menu actions. Duration, SIGINT, and SIGTERM shutdown checks passed, as did a packaged launch through LaunchServices/Finder with a duration limit. The packaged hose links only macOS system libraries. GPU timing remains unmeasured.
+After the liquid presets, particle sizes, and refraction were added, the same machine passed `--physics-check` across all nine size and liquid combinations in ten consecutive runs, plus `--smoke-test`, `--display-check`, `--motion-check`, code signing, and bundled-dependency checks. A launch with saved preferences exited cleanly. Refraction was checked with `--snapshot --refraction`. `--capture-check` could not run there because that process lacked the Screen Recording permission, so live capture and refraction still need checking on a desktop where the permission is granted.
+
+With rubber ducks added (Jolt Physics v5.6.0), `--duck-check` passed repeatedly on the same machine, along with the earlier checks and a launch with `--ducks 3`. Floating ducks settled within 0.05 radians of level. The look was checked with `--snapshot --ducks 5`; dropping ducks with the menu and dragging windows into them are interactive checks.
 
 ## Motion sensor probe
 
@@ -133,46 +199,39 @@ python3 examples/fluid-hose/tools/check-motion-lifetime.py
 
 The lifecycle check force-kills a test owner and verifies the mock reader stops when its control pipe closes. It does not access sensors. Physics, projection, transport, packaged executable, lifecycle, and signing checks passed; live tilt rendering still needs the normal desktop session.
 
-## Performance assessment — October 8, 2026
+## Performance — October 9, 2026
 
-Neighbor caching is integrated into the app and the rebuilt app bundle. It reduced CPU physics step time by approximately 38–43% in these benchmarks, with the same particle trajectories as the original solver. Scratch memory is retained across particles, relaxation iterations, and simulation steps.
+GPU time per 120 Hz step on an Apple M3 Pro with the default fine water (six substeps), measured with Metal command-buffer timestamps. The benchmark uses a 1440 × 900 point canvas, seeds water by sweeping the nozzle across it, lets it settle, then times 240 steps, each in its own command buffer. CPU encoding, rendering, desktop capture, and window tracking are excluded.
 
-The benchmark uses a 1440 × 900 logical canvas, deterministic pouring to seed particles, and 120 settling steps before timing. Each case measures three runs of 180 steps from the same snapshot, with pouring stopped. Setup, snapshot copying, SDL, window enumeration, and Metal rendering are excluded. Apple clang 17 compiles with the app's `-O2` setting on the project's M1 Pro Mac. Times below are milliseconds per step with one window obstacle.
+| Particles | No windows median | 1 window median | 12 windows median | 12 windows p95 | Budget used (12 windows) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4,080 | 0.75 ms | 0.75 ms | 0.80 ms | 0.82 ms | 9.5% |
+| 16,370 | 1.14 ms | 1.16 ms | 1.31 ms | 1.34 ms | 15.7% |
+| 65,520 | 3.01 ms | 3.05 ms | 3.46 ms | 3.51 ms | 41.4% |
 
-| Particles | Original median | Original p95 | Integrated median | Integrated p95 | Median time reduction |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 2,000 | 2.90 | 4.37 | 1.66 | 1.79 | 43% |
-| 4,000 | 7.32 | 11.76 | 4.31 | 4.58 | 41% |
-| 8,000 | 16.40 | 17.95 | 10.09 | 11.36 | 38% |
+Thick and goo use four substeps, so they cost about two thirds as much. A trial capacity of 131,072 fine particles took 7.0 ms per step with 12 windows, 84% of the budget before rendering, so the capacity stays at 65,536.
 
-A 120 Hz simulation has **8.33 ms per step**, with additional CPU work needed for input and rendering submission. At 8,000 particles, the loop's catch-up steps can still consume substantial time before presenting a frame. Further improvement is needed to meet that budget at full capacity. Increasing obstacles from one to twelve changed the original 8,000-particle median by approximately 3% in this scene.
+The previous CPU solver needed about 10 ms per step for 8,000 particles on an M1 Pro, which exceeded the 8.33 ms step budget. Its benchmarks and the neighbor-cache comparison tool remain in the Git history (commit `58eba65`). Rendering cost is not yet measured; the splat pass runs at point resolution, so a 2× Retina display shades a quarter of its pixels there.
 
-The original solver traversed the same neighbors twice in each density-relaxation iteration, recomputing distances both times. Particle positions are fixed until all corrections have been accumulated, so the app now computes and caches those results once per particle. The integrated solver passed the existing physics checks and produced bit-identical particle vertices throughout a 1,800-step, 2,000-particle comparison, including displacement by moving, overlapping windows. Clearing and pouring again also preserves the original trajectories.
-
-The next changes to consider, in priority order:
-
-1. **Reduce idle rendering.** The current loop renders both passes even with no water or when paused. Retain the last frame when the visible state is unchanged, while continuing to poll the global pointer, Option key, menu controls, and window bounds.
-2. **Measure and reduce GPU work.** Both passes currently use the drawable's full pixel dimensions. On a 2× Retina display, a density field at logical resolution would contain 75% fewer pixels while the final output could remain native resolution. The surface shader can also skip its four gradient samples and lighting on empty pixels, provided it preserves the nozzle. These are unmeasured candidates; density resolution can affect edge detail and lighting. Record [GPU start](https://developer.apple.com/documentation/metal/mtlcommandbuffer/gpustarttime) and [end](https://developer.apple.com/documentation/metal/mtlcommandbuffer/gpuendtime) timestamps in command-buffer completion handlers before choosing a rendering change.
-3. **For a larger solver improvement, process unordered neighbor pairs once or redesign for parallel updates.** Current corrections write into other particles, so simply threading the loop would introduce data races. A 60 Hz physics preset would reduce tick count, but the pressure terms depend on `dt²` and require behavior and stability checks.
-
-Reproduce the CPU measurements from the workspace root:
+Reproduce from the workspace root:
 
 ```sh
 ./examples/fluid-hose/tools/benchmark-physics.sh
-./examples/fluid-hose/tools/benchmark-neighbor-cache.py
-./examples/fluid-hose/tools/benchmark-neighbor-cache.py --baseline
+./examples/fluid-hose/tools/benchmark-physics.sh --quick
 ```
 
-Both tools accept `--quick` for a 2,000-particle check. `--profile` adds a 15-second steady workload for sampling in a normal desktop session. The neighbor-cache tool loads the original solver from commit `ed0f543`, generates comparison files under `build/performance`, and verifies equivalence before benchmarking the integrated solver. `--baseline` benchmarks the original instead. This comparison tool requires the repository's Git history; the plain physics benchmark requires no Git or SDL dependencies.
-
-Raw results: [original solver](benchmarks/2026-10-08-physics-baseline.csv), [neighbor-cache prototype](benchmarks/2026-10-08-physics-cached-neighbors.csv), and [integrated solver](benchmarks/2026-10-08-physics-integrated.csv). These are standalone wall-clock timings from the development sandbox, with scheduling outliers and no CPU affinity or thermal isolation; they are not live app frame rates. The CSV budget percentage is mean step time divided by 8.33 ms, rather than measured OS CPU utilization. GPU timings and the cost of Quartz window enumeration remain unmeasured. External process sampling was denied by the sandbox.
-
+Raw results: [benchmarks/2026-10-09-gpu-solver.csv](benchmarks/2026-10-09-gpu-solver.csv).
 ## Code
 
-- [src/main.cpp](src/main.cpp): command-line options and C++ fixed-step simulation callbacks.
-- [src/fluid_sim.cpp](src/fluid_sim.cpp): gravity, density relaxation, collision, and nozzle placement.
-- [src/desktop.mm](src/desktop.mm): AppKit application lifecycle and display link, native overlay window, display and window metadata, Option-key state, menu-bar controls, and Metal rendering.
-- [src/fluid.metal](src/fluid.metal): density splats, water surface shading, and the nozzle.
+- [src/main.cpp](src/main.cpp): command-line options and the fixed-step frame loop.
+- [src/fluid_sim.mm](src/fluid_sim.mm): particle sizes and liquid presets, step recording and encoding, hose placement, and physics checks.
+- [src/fluid_solver.metal](src/fluid_solver.metal): position-based fluid compute kernels and rounded-window collision.
+- [src/window_tracker.mm](src/window_tracker.mm): live window tracking through SkyLight notifications, with a polling fallback.
+- [src/desktop.mm](src/desktop.mm): AppKit application lifecycle and display link, native overlay window, display metadata, Option-key state, menu-bar controls and saved preferences, Metal rendering, and offscreen snapshots.
+- [src/screen_capture.mm](src/screen_capture.mm): ScreenCaptureKit desktop capture for refraction.
+- [src/duck_world.cpp](src/duck_world.cpp): Jolt Physics rubber ducks, window and wall bodies, buoyancy and drag, and duck checks.
+- [tools/build-jolt.sh](tools/build-jolt.sh): builds the pinned Jolt Physics submodule into a cached static library.
+- [src/fluid.metal](src/fluid.metal): particle splats, field smoothing, rubber duck drawing, water surface shading, and the nozzle.
 - [src/fluid_types.h](src/fluid_types.h): shared CPU/GPU data layouts.
 - [tools/probe_motion.cpp](tools/probe_motion.cpp): SPU motion sensor activation and live sample diagnostics.
 - [src/motion.cpp](src/motion.cpp): gravity estimation, display projection, and ownership of the reader process.

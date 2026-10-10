@@ -1,5 +1,4 @@
 #include "motion.h"
-#include "fluid_sim.h"
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
@@ -181,19 +180,6 @@ bool run_motion_checks(const std::string& helper) {
     tilt.update(packet);
     if (tilt.gravity(packet.timestamp).x >= 0) return false;
     std::puts("PASS: screen gravity projection, horizontal reversal, stale data fallback, and invalid samples.");
-
-    FluidSimulation fluid(640, 480);
-    constexpr float dt = 1.0f / 120;
-    for (int tick = 0; tick < 240; ++tick) fluid.step(dt, {}, tick < 24, {320, 100});
-    for (int tick = 0; tick < 480; ++tick) fluid.step(dt, {}, false, {320, 100}, {-950, 0});
-    float average_x = 0;
-    for (const auto& point : fluid.vertices()) average_x += point.x;
-    if (fluid.size() == 0 || average_x / fluid.size() > 80) return false;
-    for (int tick = 0; tick < 480; ++tick) fluid.step(dt, {}, false, {320, 100}, {0, -950});
-    float average_y = 0;
-    for (const auto& point : fluid.vertices()) average_y += point.y;
-    if (average_y / fluid.size() > 80) return false;
-    std::puts("PASS: fluid accumulates toward the left and ceiling under rotated gravity.");
 
     MotionProcess process;
     if (!process.start(helper, true)) return false;

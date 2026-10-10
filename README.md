@@ -7,9 +7,9 @@ Native macOS examples for interactive graphics and desktop fluid simulation, bui
 | Example | Behavior | Implementation |
 | --- | --- | --- |
 | [Floating triangle](examples/floating-triangle/README.md) | A rotating colored triangle in a standard window or a transparent, draggable floating window. | SDL3 handles windows and events. Standard mode renders through SDL GPU's Metal backend; floating mode renders through native Metal. |
-| [Fluid hose](examples/fluid-hose/README.md) | A transparent desktop overlay where water lands on window tops, flows around their edges, and pools above the Dock. | AppKit handles the window, menus, displays, and event loop. C++ simulates the fluid; native Metal renders it. |
+| [Fluid hose](examples/fluid-hose/README.md) | A transparent desktop overlay where water lands on window tops, drips off their edges, pools above the Dock, and sloshes when you drag windows through it. Rubber ducks float in it. | AppKit handles the window, menus, displays, and event loop. Position-based fluids run in Metal compute shaders; WindowServer notifications track windows live; native Metal renders the water. |
 
-The hose operates on one selected display at a time. Collision geometry consists of axis-aligned window rectangles. Display selection is remembered by monitor UUID, and optional Mac tilt controls gravity on supported sensor hardware.
+The hose operates on one selected display at a time. Windows collide as rounded rectangles that carry their motion into the water. Display selection is remembered by monitor UUID, and optional Mac tilt controls gravity on supported sensor hardware.
 
 ## Development setup
 
@@ -32,7 +32,7 @@ The same build is available as a single command:
 devenv shell -- build-examples
 ```
 
-Each example's `build.sh` builds that example individually. The triangle uses the SDL SDK supplied by devenv. The hose uses Xcode's tools and macOS system frameworks directly:
+Each example's `build.sh` builds that example individually. The triangle uses the SDL SDK supplied by devenv. The hose uses Xcode's tools and macOS system frameworks directly; without full Xcode it also builds with only the Command Line Tools, bundling its shader source for Metal to compile at launch:
 
 ```sh
 ./examples/fluid-hose/build.sh
@@ -65,6 +65,7 @@ Launch scripts and resource lookup use paths relative to the example. Both bundl
 | --- | --- |
 | SDL3 headers and library | The triangle uses matching SDL 3.4.10 headers and library from the Nixpkgs revision pinned in `devenv.lock`. |
 | Bash, Git, and Python | Supplied by the same locked Nixpkgs revision. Python tools use the standard library. |
+| Jolt Physics | The hose's rubber ducks use [Jolt Physics](https://github.com/jrouwe/JoltPhysics) v5.6.0 (MIT), a Git submodule at `examples/fluid-hose/third_party/JoltPhysics`. The hose build fetches it if missing, compiles it once into `build/jolt/libJolt.a`, and bundles its license. |
 | C++ and Objective-C++ compiler, macOS SDK, and Metal compiler | Supplied by the active Xcode installation and accessed through `xcrun`. |
 | macOS runtime frameworks | AppKit, Foundation, Metal, QuartzCore, CoreGraphics, and the motion helper's CoreFoundation and IOKit dependencies are supplied by macOS. |
 | App resources and signatures | Build scripts compile tracked shader sources into `.metallib` files, assemble the app bundles, and apply local ad hoc code signatures. The triangle bundles a signed copy of SDL3 with an `@rpath` install name. |

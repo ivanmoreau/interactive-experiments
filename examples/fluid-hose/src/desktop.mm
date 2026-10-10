@@ -3,8 +3,11 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CAMetalDisplayLink.h>
+#import <ImageIO/ImageIO.h>
 #include "desktop.h"
 #include "fluid_sim.h"
+#include "screen_capture.h"
+#include "duck_world.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdarg>
@@ -20,7 +23,7 @@ static thread_local std::string last_desktop_error;
 
 const char* desktop_error() { return last_desktop_error.c_str(); }
 
-static bool set_desktop_error(const char* format, ...) {
+bool set_desktop_error(const char* format, ...) {
     char message[2048];
     va_list arguments;
     va_start(arguments, format);
@@ -95,6 +98,17 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 @property(nonatomic) BOOL tiltEnabled;
 @property(nonatomic) BOOL reverseTilt;
 @property(nonatomic) DesktopDisplayID requestedDisplay;
+@property(nonatomic) NSInteger particleSize;
+@property(nonatomic) NSInteger liquidFeel;
+@property(nonatomic) BOOL refraction;
+@property(nonatomic) double flowRate;
+@property(nonatomic) NSInteger duckRequests;
+@property(nonatomic) BOOL removeDucksRequested;
+@property(nonatomic, strong) NSMenuItem* flowItem;
+@property(nonatomic, strong) NSMenu* flowMenu;
+@property(nonatomic) CFMachPortRef scrollTap;
+@property(nonatomic, strong) NSMenu* sizeMenu;
+@property(nonatomic, strong) NSMenu* liquidMenu;
 - (void)togglePour:(NSMenuItem*)sender;
 - (void)togglePause:(NSMenuItem*)sender;
 - (void)clearWater:(NSMenuItem*)sender;
@@ -102,6 +116,14 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 - (void)toggleTilt:(NSMenuItem*)sender;
 - (void)toggleReverseTilt:(NSMenuItem*)sender;
 - (void)selectDisplay:(NSMenuItem*)sender;
+- (void)selectSize:(NSMenuItem*)sender;
+- (void)selectLiquid:(NSMenuItem*)sender;
+- (void)toggleRefraction:(NSMenuItem*)sender;
+- (void)selectFlow:(NSMenuItem*)sender;
+- (void)addDuck:(NSMenuItem*)sender;
+- (void)removeDucks:(NSMenuItem*)sender;
+- (void)adjustFlowByScroll:(double)points;
+- (void)updateFlowMenu;
 @end
 
 @implementation FluidMenuController
@@ -126,6 +148,42 @@ static NSRect appkit_canvas_frame(const DesktopRect& canvas) {
 - (void)selectDisplay:(NSMenuItem*)sender {
     self.requestedDisplay = [sender.representedObject unsignedIntValue];
 }
+static void check_only(NSMenu* menu, NSInteger tag) {
+    for (NSMenuItem* item in menu.itemArray)
+        if (item.action) item.state = item.tag == tag ? NSControlStateValueOn : NSControlStateValueOff;
+}
+- (void)selectSize:(NSMenuItem*)sender {
+    self.particleSize = sender.tag;
+    check_only(self.sizeMenu, sender.tag);
+}
+- (void)selectLiquid:(NSMenuItem*)sender {
+    self.liquidFeel = sender.tag;
+    check_only(self.liquidMenu, sender.tag);
+}
+static const double flow_presets[] = {0.25, 0.5, 1.0, 1.5, 2.0, 3.0};
+- (void)addDuck:(NSMenuItem*)sender { (void)sender; self.duckRequests += 1; }
+- (void)removeDucks:(NSMenuItem*)sender { (void)sender; self.removeDucksRequested = YES; }
+- (void)selectFlow:(NSMenuItem*)sender {
+    self.flowRate = flow_presets[sender.tag];
+    [self updateFlowMenu];
+}
+- (void)adjustFlowByScroll:(double)points {
+    // Exponential, so each scroll step changes the flow by the same proportion.
+    self.flowRate = std::clamp(self.flowRate * std::exp(points * 0.008), static_cast<double>(FluidSimulation::min_flow),
+                               static_cast<double>(FluidSimulation::max_flow));
+    [self updateFlowMenu];
+}
+- (void)updateFlowMenu {
+    self.flowItem.title = [NSString stringWithFormat:@"Flow: %.2g×", self.flowRate];
+    for (NSMenuItem* item in self.flowMenu.itemArray)
+        if (item.action) item.state = std::abs(flow_presets[item.tag] - self.flowRate) < 0.01 ? NSControlStateValueOn : NSControlStateValueOff;
+}
+- (void)toggleRefraction:(NSMenuItem*)sender {
+    self.refraction = !self.refraction;
+    // The first request shows the macOS Screen Recording prompt.
+    if (self.refraction) ScreenCapture::request_permission();
+    sender.state = self.refraction ? NSControlStateValueOn : NSControlStateValueOff;
+}
 @end
 
 struct HoseRenderer {
@@ -138,13 +196,25 @@ struct HoseRenderer {
     CAMetalLayer* layer = nil;
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
-    id<MTLRenderPipelineState> density_pipeline = nil;
+    id<MTLRenderPipelineState> splat_pipeline = nil;
     id<MTLRenderPipelineState> surface_pipeline = nil;
+    id<MTLRenderPipelineState> blur_pipeline = nil;
+    id<MTLRenderPipelineState> duck_pipeline = nil;
+    id<MTLTexture> duck_layer = nil;
+    id<MTLTexture> blurred = nil;   // horizontal pass
+    id<MTLTexture> smoothed = nil;  // both passes, with a mip chain
     id<MTLTexture> field = nil;
-    id<MTLBuffer> buffers[3] = {nil, nil, nil};
+    id<MTLTexture> no_background = nil;
     id<MTLCommandBuffer> last_submission = nil;
+    ScreenCapture capture;
+    bool refraction = false;
+    DesktopDisplay refraction_display{};
+    CaptureState previous_capture_state = CaptureState::starting;
+    NSMenuItem* refraction_status = nil;
+    CFMachPortRef scroll_tap = nullptr;
+    CFRunLoopSourceRef scroll_source = nullptr;
+    id scroll_monitor = nil;
     dispatch_semaphore_t available = dispatch_semaphore_create(3);
-    unsigned slot = 0;
     NSStatusItem* status_item = nil;
     FluidMenuController* controls = nil;
     NSMenuItem* tilt_status = nil;
@@ -157,6 +227,16 @@ struct HoseRenderer {
     ~HoseRenderer() {
         @autoreleasepool {
             if (status_item) [NSStatusBar.systemStatusBar removeStatusItem:status_item];
+            if (scroll_source) {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), scroll_source, kCFRunLoopCommonModes);
+                CFRelease(scroll_source);
+            }
+            if (scroll_tap) {
+                CGEventTapEnable(scroll_tap, false);
+                CFMachPortInvalidate(scroll_tap);
+                CFRelease(scroll_tap);
+            }
+            if (scroll_monitor) [NSEvent removeMonitor:scroll_monitor];
             if (queue) {
                 id<MTLCommandBuffer> barrier = [queue commandBuffer];
                 [barrier commit];
@@ -170,28 +250,28 @@ struct HoseRenderer {
     }
 
     bool initialize(const char* shader_file) {
-        device = MTLCreateSystemDefaultDevice();
+        device = hose_metal_device();
         if (!device) return set_desktop_error("No Metal device is accessible to this process");
         device_name = device.name.UTF8String;
-        queue = [device newCommandQueue];
+        queue = hose_metal_queue();
         if (!queue) return set_desktop_error("Cannot create the fluid command queue");
         NSError* error = nil;
-        NSString* filename = [NSString stringWithUTF8String:shader_file];
-        if (!filename) return set_desktop_error("Invalid shader path encoding");
-        id<MTLLibrary> library = [device newLibraryWithURL:[NSURL fileURLWithPath:filename] error:&error];
-        if (!library) return set_desktop_error("Load fluid shaders: %s", error.localizedDescription.UTF8String);
+        id<MTLLibrary> library = hose_shader_library(shader_file);
+        if (!library) return false;
 
         MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
-        descriptor.vertexFunction = [library newFunctionWithName:@"density_vertex"];
-        descriptor.fragmentFunction = [library newFunctionWithName:@"density_fragment"];
-        descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatR16Float;
+        descriptor.vertexFunction = [library newFunctionWithName:@"splat_vertex"];
+        descriptor.fragmentFunction = [library newFunctionWithName:@"splat_fragment"];
+        descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
         descriptor.colorAttachments[0].blendingEnabled = YES;
         descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
         descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
         descriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-        descriptor.colorAttachments[0].writeMask = MTLColorWriteMaskRed;
-        density_pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
-        if (!density_pipeline) return set_desktop_error("Create fluid density pipeline: %s", error.localizedDescription.UTF8String);
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        splat_pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+        if (!splat_pipeline) return set_desktop_error("Create fluid splat pipeline: %s", error.localizedDescription.UTF8String);
 
         descriptor = [[MTLRenderPipelineDescriptor alloc] init];
         descriptor.vertexFunction = [library newFunctionWithName:@"surface_vertex"];
@@ -199,27 +279,52 @@ struct HoseRenderer {
         descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         surface_pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
         if (!surface_pipeline) return set_desktop_error("Create fluid surface pipeline: %s", error.localizedDescription.UTF8String);
-        for (auto& buffer : buffers) {
-            buffer = [device newBufferWithLength:FluidSimulation::capacity * sizeof(FluidVertex) options:MTLResourceStorageModeShared];
-            if (!buffer) return set_desktop_error("Cannot allocate fluid particle buffers");
-        }
+        descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+        descriptor.vertexFunction = [library newFunctionWithName:@"surface_vertex"];
+        descriptor.fragmentFunction = [library newFunctionWithName:@"blur_fragment"];
+        descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+        blur_pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+        if (!blur_pipeline) return set_desktop_error("Create fluid blur pipeline: %s", error.localizedDescription.UTF8String);
+        descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+        descriptor.vertexFunction = [library newFunctionWithName:@"duck_vertex"];
+        descriptor.fragmentFunction = [library newFunctionWithName:@"duck_fragment"];
+        descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        descriptor.colorAttachments[0].blendingEnabled = YES;
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        duck_pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+        if (!duck_pipeline) return set_desktop_error("Create duck pipeline: %s", error.localizedDescription.UTF8String);
+        MTLTextureDescriptor* placeholder = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                              width:1 height:1 mipmapped:NO];
+        no_background = [device newTextureWithDescriptor:placeholder];
+        if (!no_background) return set_desktop_error("Cannot allocate the fluid background placeholder");
         return true;
     }
 
-    id<MTLCommandBuffer> encode(id<MTLTexture> target, const std::vector<FluidVertex>& particles,
-                                const SceneUniforms& scene) {
-        if (!field || field.width != target.width || field.height != target.height) {
-            MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float
-                                                                                               width:target.width height:target.height mipmapped:NO];
-            descriptor.storageMode = MTLStorageModePrivate;
-            descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-            field = [device newTextureWithDescriptor:descriptor];
-            if (!field) { set_desktop_error("Cannot allocate the fluid density field"); return nil; }
+    // Splats particles into a fluid field at point resolution, builds its mip
+    // chain for smooth thickness lookups, then shades the water surface.
+    bool encode(id<MTLCommandBuffer> commands, id<MTLTexture> target, id<MTLBuffer> particles, SceneUniforms scene,
+                id<MTLTexture> background = nil, const std::vector<DuckBody>& ducks = {}) {
+        const NSUInteger reduction = scene.scale >= 1.5f ? 2 : 1;
+        const NSUInteger width = std::max<NSUInteger>(1, target.width / reduction);
+        const NSUInteger height = std::max<NSUInteger>(1, target.height / reduction);
+        if (!field || field.width != width || field.height != height) {
+            auto texture = [&](bool mipmapped) {
+                MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                                                                                   width:width height:height
+                                                                                               mipmapped:mipmapped];
+                descriptor.mipmapLevelCount = std::min<NSUInteger>(descriptor.mipmapLevelCount, 6);
+                descriptor.storageMode = MTLStorageModePrivate;
+                descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                return [device newTextureWithDescriptor:descriptor];
+            };
+            field = texture(false);
+            blurred = texture(false);
+            smoothed = texture(true);
+            if (!field || !blurred || !smoothed) return set_desktop_error("Cannot allocate the fluid field");
         }
-        id<MTLCommandBuffer> commands = [queue commandBuffer];
-        if (!commands) { set_desktop_error("Cannot allocate fluid commands"); return nil; }
-        const std::size_t count = std::min(particles.size(), FluidSimulation::capacity);
-        if (count) std::memcpy(buffers[slot].contents, particles.data(), count * sizeof(FluidVertex));
 
         MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
         pass.colorAttachments[0].texture = field;
@@ -227,14 +332,64 @@ struct HoseRenderer {
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
         id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
-        if (!encoder) { set_desktop_error("Cannot begin the fluid density pass"); return nil; }
-        if (count) {
-            [encoder setRenderPipelineState:density_pipeline];
+        if (!encoder) return set_desktop_error("Cannot begin the fluid splat pass");
+        if (scene.count && particles) {
+            [encoder setRenderPipelineState:splat_pipeline];
             [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:0];
-            [encoder setVertexBuffer:buffers[slot] offset:0 atIndex:1];
+            [encoder setVertexBuffer:particles offset:0 atIndex:1];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6 instanceCount:scene.count];
+        }
+        [encoder endEncoding];
+
+        // Blur by about 60% of a splat radius, in field texels: wide enough to
+        // flatten bumps a few particles across.
+        const float texels_per_point = scene.scale / reduction;
+        const float sigma = std::max(0.5f, scene.particle_radius * 0.6f * texels_per_point);
+        const std::pair<id<MTLTexture>, id<MTLTexture>> passes[2] = {{field, blurred}, {blurred, smoothed}};
+        for (int axis = 0; axis < 2; ++axis) {
+            pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = passes[axis].second;
+            pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            encoder = [commands renderCommandEncoderWithDescriptor:pass];
+            if (!encoder) return set_desktop_error("Cannot begin the fluid blur pass");
+            const float parameters[4] = {axis == 0 ? 1.0f / width : 0.0f, axis == 1 ? 1.0f / height : 0.0f, sigma, 0};
+            [encoder setRenderPipelineState:blur_pipeline];
+            [encoder setFragmentBytes:parameters length:sizeof(parameters) atIndex:0];
+            [encoder setFragmentTexture:passes[axis].first atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [encoder endEncoding];
+        }
+        // Ducks are drawn at full resolution into their own layer.
+        if (!duck_layer || duck_layer.width != target.width || duck_layer.height != target.height) {
+            MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                               width:target.width height:target.height
+                                                                                           mipmapped:NO];
+            descriptor.storageMode = MTLStorageModePrivate;
+            descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            duck_layer = [device newTextureWithDescriptor:descriptor];
+            if (!duck_layer) return set_desktop_error("Cannot allocate the duck layer");
+        }
+        pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = duck_layer;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        encoder = [commands renderCommandEncoderWithDescriptor:pass];
+        if (!encoder) return set_desktop_error("Cannot begin the duck pass");
+        if (!ducks.empty()) {
+            const std::size_t count = std::min(ducks.size(), FluidSimulation::max_ducks);
+            [encoder setRenderPipelineState:duck_pipeline];
+            [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:0];
+            [encoder setVertexBytes:ducks.data() length:count * sizeof(DuckBody) atIndex:1];
             [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6 instanceCount:count];
         }
         [encoder endEncoding];
+
+        id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
+        if (!blit) return set_desktop_error("Cannot build the fluid field mip chain");
+        [blit generateMipmapsForTexture:smoothed];
+        [blit endEncoding];
 
         pass = [MTLRenderPassDescriptor renderPassDescriptor];
         pass.colorAttachments[0].texture = target;
@@ -242,17 +397,55 @@ struct HoseRenderer {
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
         encoder = [commands renderCommandEncoderWithDescriptor:pass];
-        if (!encoder) { set_desktop_error("Cannot begin the fluid surface pass"); return nil; }
+        if (!encoder) return set_desktop_error("Cannot begin the fluid surface pass");
         [encoder setRenderPipelineState:surface_pipeline];
         [encoder setFragmentBytes:&scene length:sizeof(scene) atIndex:0];
-        [encoder setFragmentTexture:field atIndex:0];
+        [encoder setFragmentTexture:smoothed atIndex:0];
+        [encoder setFragmentTexture:background ? background : no_background atIndex:1];
+        [encoder setFragmentTexture:duck_layer atIndex:2];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [encoder endEncoding];
-        return commands;
+        return true;
     }
 };
 
-HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader_file, bool continuous, bool tilt) {
+// Option+scroll changes the flow. An event tap can consume those scroll events
+// so the window under the pointer does not also scroll; it needs the
+// Accessibility permission, so without it a passive monitor is used instead.
+static CGEventRef scroll_tap_callback(CGEventTapProxy, CGEventType type, CGEventRef event, void* context) {
+    FluidMenuController* controls = (__bridge FluidMenuController*)context;
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        if (controls.scrollTap) CGEventTapEnable(controls.scrollTap, true);
+        return event;
+    }
+    if (type != kCGEventScrollWheel || !(CGEventGetFlags(event) & kCGEventFlagMaskAlternate)) return event;
+    const bool continuous = CGEventGetIntegerValueField(event, kCGScrollWheelEventIsContinuous) != 0;
+    const double points = continuous ? CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis1)
+                                     : CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1) * 12.0;
+    [controls adjustFlowByScroll:points];
+    return nullptr;
+}
+
+static bool watch_flow_scrolling(HoseRenderer* renderer) {
+    FluidMenuController* controls = renderer->controls;
+    renderer->scroll_tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
+                                            CGEventMaskBit(kCGEventScrollWheel), scroll_tap_callback,
+                                            (__bridge void*)controls);
+    if (renderer->scroll_tap) {
+        controls.scrollTap = renderer->scroll_tap;
+        renderer->scroll_source = CFMachPortCreateRunLoopSource(nullptr, renderer->scroll_tap, 0);
+        CFRunLoopAddSource(CFRunLoopGetMain(), renderer->scroll_source, kCFRunLoopCommonModes);
+        return true;
+    }
+    renderer->scroll_monitor = [NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskScrollWheel handler:^(NSEvent* event) {
+        if (!(event.modifierFlags & NSEventModifierFlagOption)) return;
+        [controls adjustFlowByScroll:event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 12.0];
+    }];
+    return false;
+}
+
+HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader_file, bool continuous, bool tilt,
+                                   FluidSettings settings, bool refraction, float flow) {
     @autoreleasepool {
         auto renderer = std::make_unique<HoseRenderer>();
         if (!renderer->initialize(shader_file)) return nullptr;
@@ -278,6 +471,10 @@ HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader
         if (!renderer->layer) { set_desktop_error("Cannot create the native Metal layer"); return nullptr; }
         renderer->layer.device = renderer->device;
         renderer->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        // Captured desktop frames are sRGB too, so refracted pixels match the desktop around them.
+        CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        renderer->layer.colorspace = srgb;
+        CGColorSpaceRelease(srgb);
         renderer->layer.opaque = NO;
         renderer->layer.framebufferOnly = YES;
         renderer->layer.displaySyncEnabled = YES;
@@ -288,6 +485,10 @@ HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader
         renderer->controls = [[FluidMenuController alloc] init];
         renderer->controls.pouring = continuous;
         renderer->controls.tiltEnabled = tilt;
+        renderer->controls.particleSize = static_cast<NSInteger>(settings.size);
+        renderer->controls.liquidFeel = static_cast<NSInteger>(settings.feel);
+        renderer->controls.refraction = refraction;
+        renderer->controls.flowRate = flow;
         renderer->status_item = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
         renderer->status_item.button.title = @"💧";
         renderer->status_item.button.toolTip = @"Fluid Hose — hold Option to pour";
@@ -311,6 +512,52 @@ HoseRenderer* create_hose_renderer(const DesktopRect& canvas, const char* shader
         NSMenuItem* clear = [[NSMenuItem alloc] initWithTitle:@"Clear water" action:@selector(clearWater:) keyEquivalent:@""];
         clear.target = renderer->controls;
         [menu addItem:clear];
+        NSMenuItem* duck = [[NSMenuItem alloc] initWithTitle:@"Add rubber duck 🦆" action:@selector(addDuck:) keyEquivalent:@""];
+        duck.target = renderer->controls;
+        [menu addItem:duck];
+        NSMenuItem* no_ducks = [[NSMenuItem alloc] initWithTitle:@"Remove ducks" action:@selector(removeDucks:) keyEquivalent:@""];
+        no_ducks.target = renderer->controls;
+        [menu addItem:no_ducks];
+        [menu addItem:NSMenuItem.separatorItem];
+        auto submenu = [&](NSString* title, NSArray<NSString*>* options, SEL action, NSInteger selected, NSString* hint) {
+            NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""];
+            NSMenu* choices = [[NSMenu alloc] initWithTitle:title];
+            for (NSUInteger i = 0; i < options.count; ++i) {
+                NSMenuItem* option = [[NSMenuItem alloc] initWithTitle:options[i] action:action keyEquivalent:@""];
+                option.target = renderer->controls;
+                option.tag = static_cast<NSInteger>(i);
+                option.state = option.tag == selected ? NSControlStateValueOn : NSControlStateValueOff;
+                [choices addItem:option];
+            }
+            if (hint) {
+                [choices addItem:NSMenuItem.separatorItem];
+                NSMenuItem* note = [[NSMenuItem alloc] initWithTitle:hint action:nil keyEquivalent:@""];
+                note.enabled = NO;
+                [choices addItem:note];
+            }
+            item.submenu = choices;
+            [menu addItem:item];
+            return choices;
+        };
+        const bool scroll_consumed = watch_flow_scrolling(renderer.get());
+        renderer->controls.flowMenu = submenu(@"Flow", @[@"0.25×", @"0.5×", @"1×", @"1.5×", @"2×", @"3×"],
+                                              @selector(selectFlow:), -1,
+                                              scroll_consumed ? @"Option+scroll adjusts the flow"
+                                                              : @"Option+scroll adjusts the flow (allow Accessibility to stop it also scrolling windows)");
+        renderer->controls.flowItem = menu.itemArray.lastObject;
+        [renderer->controls updateFlowMenu];
+        renderer->controls.liquidMenu = submenu(@"Liquid", @[@"Water", @"Thick", @"Goo"], @selector(selectLiquid:),
+                                                renderer->controls.liquidFeel, nil);
+        renderer->controls.sizeMenu = submenu(@"Particle size", @[@"Fine — most detail", @"Medium", @"Coarse — most water"],
+                                              @selector(selectSize:), renderer->controls.particleSize,
+                                              @"Changing the size clears the water");
+        NSMenuItem* refract = [[NSMenuItem alloc] initWithTitle:@"Refract the desktop" action:@selector(toggleRefraction:) keyEquivalent:@""];
+        refract.target = renderer->controls;
+        refract.state = refraction ? NSControlStateValueOn : NSControlStateValueOff;
+        [menu addItem:refract];
+        renderer->refraction_status = [[NSMenuItem alloc] initWithTitle:@"Refraction: off" action:nil keyEquivalent:@""];
+        renderer->refraction_status.enabled = NO;
+        [menu addItem:renderer->refraction_status];
         [menu addItem:NSMenuItem.separatorItem];
         NSMenuItem* tilt_item = [[NSMenuItem alloc] initWithTitle:@"Use Mac tilt" action:@selector(toggleTilt:) keyEquivalent:@""];
         tilt_item.target = renderer->controls;
@@ -473,7 +720,15 @@ DesktopInput poll_desktop_input(HoseRenderer* renderer, const DesktopRect& canva
                            static_cast<bool>(renderer->controls.paused), static_cast<bool>(renderer->controls.clearRequested),
                            static_cast<bool>(renderer->controls.quitRequested),
                            static_cast<bool>(renderer->controls.tiltEnabled), static_cast<bool>(renderer->controls.reverseTilt),
-                           renderer->controls.requestedDisplay};
+                           renderer->controls.requestedDisplay,
+                           {static_cast<ParticleSize>(renderer->controls.particleSize),
+                            static_cast<LiquidFeel>(renderer->controls.liquidFeel)},
+                           static_cast<bool>(renderer->controls.refraction),
+                           static_cast<float>(renderer->controls.flowRate),
+                           static_cast<unsigned>(renderer->controls.duckRequests),
+                           static_cast<bool>(renderer->controls.removeDucksRequested)};
+        renderer->controls.duckRequests = 0;
+        renderer->controls.removeDucksRequested = NO;
         renderer->controls.clearRequested = NO;
         renderer->controls.requestedDisplay = 0;
         return input;
@@ -489,6 +744,50 @@ void set_hose_tilt_status(HoseRenderer* renderer, TiltStatus status) {
             case TiltStatus::waiting: renderer->tilt_status.title = @"Tilt: waiting for motion"; break;
             case TiltStatus::active: renderer->tilt_status.title = @"Tilt: active"; break;
             case TiltStatus::unavailable: renderer->tilt_status.title = @"Tilt: unavailable — gravity down"; break;
+        }
+    }
+}
+
+bool run_capture_check() {
+    @autoreleasepool {
+        if (!CGPreflightScreenCaptureAccess())
+            return set_desktop_error("Screen Recording permission is not granted to this process or its terminal");
+        ScreenCapture capture;
+        capture.start(CGMainDisplayID(), 1.0);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!capture.latest_frame() && capture.state() != CaptureState::failed && capture.state() != CaptureState::denied &&
+               std::chrono::steady_clock::now() < deadline)
+            [NSRunLoop.mainRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        HoseCaptureFrame* frame = capture.latest_frame();
+        capture.stop();
+        if (!frame) return set_desktop_error("No desktop frame arrived from ScreenCaptureKit");
+        std::printf("PASS: ScreenCaptureKit delivered a %lu × %lu desktop frame as a Metal texture.\n",
+                    static_cast<unsigned long>(frame.texture.width), static_cast<unsigned long>(frame.texture.height));
+        return true;
+    }
+}
+
+void set_hose_refraction(HoseRenderer* renderer, bool enabled, const DesktopDisplay& display) {
+    const bool restart = enabled && (!renderer->refraction || renderer->refraction_display.id != display.id ||
+                                     !same_rect(renderer->refraction_display.bounds, display.bounds));
+    renderer->refraction_display = display;
+    renderer->refraction = enabled;
+    if (!enabled && renderer->capture.state() != CaptureState::off) renderer->capture.stop();
+    if (restart) {
+        NSScreen* screen = renderer->window.screen;
+        renderer->capture.start(display.id, screen ? screen.backingScaleFactor : 2.0);
+    }
+    const CaptureState state = renderer->capture.state();
+    if (state == renderer->previous_capture_state) return;
+    renderer->previous_capture_state = state;
+    @autoreleasepool {
+        switch (state) {
+            case CaptureState::off: renderer->refraction_status.title = @"Refraction: off"; break;
+            case CaptureState::starting: renderer->refraction_status.title = @"Refraction: starting"; break;
+            case CaptureState::active: renderer->refraction_status.title = @"Refraction: active"; break;
+            case CaptureState::denied:
+                renderer->refraction_status.title = @"Refraction: allow Screen Recording in System Settings, then relaunch"; break;
+            case CaptureState::failed: renderer->refraction_status.title = @"Refraction: capture unavailable"; break;
         }
     }
 }
@@ -531,6 +830,32 @@ std::string saved_hose_display() {
     }
 }
 
+FluidPreferences saved_hose_preferences() {
+    @autoreleasepool {
+        NSUserDefaults* preferences = [[NSUserDefaults alloc] initWithSuiteName:@"local.interactive-experiences.fluid-hose"];
+        FluidPreferences saved;
+        if ([preferences objectForKey:@"ParticleSize"])
+            saved.fluid.size = static_cast<ParticleSize>(std::clamp<NSInteger>([preferences integerForKey:@"ParticleSize"], 0, 2));
+        if ([preferences objectForKey:@"LiquidFeel"])
+            saved.fluid.feel = static_cast<LiquidFeel>(std::clamp<NSInteger>([preferences integerForKey:@"LiquidFeel"], 0, 2));
+        saved.refraction = [preferences boolForKey:@"Refraction"];
+        if ([preferences objectForKey:@"FlowRate"])
+            saved.flow = std::clamp(static_cast<float>([preferences doubleForKey:@"FlowRate"]),
+                                    FluidSimulation::min_flow, FluidSimulation::max_flow);
+        return saved;
+    }
+}
+
+void save_hose_preferences(const FluidPreferences& saved) {
+    @autoreleasepool {
+        NSUserDefaults* preferences = [[NSUserDefaults alloc] initWithSuiteName:@"local.interactive-experiences.fluid-hose"];
+        [preferences setInteger:static_cast<NSInteger>(saved.fluid.size) forKey:@"ParticleSize"];
+        [preferences setInteger:static_cast<NSInteger>(saved.fluid.feel) forKey:@"LiquidFeel"];
+        [preferences setBool:saved.refraction forKey:@"Refraction"];
+        [preferences setDouble:saved.flow forKey:@"FlowRate"];
+    }
+}
+
 void save_hose_display(const DesktopDisplay& display) {
     if (display.uuid.empty()) return;
     @autoreleasepool {
@@ -562,37 +887,8 @@ void set_hose_displays(HoseRenderer* renderer, const std::vector<DesktopDisplay>
     }
 }
 
-bool read_window_obstacles(const DesktopRect& canvas, std::vector<WindowRect>& output) {
-    @autoreleasepool {
-        NSArray* windows = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly |
-                                                                      kCGWindowListExcludeDesktopElements, kCGNullWindowID));
-        if (!windows) return set_desktop_error("Window geometry is unavailable: no accessible Quartz desktop session");
-        output.clear();
-        for (NSDictionary* info in windows) {
-            NSNumber* layer = info[(__bridge NSString*)kCGWindowLayer];
-            NSNumber* owner = info[(__bridge NSString*)kCGWindowOwnerPID];
-            NSNumber* alpha = info[(__bridge NSString*)kCGWindowAlpha];
-            if (!layer || layer.intValue != 0 || owner.intValue == getpid() || alpha.doubleValue <= 0.01) continue;
-            NSDictionary* bounds = info[(__bridge NSString*)kCGWindowBounds];
-            CGRect rect;
-            if (!bounds || !CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)bounds, &rect)) continue;
-            WindowRect obstacle{static_cast<float>(rect.origin.x) - canvas.x, static_cast<float>(rect.origin.y) - canvas.y,
-                                static_cast<float>(rect.size.width), static_cast<float>(rect.size.height)};
-            if (obstacle.width < 10 || obstacle.height < 10 || obstacle.x >= canvas.w || obstacle.y >= canvas.h ||
-                obstacle.x + obstacle.width <= 0 || obstacle.y + obstacle.height <= 0) continue;
-            // A solid rectangle covering the entire canvas leaves no space for
-            // a fluid simulation, so fullscreen/maximized covering windows are omitted.
-            if (obstacle.x <= 0 && obstacle.y <= 0 && obstacle.x + obstacle.width >= canvas.w &&
-                obstacle.y + obstacle.height >= canvas.h) continue;
-            output.push_back(obstacle);
-            if (output.size() == 128) break;
-        }
-        return true;
-    }
-}
-
-bool draw_hose_frame(HoseRenderer* renderer, const std::vector<FluidVertex>& particles,
-                     const SceneUniforms& scene, bool& presented) {
+bool draw_hose_frame(HoseRenderer* renderer, FluidSimulation& simulation, const std::vector<DuckBody>& ducks,
+                     SceneUniforms scene, bool& presented) {
     @autoreleasepool {
         presented = false;
         if (renderer->last_submission.status == MTLCommandBufferStatusError)
@@ -600,34 +896,72 @@ bool draw_hose_frame(HoseRenderer* renderer, const std::vector<FluidVertex>& par
         id<CAMetalDrawable> drawable = renderer->current_drawable;
         if (!drawable) return true;
         dispatch_semaphore_wait(renderer->available, DISPATCH_TIME_FOREVER);
-        id<MTLCommandBuffer> commands = renderer->encode(drawable.texture, particles, scene);
-        if (!commands) { dispatch_semaphore_signal(renderer->available); return false; }
+        id<MTLCommandBuffer> commands = [renderer->queue commandBuffer];
+        if (!commands) {
+            dispatch_semaphore_signal(renderer->available);
+            return set_desktop_error("Cannot allocate fluid commands");
+        }
+        scene.count = simulation.size();
+        scene.particle_radius = simulation.splat_radius();
+        scene.scale = static_cast<float>(drawable.texture.width) / std::max(scene.width, 1.0f);
+        HoseCaptureFrame* background = renderer->refraction ? renderer->capture.latest_frame() : nil;
+        if (background) {
+            const auto& display = renderer->refraction_display;
+            scene.has_background = 1;
+            scene.background_x = static_cast<float>(display.canvas.x - display.bounds.x);
+            scene.background_y = static_cast<float>(display.canvas.y - display.bounds.y);
+            scene.background_width = static_cast<float>(display.bounds.w);
+            scene.background_height = static_cast<float>(display.bounds.h);
+        }
+        if (!simulation.encode(commands) ||
+            !renderer->encode(commands, drawable.texture, simulation.particle_buffer(), scene, background.texture, ducks)) {
+            dispatch_semaphore_signal(renderer->available);
+            return false;
+        }
         dispatch_semaphore_t completion = renderer->available;
-        [commands addCompletedHandler:^(id<MTLCommandBuffer> finished) { (void)finished; dispatch_semaphore_signal(completion); }];
+        // The block keeps the captured frame alive until the GPU has sampled it.
+        [commands addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+            (void)finished;
+            (void)background;
+            dispatch_semaphore_signal(completion);
+        }];
         // CAMetalDisplayLink supplies this drawable. Submit before presenting it.
         [commands commit];
         [drawable present];
         renderer->last_submission = commands;
-        renderer->slot = (renderer->slot + 1) % 3;
         presented = true;
         return true;
     }
+}
+
+static id<MTLTexture> offscreen_target(id<MTLDevice> device, NSUInteger width, NSUInteger height) {
+    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                       width:width height:height mipmapped:NO];
+    descriptor.usage = MTLTextureUsageRenderTarget;
+    descriptor.storageMode = MTLStorageModeShared;
+    return [device newTextureWithDescriptor:descriptor];
 }
 
 bool smoke_test_hose_renderer(const char* shader_file) {
     @autoreleasepool {
         HoseRenderer renderer;
         if (!renderer.initialize(shader_file)) return false;
-        MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                           width:64 height:64 mipmapped:NO];
-        descriptor.usage = MTLTextureUsageRenderTarget;
-        descriptor.storageMode = MTLStorageModeShared;
-        id<MTLTexture> texture = [renderer.device newTextureWithDescriptor:descriptor];
+        id<MTLTexture> texture = offscreen_target(renderer.device, 64, 64);
         if (!texture) return set_desktop_error("Cannot allocate fluid test texture");
-        const std::vector<FluidVertex> particles{{24, 32, 12, 0}, {40, 32, 12, 0}};
-        const SceneUniforms scene{64, 64, 0, 0, 0, 0, 0, 0};
-        id<MTLCommandBuffer> commands = renderer.encode(texture, particles, scene);
-        if (!commands) return false;
+        // A small packed blob of water in the middle of the target.
+        std::vector<FluidParticle> particles;
+        for (int y = -2; y <= 2; ++y)
+            for (int x = -2; x <= 2; ++x) particles.push_back({32 + x * 4.5f, 32 + y * 4.5f, 0, 0, 0, 0, 0, 0});
+        id<MTLBuffer> buffer = [renderer.device newBufferWithBytes:particles.data() length:particles.size() * sizeof(FluidParticle)
+                                                           options:MTLResourceStorageModeShared];
+        SceneUniforms scene{};
+        scene.width = 64;
+        scene.height = 64;
+        scene.particle_radius = 9;  // matches the blob's 4.5-point spacing
+        scene.scale = 1;
+        scene.count = static_cast<fluid_uint>(particles.size());
+        id<MTLCommandBuffer> commands = [renderer.queue commandBuffer];
+        if (!buffer || !commands || !renderer.encode(commands, texture, buffer, scene)) return false;
         [commands commit];
         [commands waitUntilCompleted];
         if (commands.status == MTLCommandBufferStatusError)
@@ -635,10 +969,12 @@ bool smoke_test_hose_renderer(const char* shader_file) {
         std::vector<unsigned char> pixels(64 * 64 * 4);
         [texture getBytes:pixels.data() bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
         const auto* center = pixels.data() + (32 * 64 + 32) * 4;
-        if (center[3] < 170 || center[3] > 205 || center[0] + center[1] + center[2] < 80 ||
+        const bool premultiplied = center[0] <= center[3] && center[1] <= center[3] && center[2] <= center[3];
+        if (center[3] < 90 || center[3] > 240 || center[0] <= center[2] / 2 || !premultiplied ||
             pixels[0] != 0 || pixels[1] != 0 || pixels[2] != 0 || pixels[3] != 0)
-            return set_desktop_error("Fluid density did not merge into a translucent surface on a transparent background");
-        std::puts("PASS: Metal density accumulation, translucent merged water surface, and transparent background.");
+            return set_desktop_error("Fluid did not render a translucent blue surface on a transparent background "
+                                     "(centre BGRA %u %u %u %u)", center[0], center[1], center[2], center[3]);
+        std::puts("PASS: Metal splats merge into a translucent, premultiplied water surface on a transparent background.");
         return true;
     }
 }
@@ -648,7 +984,7 @@ bool run_hose_window_checks(const char* shader_file) {
         std::vector<DesktopDisplay> displays;
         if (!read_desktop_displays(displays)) return false;
         std::unique_ptr<HoseRenderer, decltype(&destroy_hose_renderer)> renderer(
-            create_hose_renderer(displays.front().canvas, shader_file, false), destroy_hose_renderer);
+            create_hose_renderer(displays.front().canvas, shader_file, false, false, {}, false, 1.0f), destroy_hose_renderer);
         if (!renderer) return false;
         show_hose_window(renderer.get());
         for (std::size_t index = 0; index < displays.size(); ++index) {
@@ -659,8 +995,12 @@ bool run_hose_window_checks(const char* shader_file) {
             [renderer->display_menu performActionForItemAtIndex:index];
             if (poll_desktop_input(renderer.get(), canvas).display != display.id)
                 return set_desktop_error("Native Display menu did not dispatch the selected monitor");
-            const SceneUniforms scene{static_cast<float>(canvas.w), static_cast<float>(canvas.h), 0, 0, 0, 0, 0, 0};
-            const std::vector<FluidVertex> particles{{canvas.w * 0.5f, canvas.h * 0.5f, 12, 0}};
+            SceneUniforms scene{};
+            scene.width = static_cast<float>(canvas.w);
+            scene.height = static_cast<float>(canvas.h);
+            FluidSimulation simulation;
+            if (!simulation.initialize(shader_file, scene.width, scene.height)) return false;
+            simulation.advance(30, {}, true, {scene.width * 0.5f, scene.height * 0.5f});
             unsigned frames = 0;
             bool moved = false;
             bool draw_success = true;
@@ -678,7 +1018,7 @@ bool run_hose_window_checks(const char* shader_file) {
                     texture.width == static_cast<NSUInteger>(std::lround(canvas.w * scale)) &&
                     texture.height == static_cast<NSUInteger>(std::lround(canvas.h * scale));
                 bool presented = false;
-                draw_success = draw_hose_frame(renderer.get(), particles, scene, presented);
+                draw_success = draw_hose_frame(renderer.get(), simulation, {}, scene, presented);
                 if (!draw_success) return false;
                 if (presented && ++frames == 3)
                     [renderer->status_item.menu performActionForItemAtIndex:renderer->status_item.menu.numberOfItems - 1];
@@ -711,6 +1051,142 @@ bool run_hose_window_checks(const char* shader_file) {
                         renderer->window.backingScaleFactor, frames);
         }
         std::puts("PASS: native overlays remain transparent, click-through, and unable to take keyboard focus.");
+        return true;
+    }
+}
+
+namespace {
+struct SnapshotWindow { float x, y, width, height; };
+
+// A synthetic desktop: a soft wallpaper gradient and plain light windows.
+void paint_desktop(std::vector<unsigned char>& rgba, int width, int height, float scale,
+                   const std::vector<SnapshotWindow>& windows) {
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const float u = x / static_cast<float>(width), v = y / static_cast<float>(height);
+            unsigned char* pixel = rgba.data() + (y * width + x) * 4;
+            const float px = x / scale, py = y / scale;
+            // Fine grid lines and soft circles give refraction something to bend.
+            const bool grid = std::fmod(px, 40.0f) < 1.0f || std::fmod(py, 40.0f) < 1.0f;
+            const float ring = std::abs(std::hypot(std::fmod(px, 160.0f) - 80, std::fmod(py, 160.0f) - 80) - 34);
+            const float light = (grid ? 28.0f : 0.0f) + (ring < 2.0f ? 40.0f : 0.0f);
+            pixel[0] = static_cast<unsigned char>(std::min(255.0f, 60 + 90 * u + light));
+            pixel[1] = static_cast<unsigned char>(std::min(255.0f, 70 + 50 * v + light));
+            pixel[2] = static_cast<unsigned char>(std::min(255.0f, 120 + 60 * (1 - v) + light));
+            pixel[3] = 255;
+            for (const auto& w : windows) {
+                const float hx = w.width * 0.5f, hy = w.height * 0.5f, r = 10;
+                const float qx = std::abs(px - w.x - hx) - (hx - r), qy = std::abs(py - w.y - hy) - (hy - r);
+                const float d = std::hypot(std::max(qx, 0.0f), std::max(qy, 0.0f)) + std::min(std::max(qx, qy), 0.0f) - r;
+                if (d > 0) continue;
+                const bool title = py - w.y < 28;
+                // Rows of dark bars stand in for text.
+                const float line = std::fmod(py - w.y - 40, 18.0f);
+                const bool text = !title && py - w.y > 40 && line < 7 && px - w.x > 16 && px < w.x + w.width - 40 &&
+                                  std::fmod(px - w.x + std::floor((py - w.y) / 18) * 23, 70.0f) < 52;
+                pixel[0] = pixel[1] = pixel[2] = title ? 214 : text ? 90 : 246;
+            }
+        }
+    }
+}
+}
+
+bool render_hose_snapshot(const char* shader_file, const char* output_file, float seconds, const FluidSettings& settings,
+                          bool refraction, float flow, unsigned duck_count) {
+    @autoreleasepool {
+        constexpr float width = 960, height = 600, scale = 2;
+        HoseRenderer renderer;
+        if (!renderer.initialize(shader_file)) return false;
+        FluidSimulation simulation;
+        if (!simulation.initialize(shader_file, width, height, settings)) return false;
+        simulation.set_flow_rate(flow);
+        DuckWorld ducks;
+        ducks.reset(width, height);
+        std::vector<DuckSample> duck_water;
+        // A shelf window catches the stream; a second window slides into the
+        // pool after a few seconds and pushes the water back.
+        const int steps = static_cast<int>(seconds / FluidSimulation::step_time);
+        std::vector<SnapshotWindow> windows;
+        const FluidPoint nozzle{300, 40};
+        for (int i = 0; i < steps; ++i) {
+            const float t = i * FluidSimulation::step_time;
+            const float slide = t < 5 ? 0 : std::min(1.0f, (t - 5) / 1.2f);
+            windows = {{120, 200, 380, 230}, {980 - 380 * slide, 380, 300, 260}};
+            std::vector<WindowObstacle> obstacles;
+            for (std::size_t w = 0; w < windows.size(); ++w) {
+                const auto& r = windows[w];
+                obstacles.push_back({r.x, r.y, r.width, r.height, r.x, r.y, r.width, r.height, 10,
+                                     static_cast<fluid_uint>(w + 1), 0, 0});
+            }
+            // Ducks drop in one by one across the scene.
+            if (ducks.size() < duck_count && t >= 1.0f + ducks.size() * 0.7f)
+                ducks.add_duck({150.0f + std::fmod(ducks.size() * 263.0f, width - 300), 40});
+            ducks.set_windows(obstacles);
+            if (!simulation.latest_duck_samples(duck_water)) duck_water.clear();
+            ducks.step(FluidSimulation::step_time, 1, {0, 950}, duck_water, simulation.particle_area());
+            simulation.set_ducks(ducks.bodies());
+            simulation.advance(1, obstacles, true, nozzle);
+            // With ducks, flush every step so buoyancy sees the current water.
+            if ((duck_count || i % 120 == 119) && !simulation.flush()) return false;
+        }
+        id<MTLTexture> texture = offscreen_target(renderer.device, width * scale, height * scale);
+        const int w = static_cast<int>(texture.width), h = static_cast<int>(texture.height);
+        std::vector<unsigned char> overlay(w * h * 4), image(w * h * 4);
+        paint_desktop(image, w, h, scale, windows);
+        // With refraction, the painted desktop stands in for a captured frame.
+        id<MTLTexture> background = nil;
+        if (refraction) {
+            MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                               width:w height:h mipmapped:NO];
+            background = [renderer.device newTextureWithDescriptor:descriptor];
+            [background replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:image.data() bytesPerRow:w * 4];
+        }
+        id<MTLCommandBuffer> commands = [renderer.queue commandBuffer];
+        SceneUniforms scene{};
+        scene.width = width;
+        scene.height = height;
+        scene.nozzle_x = nozzle.x;
+        scene.nozzle_y = nozzle.y;
+        scene.show_nozzle = 1;
+        scene.time = seconds;
+        scene.particle_radius = simulation.splat_radius();
+        scene.flow = simulation.flow_rate();
+        scene.scale = scale;
+        scene.count = simulation.size();
+        scene.has_background = background ? 1 : 0;
+        scene.background_width = width;
+        scene.background_height = height;
+        if (!texture || !commands || !simulation.encode(commands) ||
+            !renderer.encode(commands, texture, simulation.particle_buffer(), scene, background, ducks.bodies())) return false;
+        [commands commit];
+        [commands waitUntilCompleted];
+        if (commands.status == MTLCommandBufferStatusError)
+            return set_desktop_error("Snapshot rendering failed: %s", commands.error.localizedDescription.UTF8String);
+
+        [texture getBytes:overlay.data() bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+        for (int i = 0; i < w * h; ++i) {
+            // Premultiplied BGRA over the opaque RGBA desktop.
+            const float alpha = overlay[i * 4 + 3] / 255.0f;
+            for (int c = 0; c < 3; ++c)
+                image[i * 4 + c] = static_cast<unsigned char>(std::min(255.0f, overlay[i * 4 + 2 - c] + image[i * 4 + c] * (1 - alpha)));
+        }
+        CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        CGContextRef context = CGBitmapContextCreate(image.data(), w, h, 8, w * 4, space,
+                                                     static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast));
+        CGImageRef result = context ? CGBitmapContextCreateImage(context) : nullptr;
+        NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:output_file]];
+        CGImageDestinationRef destination = result ? CGImageDestinationCreateWithURL((__bridge CFURLRef)url, CFSTR("public.png"), 1, nullptr) : nullptr;
+        bool written = false;
+        if (destination) {
+            CGImageDestinationAddImage(destination, result, nullptr);
+            written = CGImageDestinationFinalize(destination);
+            CFRelease(destination);
+        }
+        if (result) CGImageRelease(result);
+        if (context) CGContextRelease(context);
+        CGColorSpaceRelease(space);
+        if (!written) return set_desktop_error("Cannot write snapshot %s", output_file);
+        std::printf("Snapshot: %u particles after %.1f s -> %s\n", simulation.size(), seconds, output_file);
         return true;
     }
 }
