@@ -2,7 +2,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <functional>
+#include <sstream>
 
 namespace {
 constexpr float tick = 0.001f;            // seconds
@@ -14,7 +16,16 @@ constexpr int refractory_ticks = 2;
 constexpr float pi = 3.14159265f;
 constexpr float prey_seen = 0.25f;
 constexpr float habituation_per_spike = 0.004f;
-constexpr float habituation_recovery = 60.0f;  // seconds  // tectal vector strength that counts as seeing prey
+constexpr float habituation_recovery = 60.0f;  // seconds
+// Measured synapse counts become weights at this many units per synapse. At
+// this gain the measured integrator holds activity after a brief input, and
+// the same cells wired at random with the same counts do not.
+constexpr float measured_gain = 0.2f;
+constexpr float measured_tonic = 0.2f;
+constexpr int commissural_size = 8;
+// Real larval integrators leak back toward the centre over seconds; a slow
+// adaptation does the same here, so a new turning streak can move the gaze.
+constexpr float integrator_leak = 0.002f;  // tectal vector strength that counts as seeing prey
 
 float wrap(float angle) { return std::remainder(angle, 2 * pi); }
 
@@ -49,6 +60,22 @@ enum Pop {
     swim_speed,         // nucleus of the medial longitudinal fasciculus
     bout_generator,     // hindbrain burst generator that times bouts
     strike,
+    // The eye-position circuit, built from the measured hindbrain wiring
+    // when it is available (empty otherwise), one copy per side.
+    integrator_left,    // the oculomotor velocity-to-position integrator
+    integrator_right,
+    vestibular_left,    // descending octaval (vestibular) neurons
+    vestibular_right,
+    abducens_motor_left,  // turn the same-side eye outward
+    abducens_motor_right,
+    abducens_internuclear_left,  // turn the other eye inward
+    abducens_internuclear_right,
+    axial_left,         // the axial (body) module, wired with the integrator
+    axial_right,
+    reticulospinal_left,  // spinal-projecting cells, the Mauthner cell among them
+    reticulospinal_right,
+    commissural_left,   // hand-wired: each integrator silences the other side's
+    commissural_right,
     population_count
 };
 
@@ -98,6 +125,32 @@ const Population populations[population_count] = {
     {"swim speed", 12, 0.6f, 0.3f, 0, 1},
     {"bout generator", 10, 0.95f, 0.35f, 0.08f, 1.0f},
     {"strike", 6, 0.2f, 0.2f, 0, 1},
+    // Sizes come from the connectome.
+    {"integrator (left)", 0, measured_tonic, 0.25f, integrator_leak, 8.0f},
+    {"integrator (right)", 0, measured_tonic, 0.25f, integrator_leak, 8.0f},
+    {"vestibular (left)", 0, measured_tonic, 0.25f, 0, 1},
+    {"vestibular (right)", 0, measured_tonic, 0.25f, 0, 1},
+    {"abducens motor (left)", 0, measured_tonic, 0.25f, 0, 1},
+    {"abducens motor (right)", 0, measured_tonic, 0.25f, 0, 1},
+    {"abducens internuclear (left)", 0, measured_tonic, 0.25f, 0, 1},
+    {"abducens internuclear (right)", 0, measured_tonic, 0.25f, 0, 1},
+    {"axial (left)", 0, measured_tonic, 0.25f, 0, 1},
+    {"axial (right)", 0, measured_tonic, 0.25f, 0, 1},
+    {"reticulospinal (left)", 0, measured_tonic, 0.25f, 0, 1},
+    {"reticulospinal (right)", 0, measured_tonic, 0.25f, 0, 1},
+    {"commissural (left)", 0, 0.2f, 0.2f, 0, 1},
+    {"commissural (right)", 0, 0.2f, 0.2f, 0, 1},
+};
+
+// Measured cell types, and the populations each side's copy goes into.
+const struct { const char* kind; Pop left, right; } measured_types[] = {
+    {"integrator", integrator_left, integrator_right},
+    {"vestibular", vestibular_left, vestibular_right},
+    {"abducens_motor", abducens_motor_left, abducens_motor_right},
+    {"abducens_internuclear", abducens_internuclear_left, abducens_internuclear_right},
+    {"axial", axial_left, axial_right},
+    {"reticulospinal", reticulospinal_left, reticulospinal_right},
+    {"mauthner", reticulospinal_left, reticulospinal_right},
 };
 
 // Where each population sits on the brain diagram, a short label, and what
@@ -127,20 +180,38 @@ const Place places[population_count] = {
     {0.50f, 0.48f, "blocked up", C::sense, false},
     {0.50f, 0.59f, "blocked down", C::sense, false},
     {0.50f, 0.70f, "blocked ahead", C::sense, false},
-    {0.94f, 0.80f, "hypoxia", C::drive, false},
+    {0.96f, 0.70f, "hypoxia", C::drive, false},
     {0.85f, 0.52f, "steer up", C::move, false},
     {0.85f, 0.67f, "steer down", C::move, false},
     {0.95f, 0.56f, "reverse", C::move, false},
     {0.63f, 0.78f, "swim speed", C::move, false},
     {0.94f, 0.32f, "bout generator", C::move, false},
     {0.38f, 0.70f, "strike", C::move, false},
+    // The measured populations are drawn in their own strip, by side.
+    {0, 0, "integrator", C::decide, false},
+    {0, 0, "integrator", C::decide, false},
+    {0, 0, "vestibular", C::sense, false},
+    {0, 0, "vestibular", C::sense, false},
+    {0, 0, "abducens", C::move, false},
+    {0, 0, "abducens", C::move, false},
+    {0, 0, "internuclear", C::move, false},
+    {0, 0, "internuclear", C::move, false},
+    {0, 0, "axial", C::move, false},
+    {0, 0, "axial", C::move, false},
+    {0, 0, "spinal", C::move, false},
+    {0, 0, "spinal", C::move, false},
+    {0.78f, 0.78f, "commissural L", C::decide, false},
+    {0.88f, 0.78f, "commissural R", C::decide, false},
 };
 
 struct Synapse { std::uint16_t target; float weight; };
 }
 
 struct FishBrain::Impl {
+    int size_of[population_count] = {};
     int first[population_count + 1] = {};
+    std::shared_ptr<const HindbrainConnectome> hindbrain;
+    bool shuffle_hindbrain = false;
     std::vector<int> owner;  // population of each neuron
     std::vector<float> voltage, excitation, inhibition, adaptation, input;
     std::vector<float> strength;  // remaining synaptic strength under depression, 0 to 1
@@ -183,9 +254,29 @@ struct FishBrain::Impl {
             }
     }
 
+    // Each measured cell's population and index within it, for one side.
+    std::vector<std::pair<Pop, int>> measured_cells(bool left) const {
+        std::vector<std::pair<Pop, int>> cells;
+        int counts[population_count] = {};
+        for (const auto& kind : hindbrain->kinds) {
+            Pop pop = population_count;
+            for (const auto& type : measured_types)
+                if (kind == type.kind) pop = left ? type.left : type.right;
+            cells.push_back({pop, pop == population_count ? -1 : counts[pop]++});
+        }
+        return cells;
+    }
+
     void build() {
+        for (int p = 0; p < population_count; ++p) size_of[p] = populations[p].size;
+        if (hindbrain) {
+            for (const bool left : {true, false})
+                for (const auto& cell : measured_cells(left))
+                    if (cell.first != population_count) ++size_of[cell.first];
+            size_of[commissural_left] = size_of[commissural_right] = commissural_size;
+        }
         for (int p = 0; p < population_count; ++p) {
-            first[p + 1] = first[p] + populations[p].size;
+            first[p + 1] = first[p] + size_of[p];
             decay_adaptation[p] = std::exp(-tick / populations[p].adaptation_time);
         }
         const int count = first[population_count];
@@ -290,6 +381,38 @@ struct FishBrain::Impl {
         wire(hunt_command, swim_speed, 0.3f, -0.5f);  // stalking is slow
         wire(satiety, swim_speed, 0.3f, -0.3f);
 
+        if (hindbrain) {
+            // The measured wiring, copied onto each side: synapse counts become
+            // weights. The connectome has no signs; like the authors' model,
+            // every measured synapse is taken as excitatory.
+            for (const bool left : {true, false}) {
+                const auto cells = measured_cells(left);
+                std::vector<std::vector<int>> by_kind(population_count);
+                for (std::size_t i = 0; i < cells.size(); ++i)
+                    if (cells[i].first != population_count) by_kind[cells[i].first].push_back(static_cast<int>(i));
+                for (const auto& synapse : hindbrain->synapses) {
+                    const auto pre = cells[synapse.pre];
+                    auto post = cells[synapse.post];
+                    if (pre.first == population_count || post.first == population_count) continue;
+                    if (shuffle_hindbrain) post = cells[by_kind[post.first][static_cast<std::size_t>(random() * by_kind[post.first].size())]];
+                    lists[neuron(pre.first, pre.second)].push_back(
+                        {static_cast<std::uint16_t>(neuron(post.first, post.second)), measured_gain * synapse.count});
+                }
+            }
+            // Hand-wired connections into and out of the measured circuit. The
+            // turning region drives its own side's integrator, so the gaze
+            // shifts with exploration streaks, and inhibitory commissural
+            // neurons let only one side's integrator hold at a time.
+            wire(turning_left, integrator_left, 0.5f, 0.8f);
+            wire(turning_right, integrator_right, 0.5f, 0.8f);
+            wire(integrator_left, commissural_left, 0.1f, 0.5f);
+            wire(integrator_right, commissural_right, 0.1f, 0.5f);
+            wire(commissural_left, integrator_right, 0.5f, -1.0f);
+            wire(commissural_right, integrator_left, 0.5f, -1.0f);
+            wire(tilt_dorsal, vestibular_left, 0.5f, 0.6f);
+            wire(tilt_ventral, vestibular_right, 0.5f, 0.6f);
+        }
+
         synapse_start.assign(count + 1, 0);
         for (int i = 0; i < count; ++i) synapse_start[i + 1] = synapse_start[i] + static_cast<std::uint32_t>(lists[i].size());
         synapses.reserve(synapse_start[count]);
@@ -362,7 +485,7 @@ struct FishBrain::Impl {
         }
         const float keep = std::exp(-tick / rate_time);
         for (int p = 0; p < population_count; ++p)
-            rate[p] = rate[p] * keep + counts[p] / static_cast<float>(populations[p].size) / rate_time;
+            rate[p] = rate[p] * keep + (size_of[p] ? counts[p] / static_cast<float>(size_of[p]) / rate_time : 0.0f);
     }
 
     // Direction read from a topographic population: the activity-weighted
@@ -393,7 +516,10 @@ struct FishBrain::Impl {
     }
 };
 
-FishBrain::FishBrain(std::uint32_t seed) : impl_(std::make_unique<Impl>(seed)) {
+FishBrain::FishBrain(std::uint32_t seed, std::shared_ptr<const HindbrainConnectome> hindbrain, bool shuffle_hindbrain)
+    : impl_(std::make_unique<Impl>(seed)) {
+    impl_->hindbrain = std::move(hindbrain);
+    impl_->shuffle_hindbrain = shuffle_hindbrain;
     impl_->build();
     impl_->trace.assign(impl_->voltage.size(), 0);
 }
@@ -416,12 +542,60 @@ std::vector<FishBrain::Area> FishBrain::layout() const {
     std::vector<Area> result;
     for (int p = 0; p < population_count; ++p)
         result.push_back({populations[p].name, places[p].label, static_cast<std::size_t>(impl_->first[p]),
-                          static_cast<std::size_t>(populations[p].size),
-                          places[p].x, places[p].y, places[p].circuit, places[p].topographic, impl_->rate[p]});
+                          static_cast<std::size_t>(impl_->size_of[p]),
+                          places[p].x, places[p].y, places[p].circuit, places[p].topographic,
+                          p >= integrator_left && p <= reticulospinal_right && p != commissural_left && p != commissural_right,
+                          impl_->rate[p]});
     return result;
 }
 
 const std::vector<float>& FishBrain::activity() const { return impl_->trace; }
+
+// The visible eye is the left one. Its medial rectus, driven by the right
+// side's internuclear neurons, turns it forward (toward the snout); its
+// lateral rectus, driven by the left abducens motoneurons, turns it back.
+float FishBrain::eye_position() const {
+    if (!impl_->hindbrain) return 0;
+    return std::clamp((impl_->rate[abducens_internuclear_right] - impl_->rate[abducens_motor_left]) / 60.0f, -1.0f, 1.0f);
+}
+
+bool FishBrain::measured_hindbrain() const { return impl_->hindbrain != nullptr; }
+
+std::shared_ptr<const HindbrainConnectome> HindbrainConnectome::load(const std::string& path) {
+    std::ifstream file(path);
+    if (!file) return nullptr;
+    auto connectome = std::make_shared<HindbrainConnectome>();
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream header(line);
+        std::string word;
+        std::size_t count = 0;
+        header >> word >> count;
+        if (word == "cells") {
+            connectome->kinds.resize(count);
+            for (std::size_t i = 0; i < count && std::getline(file, line); ++i) {
+                std::istringstream cell(line);
+                std::size_t index = 0;
+                long segment = 0;
+                std::string kind;
+                if (!(cell >> index >> segment >> kind) || index >= count) return nullptr;
+                connectome->kinds[index] = kind;
+            }
+        } else if (word == "synapses") {
+            for (std::size_t i = 0; i < count && std::getline(file, line); ++i) {
+                std::istringstream entry(line);
+                Synapse synapse{};
+                if (!(entry >> synapse.pre >> synapse.post >> synapse.count) || synapse.pre >= connectome->kinds.size() ||
+                    synapse.post >= connectome->kinds.size())
+                    return nullptr;
+                connectome->synapses.push_back(synapse);
+            }
+        }
+    }
+    if (connectome->kinds.empty() || connectome->synapses.empty()) return nullptr;
+    return connectome;
+}
 
 bool FishBrain::advance(const FishSenses& senses, float dt, FishBout& bout) {
     auto& s = *impl_;
@@ -685,4 +859,65 @@ bool run_brain_checks(std::uint32_t seed) {
     const Tally flop = simulate(gasping, air, 20);
     std::printf("  suffocating: %d bouts in 20 s (calm: %d in 60 s)\n", flop.bouts, explore.bouts);
     return check(flop.bouts > explore.bouts / 3 * 1.5f, "a suffocating fish thrashes more often");
+}
+
+bool run_hindbrain_checks(std::shared_ptr<const HindbrainConnectome> hindbrain) {
+    const std::size_t cells = hindbrain->kinds.size();
+    std::printf("  hindbrain connectome: %zu cells, %zu connections\n", cells, hindbrain->synapses.size());
+
+    // Persistence: with the turning region silenced, a 0.1 s push into one
+    // integrator. The measured wiring keeps it firing afterwards; the same
+    // cells wired at random, with the same synapse counts, fall silent.
+    auto held = [&](bool shuffle, std::uint32_t seed) {
+        FishBrain brain(seed, hindbrain, shuffle);
+        auto& s = *brain.impl_;
+        FishSenses calm;
+        float total = 0;
+        int samples = 0;
+        for (int t = 0; t < 4000; ++t) {
+            s.set_inputs(calm);
+            for (const Pop p : {turning_left, turning_right, turning_inhibition_left, turning_inhibition_right})
+                for (int i = s.first[p]; i < s.first[p + 1]; ++i) s.input[i] = -2;
+            if (t >= 1000 && t < 1100)
+                for (int i = s.first[integrator_left]; i < s.first[integrator_left + 1]; ++i) s.input[i] += 1.5f;
+            s.step();
+            if (t >= 2100) {
+                total += s.rate[integrator_left];
+                ++samples;
+            }
+        }
+        return total / samples;
+    };
+    float measured = 1e9f, shuffled = 0;
+    for (const std::uint32_t seed : {7u, 101u, 2024u}) {
+        measured = std::min(measured, held(false, seed));
+        shuffled = std::max(shuffled, held(true, seed));
+    }
+    std::printf("  integrator 1-3 s after a 0.1 s push: measured wiring %.1f Hz, shuffled %.1f Hz (worst of three)\n", measured,
+                shuffled);
+    if (!check(measured > 15 && shuffled < 5, "the measured integrator holds activity that shuffled wiring cannot")) return false;
+
+    // In the whole brain, one side's integrator holds at a time, and the
+    // gaze follows the turning region's streaks.
+    FishBrain brain(7, hindbrain);
+    FishSenses calm;
+    calm.hunger = 0.3f;
+    int steps = 0, both = 0, agree = 0, decided = 0;
+    for (int t = 0; t < 120 * 60; ++t) {
+        FishBout bout;
+        brain.advance(calm, 1.0f / 120, bout);
+        const auto& rate = brain.impl_->rate;
+        ++steps;
+        if (rate[integrator_left] > 10 && rate[integrator_right] > 10) ++both;
+        const float turning = rate[turning_left] - rate[turning_right];
+        if (std::abs(turning) > 15 && std::abs(brain.eye_position()) > 0.5f) {
+            ++decided;
+            // Left integrator on: the left eye turns out (back), so the gaze is negative.
+            if ((turning > 0) == (brain.eye_position() < 0)) ++agree;
+        }
+    }
+    std::printf("  gaze: both integrators active %.1f%% of the time; gaze matches the turning side %d of %d times\n",
+                100.0f * both / steps, agree, decided);
+    if (!check(both * 10 < steps, "one side's integrator holds at a time")) return false;
+    return check(decided > 100 && agree * 10 > decided * 7, "the gaze follows the turning region's streaks");
 }

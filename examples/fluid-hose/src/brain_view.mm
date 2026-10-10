@@ -5,7 +5,7 @@
 #include <vector>
 
 namespace {
-struct Dot { CGFloat x, y, radius; std::size_t neuron; FishBrain::Circuit circuit; };
+struct Dot { CGFloat x, y, radius; std::size_t neuron; FishBrain::Circuit circuit; bool measured; };
 
 NSColor* circuit_color(FishBrain::Circuit circuit, CGFloat alpha) {
     switch (circuit) {
@@ -47,11 +47,18 @@ NSColor* circuit_color(FishBrain::Circuit circuit, CGFloat alpha) {
     self.needsDisplay = YES;
 }
 
-// The diagram fills a 2:1 box below the header, snout to the left.
+- (bool)hasMeasured {
+    for (const auto& area : _areas)
+        if (area.measured && area.size) return true;
+    return false;
+}
+
+// The diagram fills a 2:1 box below the header, snout to the left, leaving a
+// strip at the bottom for the measured hindbrain when there is one.
 - (NSRect)diagram {
     const NSRect bounds = NSInsetRect(self.bounds, 16, 12);
-    const CGFloat header = 40, legend = 22;
-    CGFloat width = bounds.size.width, height = bounds.size.height - header - legend;
+    const CGFloat header = 40, legend = 22, strip = [self hasMeasured] ? bounds.size.height * 0.3 : 0;
+    CGFloat width = bounds.size.width, height = bounds.size.height - header - legend - strip;
     if (width > height * 2) width = height * 2;
     else height = width / 2;
     return NSMakeRect(NSMidX(bounds) - width / 2, bounds.origin.y + header, width, height);
@@ -102,7 +109,59 @@ NSColor* circuit_color(FishBrain::Circuit circuit, CGFloat alpha) {
                                   NSForegroundColorAttributeName: [NSColor colorWithWhite:0.6 alpha:1]};
 
     std::vector<Dot> dots;
+    // The measured hindbrain: one row per side, a grid per cell type.
+    if ([self hasMeasured]) {
+        const CGFloat top = NSMaxY(box) + unit * 2, bottom = NSMaxY(self.bounds) - 34;
+        NSDictionary* heading = @{NSFontAttributeName: [NSFont systemFontOfSize:std::max<CGFloat>(9, unit * 1.2)],
+                                  NSForegroundColorAttributeName: [NSColor colorWithWhite:0.75 alpha:1]};
+        [@"Measured hindbrain wiring, one copy per side" drawAtPoint:NSMakePoint(16, top - unit * 1.6) withAttributes:heading];
+        std::vector<const FishBrain::Area*> left, right;
+        for (const auto& area : _areas) {
+            if (!area.measured || !area.size) continue;
+            (std::string(area.name).find("(left)") != std::string::npos ? left : right).push_back(&area);
+        }
+        const CGFloat row_height = (bottom - top) / 2;
+        const CGFloat gap = unit * 1.5, side_label = unit * 5;
+        // Widths in proportion to the number of cells, at least a label's
+        // worth, then scaled to fit.
+        std::vector<CGFloat> widths;
+        CGFloat sum = 0;
+        std::size_t total = 0;
+        for (const auto* area : left) total += area->size;
+        const CGFloat usable = self.bounds.size.width - 32 - side_label - gap * (left.size() - 1);
+        for (const auto* area : left) {
+            NSString* label = [NSString stringWithUTF8String:area->label];
+            widths.push_back(std::max(usable * area->size / total, [label sizeWithAttributes:label_style].width + unit));
+            sum += widths.back();
+        }
+        for (auto& width : widths) width *= usable / sum;
+        for (int side = 0; side < 2; ++side) {
+            const auto& row = side ? right : left;
+            const CGFloat y = top + side * row_height + unit * 0.8;
+            [(side ? @"right" : @"left") drawAtPoint:NSMakePoint(16, y) withAttributes:label_style];
+            CGFloat x = 16 + side_label;
+            for (std::size_t k = 0; k < row.size() && k < widths.size(); ++k) {
+                const auto* area = row[k];
+                const CGFloat width = widths[k];
+                const CGFloat height = row_height - unit * 2.6;
+                // The largest square cells whose grid fits the box.
+                CGFloat cell = std::sqrt(width * height / area->size);
+                std::size_t columns = 1;
+                for (; cell > 1.5; cell *= 0.95) {
+                    columns = std::max<std::size_t>(1, static_cast<std::size_t>(width / cell));
+                    if ((area->size + columns - 1) / columns * cell <= height) break;
+                }
+                for (std::size_t i = 0; i < area->size; ++i)
+                    dots.push_back({x + (i % columns + 0.5) * cell, y + (i / columns + 0.5) * cell, cell * 0.32, area->first + i,
+                                    area->circuit, true});
+                NSString* label = [NSString stringWithUTF8String:area->label];
+                [label drawAtPoint:NSMakePoint(x, y + height + unit * 0.1) withAttributes:label_style];
+                x += width + gap;
+            }
+        }
+    }
     for (const auto& area : _areas) {
+        if (area.measured) continue;
         const CGFloat cx = box.origin.x + area.x * box.size.width, cy = box.origin.y + area.y * box.size.height;
         const CGFloat radius = unit * (area.size == 1 ? 1.3 : 0.55);
         if (area.topographic) {
@@ -116,25 +175,28 @@ NSColor* circuit_color(FishBrain::Circuit circuit, CGFloat alpha) {
                 const CGFloat angle = M_PI * (1.1 + 0.8 * t);
                 const CGFloat r = reach - (i % layers) * unit * 1.3;
                 dots.push_back({cx + std::cos(angle) * r * 1.3, cy + std::sin(angle) * r * 0.8 + reach * 0.5, radius,
-                                area.first + i, area.circuit});
+                                area.first + i, area.circuit, area.measured});
             }
         } else {
-            // A small sunflower cluster.
+            // A sunflower cluster; the big measured populations pack tighter.
+            const CGFloat spacing = unit * (area.size > 60 ? 0.42 : area.size > 20 ? 0.8 : 1.25);
+            const CGFloat dot = area.size > 60 ? radius * 0.55 : area.size > 20 ? radius * 0.8 : radius;
             for (std::size_t i = 0; i < area.size; ++i) {
-                const CGFloat r = unit * 1.25 * std::sqrt(i + (area.size == 1 ? 0.0 : 0.5));
+                const CGFloat r = spacing * std::sqrt(i + (area.size == 1 ? 0.0 : 0.5));
                 const CGFloat angle = i * 2.39996;
-                dots.push_back({cx + r * std::cos(angle), cy + r * std::sin(angle), radius, area.first + i, area.circuit});
+                dots.push_back({cx + r * std::cos(angle), cy + r * std::sin(angle), dot, area.first + i, area.circuit, area.measured});
             }
         }
         NSString* label = [NSString stringWithUTF8String:area.label];
         const NSSize size = [label sizeWithAttributes:label_style];
-        const CGFloat below = area.topographic ? unit * 1.2 : unit * 1.25 * std::sqrt(static_cast<CGFloat>(area.size)) + unit * 0.6;
+        const CGFloat spread = area.size > 60 ? 0.42 : area.size > 20 ? 0.8 : 1.25;
+        const CGFloat below = area.topographic ? unit * 1.2 : unit * spread * std::sqrt(static_cast<CGFloat>(area.size)) + unit * 0.6;
         [label drawAtPoint:NSMakePoint(cx - size.width / 2, cy + below) withAttributes:label_style];
     }
     for (const auto& dot : dots) {
         const float spikes = dot.neuron < _activity.size() ? _activity[dot.neuron] : 0.0f;
         const CGFloat glow = std::min(1.0f, spikes / 2.0f);
-        if (glow > 0.05) {
+        if (glow > 0.05 && !dot.measured) {
             const CGFloat halo = dot.radius * (1.6 + 1.6 * glow);
             [circuit_color(dot.circuit, 0.2 * glow) setFill];
             [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(dot.x - halo, dot.y - halo, halo * 2, halo * 2)] fill];
@@ -142,6 +204,7 @@ NSColor* circuit_color(FishBrain::Circuit circuit, CGFloat alpha) {
         [circuit_color(dot.circuit, 0.22 + 0.78 * glow) setFill];
         [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(dot.x - dot.radius, dot.y - dot.radius, dot.radius * 2, dot.radius * 2)] fill];
     }
+
 
     // Legend.
     const std::pair<FishBrain::Circuit, NSString*> legend[] = {
@@ -155,6 +218,8 @@ NSColor* circuit_color(FishBrain::Circuit circuit, CGFloat alpha) {
         [entry.second drawAtPoint:NSMakePoint(x + 11, y) withAttributes:status_style];
         x += 22 + [entry.second sizeWithAttributes:status_style].width;
     }
+    if ([self hasMeasured])
+        [@"measured wiring: Vishwanathan et al. 2024" drawAtPoint:NSMakePoint(x, y) withAttributes:status_style];
     NSString* hint = @"click for the next fish";
     const NSSize hint_size = [hint sizeWithAttributes:status_style];
     [hint drawAtPoint:NSMakePoint(NSMaxX(self.bounds) - hint_size.width - 16, y) withAttributes:status_style];
@@ -178,7 +243,7 @@ void BrainWindow::show() {
     @autoreleasepool {
         auto& s = *impl_;
         if (!s.panel) {
-            s.panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(80, 120, 720, 420)
+            s.panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(80, 120, 760, 560)
                                                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                                                            NSWindowStyleMaskResizable | NSWindowStyleMaskUtilityWindow
                                                    backing:NSBackingStoreBuffered
@@ -190,7 +255,7 @@ void BrainWindow::show() {
             s.panel.becomesKeyOnlyIfNeeded = YES;
             s.panel.minSize = NSMakeSize(420, 260);
             s.panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces;
-            s.canvas = [[BrainCanvas alloc] initWithFrame:NSMakeRect(0, 0, 720, 420)];
+            s.canvas = [[BrainCanvas alloc] initWithFrame:NSMakeRect(0, 0, 760, 560)];
             s.panel.contentView = s.canvas;
             [s.panel center];
         }
@@ -224,7 +289,7 @@ void BrainWindow::update(const FishBrain& brain, const std::string& title, const
 
 bool BrainWindow::snapshot(const FishBrain& brain, const std::string& title, const std::string& status, const char* path) {
     @autoreleasepool {
-        BrainCanvas* canvas = [[BrainCanvas alloc] initWithFrame:NSMakeRect(0, 0, 720, 420)];
+        BrainCanvas* canvas = [[BrainCanvas alloc] initWithFrame:NSMakeRect(0, 0, 760, 560)];
         canvas.title = [NSString stringWithUTF8String:title.c_str()];
         canvas.status = [NSString stringWithUTF8String:status.c_str()];
         [canvas setAreas:brain.layout() activity:brain.activity()];

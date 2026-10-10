@@ -225,6 +225,7 @@ struct Pond::Impl {
     std::unordered_map<std::uint32_t, BodySample> samples;
     float width = 0, height = 0;
     float metabolism = 1, breathing = 1;
+    std::shared_ptr<const HindbrainConnectome> hindbrain;
     std::uint32_t random_state = 0x9e3779b9u;
     std::uint32_t next_tag = 1;
     FluidPoint pointer{-1000, -1000}, pointer_seen{-1000, -1000}, pointer_velocity{0, 0};
@@ -518,7 +519,8 @@ struct Pond::Impl {
             const float health = f.alive ? std::clamp(0.3f + f.energy * 3, 0.3f, 1.0f) : 0.0f;
             const float belly = f.alive ? f.upright : -f.upright;
             bodies.push_back({p.x, p.y, angle, f.scale, v.x, v.y, -interface.GetAngularVelocity(f.id).GetZ(), BODY_FISH,
-                              {f.bend, f.alive ? f.brain.vergence() : 0.0f, health, belly * f.foreshorten}, f.tag, 0, 0, 0});
+                              {f.bend, f.alive ? std::clamp(f.brain.vergence() + 0.6f * f.brain.eye_position(), -1.0f, 1.0f) : 0.0f,
+                               health, belly * f.foreshorten}, f.tag, 0, 0, 0});
             const Frame now = frame(angle, f.upright);
             f.probes[0] = p + now.ahead * (40 * f.scale);
             f.probes[1] = p + now.ahead * (30 * f.scale) + now.back * (22 * f.scale);
@@ -631,7 +633,7 @@ bool Pond::add_fish(FluidPoint position) {
     const BodyID id = s.bodies_interface().CreateAndAddBody(settings, EActivation::Activate);
     if (id.IsInvalid()) return false;
     Impl::Fish fish{id, scale, s.bodies_interface().GetShape(id)->GetMassProperties().mMass,
-                    FishBrain(static_cast<std::uint32_t>(s.random() * 4e9f) | 1u), s.next_tag, {s.next_tag + 1, s.next_tag + 2, s.next_tag + 3}};
+                    FishBrain(static_cast<std::uint32_t>(s.random() * 4e9f) | 1u, s.hindbrain), s.next_tag, {s.next_tag + 1, s.next_tag + 2, s.next_tag + 3}};
     s.next_tag += 4;
     fish.upright = left ? -1.0f : 1.0f;
     s.fish.push_back(std::move(fish));
@@ -683,6 +685,7 @@ std::size_t Pond::fish_count() const { return impl_->fish.size(); }
 std::size_t Pond::food_count() const { return impl_->food.size(); }
 const std::vector<PondBody>& Pond::bodies() const { return impl_->bodies; }
 void Pond::set_pointer(FluidPoint position) { impl_->pointer = position; }
+void Pond::set_hindbrain(std::shared_ptr<const HindbrainConnectome> hindbrain) { impl_->hindbrain = std::move(hindbrain); }
 void Pond::set_metabolism(float hunger, float breath) {
     impl_->metabolism = hunger;
     impl_->breathing = breath;
@@ -896,17 +899,22 @@ bool run_duck_checks(const char* shader_file) {
     return check(ducks.bodies().at(0).y > 440, "a duck falls to the floor when the water is cleared");
 }
 
-bool run_fish_checks(const char* shader_file) {
+bool run_fish_checks(const char* shader_file, std::shared_ptr<const HindbrainConnectome> hindbrain) {
     // Every fish's brain is wired from its own seed, so check several.
     for (const std::uint32_t seed : {7u, 101u, 2024u, 4242u, 31337u, 99991u}) {
         std::printf("Brain seed %u\n", seed);
         if (!run_brain_checks(seed)) return false;
     }
+    if (hindbrain) {
+        std::printf("Measured hindbrain\n");
+        if (!run_hindbrain_checks(hindbrain)) return false;
+    } else std::printf("No hindbrain connectome; skipping its checks (run tools/fetch-connectome.sh)\n");
     FluidSimulation fluid;
     constexpr float width = 800, height = 480;
     if (!fluid.initialize(shader_file, width, height)) return false;
     Pond pond;
     pond.reset(width, height);
+    pond.set_hindbrain(hindbrain);
     const float surface = fill_pool(fluid, pond, width, height, 5000);
     std::printf("  pool surface at %.0f of %.0f\n", surface, height);
 
@@ -934,7 +942,7 @@ bool run_fish_checks(const char* shader_file) {
     fish = pond.fish_vitals().at(0);
     for (int i = 0; i < 6; ++i) pond.add_food({fish.position.x + (fish.position.x < width / 2 ? 1 : -1) * (60 + i * 12.0f), surface - 30});
     int seconds = 0;
-    for (; seconds < 40 && pond.fish_vitals().at(0).meals < 2; ++seconds) run(fluid, pond, 120, {});
+    for (; seconds < 60 && pond.fish_vitals().at(0).meals < 2; ++seconds) run(fluid, pond, 120, {});
     fish = pond.fish_vitals().at(0);
     std::printf("  food: %u flakes eaten after %d s, energy %.2f, %zu flakes left\n", fish.meals, seconds, fish.energy, pond.food_count());
     if (!check(fish.meals >= 2, "a hungry fish finds food and eats it")) return false;

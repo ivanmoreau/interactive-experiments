@@ -33,6 +33,7 @@ else
 fi
 
 "$PROJECT_DIR/tools/build-jolt.sh"
+"$PROJECT_DIR/tools/fetch-connectome.sh"
 JOLT_DIR="$PROJECT_DIR/third_party/JoltPhysics"
 
 printf 'Building fluid application...\n'
@@ -60,5 +61,10 @@ codesign --force --sign - "$APP_DIR/Contents/MacOS/probe-motion"
 cp "$SHADERS" "$APP_DIR/Contents/Resources/"
 cp "$PROJECT_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$JOLT_DIR/LICENSE" "$APP_DIR/Contents/Resources/JoltPhysics-LICENSE.txt"
+# The measured hindbrain wiring, when it could be downloaded; see tools/fetch-connectome.sh.
+rm -f "$APP_DIR/Contents/Resources/hindbrain.txt"
+if [[ -f "$BUILD_DIR/connectome/hindbrain.txt" ]]; then
+    cp "$BUILD_DIR/connectome/hindbrain.txt" "$APP_DIR/Contents/Resources/hindbrain.txt"
+fi
 codesign --force --sign - "$APP_DIR"
 printf 'Built %s\n' "$APP_DIR"

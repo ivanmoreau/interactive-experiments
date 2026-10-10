@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 // What a fish senses, refreshed every physics step. Directions are relative
@@ -29,6 +30,17 @@ struct FishSenses {
     static float loom_angle(int bin) { return -3.14159265f + (bin + 0.5f) * 2 * 3.14159265f / loom_bins; }
 };
 
+// A measured wiring diagram that part of the brain is built from: one side of
+// the larval zebrafish hindbrain (Vishwanathan et al., Nature Neuroscience
+// 2024), as converted by tools/convert_connectome.py.
+struct HindbrainConnectome {
+    struct Synapse { std::uint32_t pre, post, count; };
+    std::vector<std::string> kinds;  // per cell: integrator, vestibular, abducens_motor, ...
+    std::vector<Synapse> synapses;
+    // Null when the file is missing or malformed.
+    static std::shared_ptr<const HindbrainConnectome> load(const std::string& path);
+};
+
 // A swim bout: larval fish move in discrete flicks rather than continuously.
 enum class BoutKind { swim, hunt, strike, escape, reverse };
 struct FishBout {
@@ -43,7 +55,11 @@ struct FishBout {
 // published circuit diagrams, not traced from a connectome.
 class FishBrain {
 public:
-    explicit FishBrain(std::uint32_t seed);
+    // With a hindbrain connectome, the eye-position circuit is built from its
+    // measured wiring; shuffle_hindbrain rewires it at random, keeping each
+    // cell type's synapse counts (a control for checks).
+    explicit FishBrain(std::uint32_t seed, std::shared_ptr<const HindbrainConnectome> hindbrain = nullptr,
+                       bool shuffle_hindbrain = false);
     ~FishBrain();
     FishBrain(FishBrain&&) noexcept;
     FishBrain& operator=(FishBrain&&) noexcept;
@@ -52,6 +68,10 @@ public:
     bool advance(const FishSenses& senses, float dt, FishBout& bout);
     float vergence() const;  // eyes turned in to hunt, 0 to 1
     float hunting() const;   // hunting state, 0 to 1
+    // Where the visible eye looks: -1 back toward the tail to 1 forward, from
+    // the abducens neurons. Zero without a hindbrain connectome.
+    float eye_position() const;
+    bool measured_hindbrain() const;
     std::size_t neuron_count() const;
     std::size_t synapse_count() const;
 
@@ -69,6 +89,7 @@ public:
         float x, y;
         Circuit circuit;
         bool topographic;  // neurons ordered by the direction they respond to
+        bool measured;     // wired from the connectome rather than by hand
         float hertz;
     };
     std::vector<Area> layout() const;
@@ -78,6 +99,10 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    friend bool run_hindbrain_checks(std::shared_ptr<const HindbrainConnectome> hindbrain);
 };
 
 bool run_brain_checks(std::uint32_t seed = 7);
+// Checks the eye-position circuit built from the measured hindbrain wiring
+// against the same circuit wired at random.
+bool run_hindbrain_checks(std::shared_ptr<const HindbrainConnectome> hindbrain);

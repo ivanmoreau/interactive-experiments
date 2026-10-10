@@ -58,6 +58,9 @@ public:
     std::size_t food_count() const;
     // Fish watch the mouse pointer and flee when it rushes at them.
     void set_pointer(FluidPoint position);
+    // Fish added from now on build their eye-position circuit from this
+    // measured wiring (null: hand-wired brains only).
+    void set_hindbrain(std::shared_ptr<const struct HindbrainConnectome> hindbrain);
     // Multiplies how fast fish get hungry and run out of air (for checks).
     void set_metabolism(float hunger, float breath = 1);
     FishStatus fish_status() const;
@@ -82,4 +85,6 @@ private:
 };
 
 bool run_duck_checks(const char* shader_file);
-bool run_fish_checks(const char* shader_file);
+// With a hindbrain connectome, also checks the circuit built from it, and
+// the pond's fish use it.
+bool run_fish_checks(const char* shader_file, std::shared_ptr<const struct HindbrainConnectome> hindbrain = nullptr);

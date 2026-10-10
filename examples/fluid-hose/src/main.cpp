@@ -46,6 +46,14 @@ static std::filesystem::path shader_path() {
     return std::filesystem::exists(compiled) ? compiled : directory / "fluid.metal";
 }
 
+// The measured hindbrain wiring: bundled in the app, or next to a plain build.
+static std::shared_ptr<const HindbrainConnectome> load_hindbrain() {
+    const auto directory = shader_path().parent_path();
+    for (const auto& path : {directory / "hindbrain.txt", directory / "connectome" / "hindbrain.txt"})
+        if (auto hindbrain = HindbrainConnectome::load(path.string())) return hindbrain;
+    return nullptr;
+}
+
 struct App {
     HoseRenderer* renderer = nullptr;
     MotionProcess motion;
@@ -182,7 +190,7 @@ int main(int argc, char** argv) {
         if (!brain_snapshot.empty()) {
             require(initialize_hose_desktop(), "Initialize AppKit");
             // A hungry fish watching food above it, startled at the end.
-            FishBrain brain(7);
+            FishBrain brain(7, load_hindbrain());
             FishSenses senses;
             senses.hunger = 0.7f;
             senses.prey[11] = 0.8f;
@@ -198,7 +206,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (fish_check) {
-            require(run_fish_checks(shaders.c_str()), "Check fish");
+            require(run_fish_checks(shaders.c_str(), load_hindbrain()), "Check fish");
             return 0;
         }
         // Command-line choices override the saved menu choices for this launch.
@@ -275,6 +283,9 @@ int main(int argc, char** argv) {
         // Ducks and fish drop from random points along the top of the canvas.
         Pond pond;
         pond.reset(static_cast<float>(canvas.w), static_cast<float>(canvas.h));
+        const auto hindbrain = load_hindbrain();
+        pond.set_hindbrain(hindbrain);
+        std::printf("Fish hindbrain: %s\n", hindbrain ? "measured wiring (Vishwanathan et al. 2024)" : "hand-wired only");
         std::mt19937 random(std::random_device{}());
         std::uniform_real_distribution<float> unit(0.0f, 1.0f);
         auto drop_point = [&]() { return FluidPoint{(0.15f + 0.7f * unit(random)) * canvas.w, 40}; };
