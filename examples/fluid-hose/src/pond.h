@@ -23,6 +23,7 @@ struct FishVitals {
     bool in_water;
     unsigned meals;
     unsigned escapes;
+    float hunting;  // 0 to 1
 };
 
 // Rubber ducks, fish, and fish food simulated with Jolt Physics, locked to
@@ -53,6 +54,7 @@ public:
     std::size_t fish_count() const;
     // Drops one food flake; the oldest flake goes when there are too many.
     void add_food(FluidPoint position);
+    void clear_food();
     std::size_t food_count() const;
     // Fish watch the mouse pointer and flee when it rushes at them.
     void set_pointer(FluidPoint position);

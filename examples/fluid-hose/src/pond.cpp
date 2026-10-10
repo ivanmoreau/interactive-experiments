@@ -299,7 +299,7 @@ struct Pond::Impl {
             if (hidden) continue;
             const float angle = bearing(frame, r);
             if (std::abs(angle) > FishSenses::prey_field + bin_width) continue;
-            const float salience = std::min(1.0f, 60.0f / (distance + 40.0f));
+            const float salience = std::min(1.0f, 100.0f / (distance + 60.0f));
             for (int b = 0; b < FishSenses::prey_bins; ++b) {
                 const float offset = (angle - FishSenses::prey_angle(b)) / bin_width;
                 senses.prey[b] = std::max(senses.prey[b], salience * std::exp(-offset * offset / 0.72f));
@@ -558,8 +558,7 @@ void Pond::reset(float width, float height) {
     auto& s = *impl_;
     clear_ducks();
     clear_fish();
-    for (const auto& flake : s.food) s.remove(flake.id);
-    s.food.clear();
+    clear_food();
     for (const auto& window : s.windows) s.remove(window.second.id);
     s.windows.clear();
     for (const auto& wall : s.walls) s.remove(wall);
@@ -672,6 +671,13 @@ void Pond::add_food(FluidPoint position) {
     s.refresh_bodies();
 }
 
+void Pond::clear_food() {
+    auto& s = *impl_;
+    for (const auto& flake : s.food) s.remove(flake.id);
+    s.food.clear();
+    s.refresh_bodies();
+}
+
 std::size_t Pond::duck_count() const { return impl_->ducks.size(); }
 std::size_t Pond::fish_count() const { return impl_->fish.size(); }
 std::size_t Pond::food_count() const { return impl_->food.size(); }
@@ -701,7 +707,8 @@ std::vector<FishVitals> Pond::fish_vitals() const {
     std::vector<FishVitals> result;
     for (const auto& f : impl_->fish)
         result.push_back({impl_->position(f.id), impl_->velocity(f.id), f.energy, f.oxygen, f.alive,
-                          std::asin(std::clamp(-std::sin(impl_->heading(f.id)), -1.0f, 1.0f)), f.in_water, f.meals, f.escapes});
+                          std::asin(std::clamp(-std::sin(impl_->heading(f.id)), -1.0f, 1.0f)), f.in_water, f.meals, f.escapes,
+                          f.alive ? f.brain.hunting() : 0.0f});
     return result;
 }
 
@@ -928,25 +935,34 @@ bool run_fish_checks(const char* shader_file) {
     std::printf("  food: %u flakes eaten after %d s, energy %.2f, %zu flakes left\n", fish.meals, seconds, fish.energy, pond.food_count());
     if (!check(fish.meals >= 2, "a hungry fish finds food and eats it")) return false;
 
-    // A pointer rushing at the fish startles it. Like real fish, it does not
+    // A pointer rushing at the fish startles it. Leftover food goes first, so
+    // the fish settles back into the water. Like real fish, it does not
     // always react, so the pointer gets three tries.
-    const unsigned escapes = pond.fish_vitals().at(0).escapes;
+    pond.clear_food();
+    for (int i = 0; i < 10 && !(pond.fish_vitals().at(0).in_water && pond.fish_vitals().at(0).position.y > surface + 30); ++i)
+        run(fluid, pond, 60, {});
+    // A try counts when the fish escapes and darts off; fleeing into a
+    // nearby wall does not.
+    int darts = 0, tries = 0;
     float fastest = 0;
-    for (int attempt = 0; attempt < 3 && pond.fish_vitals().at(0).escapes == escapes; ++attempt) {
+    for (; tries < 3 && !darts; ++tries) {
         fish = pond.fish_vitals().at(0);
+        const unsigned escapes = fish.escapes;
         const float side = fish.position.x < width / 2 ? 1.0f : -1.0f;  // from the open side
+        float top = 0;
         for (int i = 0; i < 40; ++i) {
             const float approach = std::max(0.0f, 1 - i / 30.0f);
-            pond.set_pointer({fish.position.x + side * (260 * approach + 10), fish.position.y - 260 * approach * 0.3f});
+            pond.set_pointer({fish.position.x + side * (260 * approach + 10), fish.position.y});
             run(fluid, pond, 1, {});
-            fastest = std::max(fastest, length(pond.fish_vitals().at(0).velocity));
+            top = std::max(top, length(pond.fish_vitals().at(0).velocity));
         }
         pond.set_pointer({-1000, -1000});
         run(fluid, pond, 120, {});
+        fastest = std::max(fastest, top);
+        if (pond.fish_vitals().at(0).escapes > escapes && top > 150) ++darts;
     }
-    std::printf("  startle: %u escapes, top speed %.0f points/s\n", pond.fish_vitals().at(0).escapes - escapes, fastest);
-    if (!check(pond.fish_vitals().at(0).escapes > escapes && fastest > 150, "a pointer rushing at the fish makes it dart away"))
-        return false;
+    std::printf("  startle: darted away on try %d, top speed %.0f points/s\n", darts ? tries : 0, fastest);
+    if (!check(darts > 0, "a pointer rushing at the fish makes it dart away")) return false;
 
     // Without food it eventually starves, then floats belly up.
     pond.set_metabolism(1500);

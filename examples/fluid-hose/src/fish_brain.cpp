@@ -66,7 +66,7 @@ struct Population {
 };
 
 const Population populations[population_count] = {
-    {"retina", 2 * FishSenses::prey_bins, 0.4f, 0.25f, 0, 1},
+    {"retina", 2 * FishSenses::prey_bins, 0.3f, 0.25f, 0, 1},
     {"tectum", 3 * FishSenses::prey_bins, 0.2f, 0.25f, 0, 1},
     {"tectal inhibition", 8, 0.3f, 0.2f, 0, 1},
     {"strike zone", 6, 0.4f, 0.2f, 0, 1},
@@ -173,7 +173,7 @@ struct FishBrain::Impl {
 
         // Vision: a topographic map from retina to tectum, with pooled
         // inhibition so the strongest target wins.
-        wire(retina, tectum, 0.8f, 1.1f, [](int r, int t) {
+        wire(retina, tectum, 1.0f, 1.5f, [](int r, int t) {
             const int distance = std::abs(r / 2 - t / 3);
             return distance == 0 ? 1.0f : distance == 1 ? 0.35f : 0.0f;
         });
@@ -188,7 +188,7 @@ struct FishBrain::Impl {
         wire(tectum, hunt_command, 0.3f, 2.1f, [&](int t, int) { return std::abs(prey_angle(t)) < 2.2f ? 1.0f : 0.0f; });
         wire(strike_zone, hunt_command, 0.5f, 0.6f);
         wire(hunger, hunt_command, 0.25f, 0.2f);
-        wire(satiety, hunt_command, 0.4f, -1.0f);
+        wire(satiety, hunt_command, 0.8f, -0.8f);
         wire(hunt_command, hunt_command, 1.0f, 0.22f);
         wire(hunt_command, eye_vergence, 1.0f, 0.8f);
         // Food at the surface or on the floor is worth approaching.
@@ -199,12 +199,14 @@ struct FishBrain::Impl {
         // Strike when food is right ahead and the fish is hunting.
         wire(strike_zone, strike, 0.7f, 0.9f);
         wire(hunt_command, strike, 0.3f, 0.5f);
-        wire(satiety, strike, 0.4f, -0.8f);
+        wire(satiety, strike, 0.8f, -0.6f);
 
         // Escape: looming on one side drives that side's Mauthner cell; each
         // escape recruits inhibition that silences both cells for a while.
-        wire(looming, mauthner_dorsal, 1.0f, 0.55f, [&](int l, int) { return FishSenses::loom_angle(l / 2) > 0 ? 1.0f : 0.0f; });
-        wire(looming, mauthner_ventral, 1.0f, 0.55f, [&](int l, int) { return FishSenses::loom_angle(l / 2) < 0 ? 1.0f : 0.0f; });
+        // Their fields overlap straight ahead and behind, so a threat there
+        // drives both and the faster one wins.
+        wire(looming, mauthner_dorsal, 1.0f, 0.6f, [&](int l, int) { return std::sin(FishSenses::loom_angle(l / 2)) > -0.4f ? 1.0f : 0.0f; });
+        wire(looming, mauthner_ventral, 1.0f, 0.6f, [&](int l, int) { return std::sin(FishSenses::loom_angle(l / 2)) < 0.4f ? 1.0f : 0.0f; });
         wire(lateral_line, mauthner_dorsal, 1.0f, 0.25f);
         wire(lateral_line, mauthner_ventral, 1.0f, 0.25f);
         wire(mauthner_dorsal, escape_inhibition, 1.0f, 3.0f);
@@ -236,7 +238,7 @@ struct FishBrain::Impl {
         wire(steer_dorsal, steer_ventral, 1.0f, -0.12f);
         wire(steer_ventral, steer_dorsal, 1.0f, -0.12f);
         wire(blocked_ahead, reverse, 1.0f, 0.6f);
-        wire(tectum, reverse, 0.3f, 0.7f, [&](int t, int) { return std::abs(prey_angle(t)) > 1.9f ? 1.0f : 0.0f; });
+        wire(tectum, reverse, 0.8f, 1.6f, [&](int t, int) { return std::abs(prey_angle(t)) > 1.9f ? 1.0f : 0.0f; });
         wire(hunt_command, reverse, 0.2f, 0.2f);
 
         // Bout timing and vigour.
@@ -404,7 +406,7 @@ bool FishBrain::advance(const FishSenses& senses, float dt, FishBout& bout) {
         float strength = 0;
         const float prey = s.tectal_direction(strength);
         if (s.rate[strike] > 50.0f && s.since_strike > 0.4f) {
-            bout = {BoutKind::strike, std::clamp(prey, -0.5f, 0.5f), 230.0f};
+            bout = {BoutKind::strike, std::clamp(prey, -0.5f, 0.5f), 180.0f};
             s.since_strike = s.since_bout = 0;
             started = true;
             continue;
@@ -446,6 +448,7 @@ bool check(bool condition, const char* message) {
 
 struct Tally {
     int bouts = 0, escapes = 0, strikes = 0, hunts = 0, reversals = 0;
+    int flips = 0;      // bouts that turn the fish around (see FishBout::turn)
     int steered = 0;    // bouts that turn within the screen plane
     float turn_sum = 0;  // over those bouts
     float escape_turn = 0;
@@ -464,6 +467,7 @@ Tally simulate(FishBrain& brain, const FishSenses& senses, float seconds) {
         ++steps;
         if (!started) continue;
         ++tally.bouts;
+        if (std::abs(bout.turn) > 1.75f) ++tally.flips;
         if (bout.kind == BoutKind::swim || bout.kind == BoutKind::hunt) {
             ++tally.steered;
             tally.turn_sum += bout.turn;
@@ -538,6 +542,19 @@ bool run_brain_checks(std::uint32_t seed) {
     }
     if (!check(hunt.vergence > 0.25f && explore.vergence < 0.1f, "a hunting fish turns its eyes in")) return false;
 
+    // Food seen behind makes a hungry fish turn around for it.
+    FishBrain turning_back(seed + 20);
+    FishSenses behind = calm;
+    behind.hunger = 0.6f;
+    behind.prey[15] = 0.6f;
+    behind.prey[14] = 0.3f;
+    const Tally back = simulate(turning_back, behind, 4);
+    if (!check(back.flips >= 1, "a hungry fish turns around for food behind it")) {
+        std::printf("  %d bouts: %d hunting, %d reversals\n", back.bouts, back.hunts, back.reversals);
+        print_rates(turning_back);
+        return false;
+    }
+
     // Food right ahead triggers a strike.
     FishSenses ahead = food;
     ahead.prey = {};
@@ -575,6 +592,17 @@ bool run_brain_checks(std::uint32_t seed) {
         print_rates(startled);
         return false;
     }
+
+    // A threat from straight behind, where the two sides meet, also works.
+    FishBrain chased(seed + 24);
+    simulate(chased, calm, 2);
+    FishSenses rear = calm;
+    rear.looming[7] = 1.0f;  // 157° toward the back
+    rear.looming[6] = rear.looming[0] = 0.5f;
+    const Tally rear_escape = simulate(chased, rear, 1);
+    std::printf("  looming behind: escape after %.0f ms\n", rear_escape.first_escape * 1000);
+    if (!check(rear_escape.escapes >= 1 && rear_escape.first_escape < 0.15f, "a threat from straight behind triggers a fast escape"))
+        return false;
 
     // Habituation: the same harmless threat, again and again from the same
     // direction, soon stops causing escapes. One from a new direction still
